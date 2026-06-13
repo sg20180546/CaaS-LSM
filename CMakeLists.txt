@@ -1215,8 +1215,9 @@ endif()
 
 option(WITH_JNI "build with JNI" OFF)
 # Tests are excluded from Release builds
-CMAKE_DEPENDENT_OPTION(WITH_TESTS "build with tests" ON
-  "CMAKE_BUILD_TYPE STREQUAL Debug" OFF)
+# (CaaS integration) csa_server/procp_server are defined under if(WITH_TESTS),
+# so make WITH_TESTS a plain option to allow building them in Release too.
+option(WITH_TESTS "build with tests" ON)
 option(WITH_BENCHMARK_TOOLS "build with benchmarks" ON)
 option(WITH_CORE_TOOLS "build with ldb and sst_dump" ON)
 option(WITH_TOOLS "build with tools" ON)
