@@ -79,7 +79,10 @@ elseif(GRPC_FETCHCONTENT)
             # v1.25.0, v1.26.0 etc..
             # For the purpose of testing, we override the tag used to the commit
             # that's currently under test.
-            GIT_TAG        v1.46.2)
+            # (CaaS integration) bumped v1.46.2 -> v1.60.0: abseil bundled with
+            # 1.46.2 (LTS 20211102) fails to compile on GCC 13 (Ubuntu 24.04).
+            # 1.60.0 bundles abseil 20230802 which builds on gcc13.
+            GIT_TAG        v1.60.0)
     FetchContent_MakeAvailable(grpc)
 
     # Since FetchContent uses add_subdirectory under the hood, we can use
