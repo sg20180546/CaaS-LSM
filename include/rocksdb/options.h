@@ -2115,11 +2115,11 @@ struct OpenAndCompactOptions {
   std::atomic<bool>* canceled = nullptr;
 
 #ifdef HDFS
-  std::string hdfs_address = "hdfs://10.218.107.48:9000/";
+  std::string hdfs_address = "hdfs://192.168.88.87:9000/";
 
-  std::string csa_address = "10.218.107.48:8010";
+  std::string csa_address = "192.168.88.87:8010";
 
-  std::string pro_cp_address = "10.218.107.48:8020";
+  std::string pro_cp_address = "192.168.88.53:8020";
 
   int32_t check_time_interval = 1;
 
@@ -2129,11 +2129,11 @@ struct OpenAndCompactOptions {
 
   uint64_t max_reschedule = 5;
 #else
-  //  std::string hdfs_address = "hdfs://10.218.106.144:9000/";
+  //  std::string hdfs_address = "hdfs://192.168.88.87:9000/";
 
-  std::string csa_address = "10.218.107.48:8010";
+  std::string csa_address = "192.168.88.87:8010";
 
-  std::string pro_cp_address = "10.218.107.48:8020";
+  std::string pro_cp_address = "192.168.88.53:8020";
 
   int32_t check_time_interval = 1;
 

@@ -129,7 +129,17 @@ class CSAImpl final : public compactionservice::CSAService::Service {
   std::string address_ = compaction_service_options.csa_address;
 };
 
-int main() {
+int main(int argc, char** argv) {
+  // Usage: ./csa_server [host-suffix]
+  // If a numeric suffix is given, csa_address becomes 192.168.88.<suffix>:8010,
+  // so the same binary can run on different SN nodes without recompiling
+  // (e.g. ./csa_server 87 on node 87, ./csa_server 88 on node 88).
+  if (argc > 1) {
+    compaction_service_options.csa_address =
+        std::string("192.168.88.") + argv[1] + ":8010";
+    std::cout << GetTime() << "csa_address overridden to "
+              << compaction_service_options.csa_address << std::endl;
+  }
   std::string server_address(compaction_service_options.csa_address);
   CSAImpl service;
   service.stub_ = compactionservice::ProCPService::NewStub(
