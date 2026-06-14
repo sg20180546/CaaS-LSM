@@ -661,6 +661,9 @@ add_custom_command(
         ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
         --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
         -I "${compaction_service_proto_path}"
+        # (CaaS integration) also search gRPC's bundled protobuf src so protoc can
+        # resolve well-known types like google/protobuf/empty.proto (GRPC_FETCHCONTENT).
+        -I "${grpc_SOURCE_DIR}/third_party/protobuf/src"
         --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
         "${compaction_service_proto}"
         DEPENDS "${compaction_service_proto}")
