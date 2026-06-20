@@ -886,6 +886,17 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     uint64_t num_compaction_needed_bytes,
     const MutableCFOptions& mutable_cf_options,
     const ImmutableCFOptions& immutable_cf_options) {
+  {  // [kg-instrument] independent eval of ALL active STOP causes (bit0=mem,1=L0,2=pcb)
+    extern "C" void kg_stall_set_mask(uint64_t);
+    uint64_t kg_m = 0;
+    if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) kg_m |= 1u;
+    if (!mutable_cf_options.disable_auto_compactions &&
+        num_l0_files >= mutable_cf_options.level0_stop_writes_trigger) kg_m |= 2u;
+    if (!mutable_cf_options.disable_auto_compactions &&
+        mutable_cf_options.hard_pending_compaction_bytes_limit > 0 &&
+        num_compaction_needed_bytes >= mutable_cf_options.hard_pending_compaction_bytes_limit) kg_m |= 4u;
+    kg_stall_set_mask(kg_m);
+  }
   if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) {
     return {WriteStallCondition::kStopped, WriteStallCause::kMemtableLimit};
   } else if (!mutable_cf_options.disable_auto_compactions &&

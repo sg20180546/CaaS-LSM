@@ -17,6 +17,18 @@
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
 
+// [kg-instrument] per-cause write-stall timing. Process-global == per-shard
+// (each shard is its own process). Zero hot-path cost: only touched while a
+// write is ALREADY blocked in DelayWrite's bg_cv_.Wait(). bit0=memtable,
+// bit1=L0-files, bit2=pending-compaction-bytes; index 0..7 = active-cause set
+// (so overlap == buckets with >=2 bits; net per cause == single-bit bucket).
+#include <atomic>
+namespace { std::atomic<uint64_t> kg_g_mask{0}; std::atomic<uint64_t> kg_g_micros[8]; }
+extern "C" void     kg_stall_set_mask(uint64_t m)                   { kg_g_mask.store(m, std::memory_order_relaxed); }
+extern "C" uint64_t kg_stall_get_mask()                            { return kg_g_mask.load(std::memory_order_relaxed); }
+extern "C" void     kg_stall_add_micros(uint64_t mask, uint64_t us){ kg_g_micros[mask & 7].fetch_add(us, std::memory_order_relaxed); }
+extern "C" void     kg_stall_read(uint64_t* out8)                  { for (int i = 0; i < 8; i++) out8[i] = kg_g_micros[i].load(std::memory_order_relaxed); }
+
 namespace ROCKSDB_NAMESPACE {
 // Convenience methods
 Status DBImpl::Put(const WriteOptions& o, ColumnFamilyHandle* column_family,
@@ -1816,7 +1828,10 @@ Status DBImpl::DelayWrite(uint64_t num_bytes,
       // fail any pending writers with no_slowdown
       write_thread_.BeginWriteStall();
       TEST_SYNC_POINT("DBImpl::DelayWrite:Wait");
+      uint64_t kg_m = kg_stall_get_mask();                                  // [kg-instrument]
+      uint64_t kg_t0 = immutable_db_options_.clock->NowMicros();            // [kg-instrument]
       bg_cv_.Wait();
+      kg_stall_add_micros(kg_m, immutable_db_options_.clock->NowMicros() - kg_t0);  // [kg-instrument]
       write_thread_.EndWriteStall();
     }
   }
