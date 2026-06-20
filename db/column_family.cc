@@ -880,6 +880,8 @@ int GetL0ThresholdSpeedupCompaction(int level0_file_num_compaction_trigger,
 }
 }  // anonymous namespace
 
+extern "C" void kg_stall_set_mask(uint64_t);  // [kg-instrument] defined in db_impl_write.cc
+
 std::pair<WriteStallCondition, ColumnFamilyData::WriteStallCause>
 ColumnFamilyData::GetWriteStallConditionAndCause(
     int num_unflushed_memtables, int num_l0_files,
@@ -887,7 +889,6 @@ ColumnFamilyData::GetWriteStallConditionAndCause(
     const MutableCFOptions& mutable_cf_options,
     const ImmutableCFOptions& immutable_cf_options) {
   {  // [kg-instrument] independent eval of ALL active STOP causes (bit0=mem,1=L0,2=pcb)
-    extern "C" void kg_stall_set_mask(uint64_t);
     uint64_t kg_m = 0;
     if (num_unflushed_memtables >= mutable_cf_options.max_write_buffer_number) kg_m |= 1u;
     if (!mutable_cf_options.disable_auto_compactions &&
