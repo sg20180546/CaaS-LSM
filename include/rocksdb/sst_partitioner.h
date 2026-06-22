@@ -139,4 +139,46 @@ class SstPartitionerFixedPrefixFactory : public SstPartitionerFactory {
 extern std::shared_ptr<SstPartitionerFactory>
 NewSstPartitionerFixedPrefixFactory(size_t prefix_len);
 
+/*
+ * [relink] Key-Group Aligned partitioner (disaggregated LSM key-group migration). Cuts
+ * compaction output at key-group boundaries: two keys are in the same group iff
+ * (key * num_groups / key_space) is equal; a new SST starts when the group changes. Keys are
+ * big-endian fixed-width unsigned integers (numeric order == lexicographic). The factory
+ * EXCLUDES L0 (CreatePartitioner returns nullptr for output_level <= 0). Registered as a
+ * Customizable so it serializes by name (key_space, num_groups) and is reconstructed on a
+ * remote compaction worker (CSA).
+ */
+class KeyGroupAlignedPartitioner : public SstPartitioner {
+ public:
+  KeyGroupAlignedPartitioner(uint64_t key_space, uint64_t num_groups)
+      : ks_(key_space ? key_space : 1), groups_(num_groups ? num_groups : 1) {}
+  ~KeyGroupAlignedPartitioner() override {}
+  const char* Name() const override { return "KeyGroupAlignedPartitioner"; }
+  PartitionerResult ShouldPartition(const PartitionerRequest& request) override;
+  bool CanDoTrivialMove(const Slice& smallest_user_key,
+                        const Slice& largest_user_key) override;
+
+ private:
+  uint64_t GroupOf(const Slice& k) const;
+  uint64_t ks_, groups_;
+};
+
+class KeyGroupAlignedPartitionerFactory : public SstPartitionerFactory {
+ public:
+  explicit KeyGroupAlignedPartitionerFactory(uint64_t key_space = 0,
+                                             uint64_t num_groups = 1);
+  ~KeyGroupAlignedPartitionerFactory() override {}
+  static const char* kClassName() { return "KeyGroupAlignedPartitionerFactory"; }
+  const char* Name() const override { return kClassName(); }
+  std::unique_ptr<SstPartitioner> CreatePartitioner(
+      const SstPartitioner::Context& context) const override;
+
+  // public for OptionTypeInfo offsetof serialization (key_space, num_groups).
+  uint64_t key_space_;
+  uint64_t num_groups_;
+};
+
+extern std::shared_ptr<SstPartitionerFactory>
+NewKeyGroupAlignedPartitionerFactory(uint64_t key_space, uint64_t num_groups);
+
 }  // namespace ROCKSDB_NAMESPACE

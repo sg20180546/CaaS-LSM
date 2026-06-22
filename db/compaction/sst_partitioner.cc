@@ -58,6 +58,59 @@ std::shared_ptr<SstPartitionerFactory> NewSstPartitionerFixedPrefixFactory(
   return std::make_shared<SstPartitionerFixedPrefixFactory>(prefix_len);
 }
 
+// ---- [relink] Key-Group Aligned partitioner ----
+static std::unordered_map<std::string, OptionTypeInfo> kg_aligned_type_info = {
+#ifndef ROCKSDB_LITE
+    {"key_space",
+     {offsetof(struct KeyGroupAlignedPartitionerFactory, key_space_),
+      OptionType::kUInt64T, OptionVerificationType::kNormal,
+      OptionTypeFlags::kNone}},
+    {"num_groups",
+     {offsetof(struct KeyGroupAlignedPartitionerFactory, num_groups_),
+      OptionType::kUInt64T, OptionVerificationType::kNormal,
+      OptionTypeFlags::kNone}},
+#endif  // ROCKSDB_LITE
+};
+
+KeyGroupAlignedPartitionerFactory::KeyGroupAlignedPartitionerFactory(
+    uint64_t key_space, uint64_t num_groups)
+    : key_space_(key_space), num_groups_(num_groups) {
+  RegisterOptions("Options", this, &kg_aligned_type_info);
+}
+
+uint64_t KeyGroupAlignedPartitioner::GroupOf(const Slice& k) const {
+  uint64_t v = 0;
+  size_t n = k.size() < 8 ? k.size() : 8;  // big-endian fixed-width unsigned key
+  for (size_t i = 0; i < n; i++) v = (v << 8) | (uint8_t)k.data()[i];
+  return (uint64_t)((unsigned __int128)v * groups_ / ks_);
+}
+
+PartitionerResult KeyGroupAlignedPartitioner::ShouldPartition(
+    const PartitionerRequest& request) {
+  return GroupOf(*request.prev_user_key) == GroupOf(*request.current_user_key)
+             ? kNotRequired
+             : kRequired;  // cut: keys are in different key-groups
+}
+
+bool KeyGroupAlignedPartitioner::CanDoTrivialMove(
+    const Slice& smallest_user_key, const Slice& largest_user_key) {
+  return GroupOf(smallest_user_key) == GroupOf(largest_user_key);
+}
+
+std::unique_ptr<SstPartitioner>
+KeyGroupAlignedPartitionerFactory::CreatePartitioner(
+    const SstPartitioner::Context& context) const {
+  if (context.output_level <= 0) return nullptr;  // L0 excluded (flush/intra-L0 not aligned)
+  return std::unique_ptr<SstPartitioner>(
+      new KeyGroupAlignedPartitioner(key_space_, num_groups_));
+}
+
+std::shared_ptr<SstPartitionerFactory> NewKeyGroupAlignedPartitionerFactory(
+    uint64_t key_space, uint64_t num_groups) {
+  return std::make_shared<KeyGroupAlignedPartitionerFactory>(key_space,
+                                                             num_groups);
+}
+
 #ifndef ROCKSDB_LITE
 namespace {
 static int RegisterSstPartitionerFactories(ObjectLibrary& library,
@@ -70,7 +123,15 @@ static int RegisterSstPartitionerFactories(ObjectLibrary& library,
         guard->reset(new SstPartitionerFixedPrefixFactory(0));
         return guard->get();
       });
-  return 1;
+  library.AddFactory<SstPartitionerFactory>(  // [relink] for remote-compaction CSA reconstruction
+      KeyGroupAlignedPartitionerFactory::kClassName(),
+      [](const std::string& /*uri*/,
+         std::unique_ptr<SstPartitionerFactory>* guard,
+         std::string* /* errmsg */) {
+        guard->reset(new KeyGroupAlignedPartitionerFactory(0, 1));
+        return guard->get();
+      });
+  return 2;
 }
 }  // namespace
 #endif  // ROCKSDB_LITE

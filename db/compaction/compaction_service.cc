@@ -158,4 +158,15 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
     return CompactionServiceJobStatus::kUseLocal;
   }
 }
+
+// [relink] Public factory: lets an external app (no protobuf deps) enable CaaS remote compaction.
+std::shared_ptr<CompactionService> NewMyTestCompactionService(
+    const std::string& db_path, const Options& options,
+    std::shared_ptr<Statistics> statistics) {
+  Options opts = options;
+  std::shared_ptr<Statistics> stats = std::move(statistics);
+  std::vector<std::shared_ptr<EventListener>> listeners;
+  std::vector<std::shared_ptr<TablePropertiesCollectorFactory>> tpcf;
+  return std::make_shared<MyTestCompactionService>(db_path, opts, stats, listeners, tpcf);
+}
 };  // namespace ROCKSDB_NAMESPACE

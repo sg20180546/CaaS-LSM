@@ -895,8 +895,13 @@ Status DB::OpenAndCompact(
       override_options.prefix_extractor;
   compaction_input.column_family.options.table_factory =
       override_options.table_factory;
-  compaction_input.column_family.options.sst_partitioner_factory =
-      override_options.sst_partitioner_factory;
+  // [relink] Preserve the deserialized (registered) sst_partitioner_factory when the CSA's
+  // override is null, so a Key-Group Aligned partitioner shipped from the CN (in the serialized
+  // CF options) is applied during REMOTE compaction. Stock behavior unchanged when override set.
+  if (override_options.sst_partitioner_factory != nullptr) {
+    compaction_input.column_family.options.sst_partitioner_factory =
+        override_options.sst_partitioner_factory;
+  }
   compaction_input.column_family.options.table_properties_collector_factories =
       override_options.table_properties_collector_factories;
   compaction_input.db_options.listeners = override_options.listeners;
