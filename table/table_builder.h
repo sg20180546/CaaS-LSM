@@ -86,6 +86,11 @@ struct TableReaderOptions {
 
   // Known unique_id or {}, kNullUniqueId64x2 means unknown
   UniqueId64x2 unique_id;
+
+  // [relink] per-file GSN override (key-group migration). kDisableGlobalSequenceNumber
+  // (default) = inert. A real value overrides all keys' seqno at read time. Set by
+  // TableCache from FileDescriptor::global_seqno_override.
+  SequenceNumber global_seqno_override = kDisableGlobalSequenceNumber;
 };
 
 struct TableBuilderOptions {

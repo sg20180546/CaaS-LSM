@@ -80,6 +80,7 @@
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/statistics.h"
 #include "rocksdb/stats_history.h"
+#include "rocksdb/sst_file_reader.h"  // [relink] RegisterExternalFileInPlace
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/version.h"
@@ -5426,6 +5427,145 @@ Status DBImpl::IngestExternalFiles(
     }
   }
   return status;
+}
+
+// [relink] Register an existing SST into this CF's MANIFEST at `level`, applying a
+// per-file GSN (global_seqno) that overrides ALL of the file's keys' seqno at read
+// time. NO data copy: the file is moved into the DB dir via FileSystem::RenameFile
+// (metadata-only on HDFS). Additive/opt-in for key-group migration (relink); stock
+// ingest/flush/compaction are untouched. NOTE: the GSN is applied in-memory only here
+// (not yet persisted in the MANIFEST -> lost on restart; recovery is future work).
+Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
+                                           const std::string& external_file,
+                                           int level,
+                                           SequenceNumber global_seqno) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+
+  // ---- 1. Read the file's user-key bounds + size (no DB mutex needed). ----
+  Options ropts;
+  ropts.env = env_;
+  ropts.comparator = cfd->user_comparator();
+  ropts.table_factory = cfd->ioptions()->table_factory;
+  SstFileReader reader(ropts);
+  Status s = reader.Open(external_file);
+  if (!s.ok()) {
+    return s;
+  }
+
+  uint64_t file_size = 0;
+  {
+    IOOptions io_opts;
+    s = fs_->GetFileSize(external_file, io_opts, &file_size, nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  std::string smallest_user, largest_user;
+  {
+    ReadOptions ro;
+    ro.fill_cache = false;
+    std::unique_ptr<Iterator> it(reader.NewIterator(ro));
+    it->SeekToFirst();
+    if (!it->Valid()) {
+      return it->status().ok()
+                 ? Status::Corruption("RegisterExternalFileInPlace: empty SST")
+                 : it->status();
+    }
+    smallest_user.assign(it->key().data(), it->key().size());
+    it->SeekToLast();
+    if (!it->Valid()) {
+      return it->status().ok()
+                 ? Status::Corruption("RegisterExternalFileInPlace: no last key")
+                 : it->status();
+    }
+    largest_user.assign(it->key().data(), it->key().size());
+  }
+
+  // ---- 2. Allocate a file number and MOVE the file into the DB dir (no copy). ----
+  uint64_t file_number = versions_->NewFileNumber();
+  const std::string path_inside_db =
+      TableFileName(cfd->ioptions()->cf_paths, file_number, 0 /* path_id */);
+  {
+    IOOptions io_opts;
+    s = fs_->RenameFile(external_file, path_inside_db, io_opts, nullptr);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+
+  // ---- 3. Build FileMetaData with the per-file GSN; commit to the MANIFEST. ----
+  // All keys are overridden to `global_seqno` at read time, so the bounds use it too.
+  InternalKey smallest_ikey(Slice(smallest_user), global_seqno, kValueTypeForSeek);
+  InternalKey largest_ikey(Slice(largest_user), global_seqno, kValueTypeForSeek);
+
+  UniqueId64x2 unique_id{};
+  FileMetaData f_meta(file_number, 0 /* path_id */, file_size, smallest_ikey,
+                      largest_ikey, global_seqno /* smallest_seqno */,
+                      global_seqno /* largest_seqno */,
+                      false /* marked_for_compaction */, Temperature::kUnknown,
+                      kInvalidBlobFileNumber, 0 /* oldest_ancester_time */,
+                      0 /* file_creation_time */, /*file_checksum=*/"",
+                      /*file_checksum_func_name=*/"", unique_id);
+  f_meta.fd.global_seqno_override = global_seqno;  // [relink] per-file GSN
+
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  edit.AddFile(level, f_meta);
+
+  {
+    InstrumentedMutexLock l(&mutex_);
+    s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
+                               &mutex_, directories_.GetDbDir());
+    if (s.ok()) {
+      // The registered keys exist at seqno `global_seqno`; ensure the DB's sequence
+      // covers it so reads can observe them (mirrors ingestion consuming seqnos). In
+      // the real relink protocol the GSN is preallocated <= last_sequence, so this is
+      // usually a no-op; we only ever advance, never rewind, the sequence.
+      if (global_seqno != kDisableGlobalSequenceNumber &&
+          global_seqno > versions_->LastSequence()) {
+        versions_->SetLastAllocatedSequence(global_seqno);
+        versions_->SetLastPublishedSequence(global_seqno);
+        versions_->SetLastSequence(global_seqno);
+      }
+      SuperVersionContext sv_ctx(/*create_superversion=*/true);
+      InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
+                                         *cfd->GetLatestMutableCFOptions());
+      sv_ctx.Clean();
+    }
+  }
+  return s;
+}
+
+// [relink] Remove a relinked file from this CF's MANIFEST. The physical file has been
+// renamed into another DB by RegisterExternalFileInPlace, so the obsolete-file deletion
+// triggered by removing it here is a harmless no-op (the path no longer exists). Used by
+// key-group migration on the SOURCE side after the destination has registered the file.
+Status DBImpl::UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
+                                     uint64_t file_number) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  edit.DeleteFile(level, file_number);
+
+  InstrumentedMutexLock l(&mutex_);
+  Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
+                                    &mutex_, directories_.GetDbDir());
+  if (s.ok()) {
+    SuperVersionContext sv_ctx(/*create_superversion=*/true);
+    InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
+                                       *cfd->GetLatestMutableCFOptions());
+    sv_ctx.Clean();
+  }
+  return s;
 }
 
 Status DBImpl::CreateColumnFamilyWithImport(

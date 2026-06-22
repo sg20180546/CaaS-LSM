@@ -524,6 +524,15 @@ class DBImpl : public DB {
   virtual Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) override;
 
+  // [relink] register an existing SST into the MANIFEST with a per-file GSN (no copy).
+  virtual Status RegisterExternalFileInPlace(
+      ColumnFamilyHandle* column_family, const std::string& external_file,
+      int level, SequenceNumber global_seqno) override;
+
+  // [relink] remove a relinked file from the MANIFEST (no physical delete).
+  virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
+                                       uint64_t file_number) override;
+
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,

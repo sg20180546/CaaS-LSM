@@ -117,6 +117,11 @@ struct FileDescriptor {
   uint64_t file_size;             // File size in bytes
   SequenceNumber smallest_seqno;  // The smallest seqno in this file
   SequenceNumber largest_seqno;   // The largest seqno in this file
+  // [relink] per-file GSN override (key-group migration). kDisableGlobalSequenceNumber
+  // (default) = inert (use per-key seqnos, normal behavior). A real value overrides
+  // ALL keys in this file to that seqno at read time. Only set by RegisterExternalFileInPlace.
+  // NOTE: in-memory only for now; MANIFEST persistence (recovery) is a follow-up.
+  SequenceNumber global_seqno_override = kDisableGlobalSequenceNumber;
 
   FileDescriptor() : FileDescriptor(0, 0, 0) {}
 
@@ -139,6 +144,7 @@ struct FileDescriptor {
     file_size = fd.file_size;
     smallest_seqno = fd.smallest_seqno;
     largest_seqno = fd.largest_seqno;
+    global_seqno_override = fd.global_seqno_override;  // [relink]
     return *this;
   }
 

@@ -1651,6 +1651,32 @@ class DB {
   virtual Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) = 0;
 
+  // [relink] Register an EXISTING SST file (e.g. already on shared HDFS) into this
+  // column family's MANIFEST at `level`, applying `global_seqno` as a per-file GSN
+  // override to ALL of the file's keys at read time. NO data copy: the file is moved
+  // into the DB directory via FileSystem::RenameFile (metadata-only on HDFS). This is
+  // additive/opt-in for key-group migration (relink): stock ingest/flush/compaction are
+  // untouched and the default implementation returns NotSupported, so other DB
+  // implementations are unaffected. NOTE: the GSN is currently applied in-memory only
+  // (not yet persisted in the MANIFEST -> it is lost on restart; recovery is future work).
+  virtual Status RegisterExternalFileInPlace(
+      ColumnFamilyHandle* /*column_family*/, const std::string& /*external_file*/,
+      int /*level*/, SequenceNumber /*global_seqno*/) {
+    return Status::NotSupported(
+        "RegisterExternalFileInPlace is not supported in this DB implementation");
+  }
+
+  // [relink] Remove a (relinked) file from this column family's MANIFEST WITHOUT
+  // physically deleting it — the file has been renamed away into another DB by
+  // RegisterExternalFileInPlace, so the obsolete-file deletion this triggers is a
+  // harmless no-op. Additive/opt-in (key-group migration, src side); default
+  // NotSupported so other DB implementations are unaffected.
+  virtual Status UnregisterFileInPlace(ColumnFamilyHandle* /*column_family*/,
+                                       int /*level*/, uint64_t /*file_number*/) {
+    return Status::NotSupported(
+        "UnregisterFileInPlace is not supported in this DB implementation");
+  }
+
   // CreateColumnFamilyWithImport() will create a new column family with
   // column_family_name and import external SST files specified in metadata into
   // this column family.

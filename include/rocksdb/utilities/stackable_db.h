@@ -150,6 +150,19 @@ class StackableDB : public DB {
     return db_->IngestExternalFiles(args);
   }
 
+  // [relink]
+  virtual Status RegisterExternalFileInPlace(
+      ColumnFamilyHandle* column_family, const std::string& external_file,
+      int level, SequenceNumber global_seqno) override {
+    return db_->RegisterExternalFileInPlace(column_family, external_file, level,
+                                            global_seqno);
+  }
+  // [relink]
+  virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
+                                       uint64_t file_number) override {
+    return db_->UnregisterFileInPlace(column_family, level, file_number);
+  }
+
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,

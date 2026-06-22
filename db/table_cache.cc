@@ -161,15 +161,15 @@ Status TableCache::GetTableReader(
     } else {
       expected_unique_id = kNullUniqueId64x2;  // null ID == no verification
     }
-    s = ioptions_.table_factory->NewTableReader(
-        ro,
-        TableReaderOptions(ioptions_, prefix_extractor, file_options,
+    TableReaderOptions tro(ioptions_, prefix_extractor, file_options,
                            internal_comparator, skip_filters, immortal_tables_,
                            false /* force_direct_prefetch */, level,
                            block_cache_tracer_, max_file_size_for_l0_meta_pin,
                            db_session_id_, file_meta.fd.GetNumber(),
-                           expected_unique_id, file_meta.fd.largest_seqno),
-        std::move(file_reader), file_meta.fd.GetFileSize(), table_reader,
+                           expected_unique_id, file_meta.fd.largest_seqno);
+    tro.global_seqno_override = file_meta.fd.global_seqno_override;  // [relink] inert when kDisable
+    s = ioptions_.table_factory->NewTableReader(
+        ro, tro, std::move(file_reader), file_meta.fd.GetFileSize(), table_reader,
         prefetch_index_and_filter_in_cache);
     TEST_SYNC_POINT("TableCache::GetTableReader:0");
   }

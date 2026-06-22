@@ -109,7 +109,9 @@ class BlockBasedTable : public TableReader {
       BlockCacheTracer* const block_cache_tracer = nullptr,
       size_t max_file_size_for_l0_meta_pin = 0,
       const std::string& cur_db_session_id = "", uint64_t cur_file_num = 0,
-      UniqueId64x2 expected_unique_id = {});
+      UniqueId64x2 expected_unique_id = {},
+      const SequenceNumber global_seqno_override =
+          kDisableGlobalSequenceNumber);  // [relink] inert when kDisable
 
   bool PrefixRangeMayMatch(const Slice& internal_key,
                            const ReadOptions& read_options,
@@ -476,7 +478,9 @@ class BlockBasedTable : public TableReader {
   Status ReadPropertiesBlock(const ReadOptions& ro,
                              FilePrefetchBuffer* prefetch_buffer,
                              InternalIterator* meta_iter,
-                             const SequenceNumber largest_seqno);
+                             const SequenceNumber largest_seqno,
+                             const SequenceNumber global_seqno_override =
+                                 kDisableGlobalSequenceNumber);  // [relink]
   Status ReadRangeDelBlock(const ReadOptions& ro,
                            FilePrefetchBuffer* prefetch_buffer,
                            InternalIterator* meta_iter,

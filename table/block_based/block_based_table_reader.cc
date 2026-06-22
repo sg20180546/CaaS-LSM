@@ -591,7 +591,8 @@ Status BlockBasedTable::Open(
     TailPrefetchStats* tail_prefetch_stats,
     BlockCacheTracer* const block_cache_tracer,
     size_t max_file_size_for_l0_meta_pin, const std::string& cur_db_session_id,
-    uint64_t cur_file_num, UniqueId64x2 expected_unique_id) {
+    uint64_t cur_file_num, UniqueId64x2 expected_unique_id,
+    const SequenceNumber global_seqno_override) {  // [relink]
   table_reader->reset();
 
   Status s;
@@ -681,7 +682,8 @@ Status BlockBasedTable::Open(
   // Populates table_properties and some fields that depend on it,
   // such as index_type.
   s = new_table->ReadPropertiesBlock(ro, prefetch_buffer.get(),
-                                     metaindex_iter.get(), largest_seqno);
+                                     metaindex_iter.get(), largest_seqno,
+                                     global_seqno_override);  // [relink]
   if (!s.ok()) {
     return s;
   }
@@ -872,7 +874,8 @@ Status BlockBasedTable::PrefetchTail(
 
 Status BlockBasedTable::ReadPropertiesBlock(
     const ReadOptions& ro, FilePrefetchBuffer* prefetch_buffer,
-    InternalIterator* meta_iter, const SequenceNumber largest_seqno) {
+    InternalIterator* meta_iter, const SequenceNumber largest_seqno,
+    const SequenceNumber global_seqno_override) {  // [relink]
   Status s;
   BlockHandle handle;
   s = FindOptionalMetaBlock(meta_iter, kPropertiesBlockName, &handle);
@@ -945,6 +948,11 @@ Status BlockBasedTable::ReadPropertiesBlock(
                                 &(rep_->global_seqno));
     if (!s.ok()) {
       ROCKS_LOG_ERROR(rep_->ioptions.logger, "%s", s.ToString().c_str());
+    }
+    // [relink] per-file GSN override for a registered/relinked normal SST.
+    // Inert when kDisable (all baseline SSTs) -> global_seqno path unchanged.
+    if (global_seqno_override != kDisableGlobalSequenceNumber) {
+      rep_->global_seqno = global_seqno_override;
     }
   }
   return s;
