@@ -83,3 +83,23 @@ service ProCPService {
 
   rpc RegisterCSA(CSAStatus) returns (google.protobuf.Empty) {}
 }
+
+// [relink/Storage-CP] Per-file refcount + GC over shared SSTs on HDFS.
+// path = full HDFS URI of the .sst (e.g. hdfs://192.168.88.87:9000/kg/s0/000123.sst).
+// Eager refcount: NotifyCreate(=1) -> NotifyLink(++ on relink) -> RequestDelete(--; physical
+// delete only at 0). A periodic mark-sweep GC reconciles leaks against live MANIFESTs.
+message FileRef {
+  string path = 1;       // full HDFS URI of the .sst file
+  uint32 shard_id = 2;   // owning / requesting shard index
+}
+
+message DeleteReply {
+  bool deleted = 1;      // true if refcount reached 0 and the file was physically deleted
+  uint32 refcount = 2;   // remaining refcount after this op (debug)
+}
+
+service StorageService {
+  rpc NotifyCreate(FileRef) returns (google.protobuf.Empty) {}  // refcount[path]=1, owners={shard}
+  rpc NotifyLink(FileRef) returns (google.protobuf.Empty) {}    // refcount[path]++, owners+={shard}
+  rpc RequestDelete(FileRef) returns (DeleteReply) {}           // refcount--; hdfsDelete at 0
+}

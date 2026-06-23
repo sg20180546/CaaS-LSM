@@ -88,6 +88,10 @@ enum NewFileCustomTag : uint32_t {
   kMinTimestamp = 10,
   kMaxTimestamp = 11,
   kUniqueId = 12,
+  // [relink] absolute HDFS path of an in-place referenced SST (no rename).
+  // Safely-ignorable tag (< kCustomTagNonSafeIgnoreMask): older binaries that
+  // don't know it will skip it; absent on read => empty (normal behavior).
+  kExternalPath = 13,
 
   // If this bit for the custom tag is set, opening DB should fail if
   // we don't know this field.
@@ -122,6 +126,10 @@ struct FileDescriptor {
   // ALL keys in this file to that seqno at read time. Only set by RegisterExternalFileInPlace.
   // NOTE: in-memory only for now; MANIFEST persistence (recovery) is a follow-up.
   SequenceNumber global_seqno_override = kDisableGlobalSequenceNumber;
+  // [relink] non-empty => SST is at this absolute HDFS path (no rename).
+  // EMPTY (default) => normal behavior (path derived from dbname+file_number).
+  // Only set by RegisterExternalFileInPlace; in-memory + MANIFEST-persisted.
+  std::string external_path;
 
   FileDescriptor() : FileDescriptor(0, 0, 0) {}
 
@@ -145,6 +153,7 @@ struct FileDescriptor {
     smallest_seqno = fd.smallest_seqno;
     largest_seqno = fd.largest_seqno;
     global_seqno_override = fd.global_seqno_override;  // [relink]
+    external_path = fd.external_path;                   // [relink]
     return *this;
   }
 

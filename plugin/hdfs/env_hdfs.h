@@ -5,10 +5,22 @@
 
 #pragma once
 
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <mutex>
+
 #include "hdfs.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/status.h"
+
+// [relink/Storage-CP] Forward-declare the generated gRPC client stub so this
+// header does not need to pull in the generated proto headers. The concrete
+// type is only required in env_hdfs_impl.cc.
+namespace compactionservice {
+class StorageService;
+}  // namespace compactionservice
 
 namespace ROCKSDB_NAMESPACE {
 class ObjectLibrary;
@@ -91,6 +103,29 @@ class HdfsFileSystem : public FileSystemWrapper {
  private:
   std::string fsname_;  // string of the form "hdfs://hostname:port/dira"
   hdfsFS fileSys_;      // a single hdfsFS object for all files
+
+  // [relink/Storage-CP] Gated gRPC StorageService client for per-file refcount
+  // + GC over shared SSTs on HDFS. DISABLED unless getenv("STORAGE_CP_ADDR") is
+  // set & non-empty. When disabled, every hook below is a no-op and HDFS
+  // behavior is BIT-IDENTICAL to baseline.
+  //
+  // The client (gRPC channel + generated Stub) is held behind an opaque,
+  // lazily-constructed struct defined in env_hdfs_impl.cc so this header does
+  // not need to include the generated proto/grpc headers.
+  struct StorageCpClient;
+  // Initialized once (lazily) on first hook invocation.
+  mutable std::once_flag storage_cp_init_flag_;
+  // Owning pointer to the opaque client; nullptr => DISABLED (default).
+  mutable std::unique_ptr<StorageCpClient> storage_cp_client_;
+  // Shard id from getenv("STORAGE_CP_SHARD") (default 0); cached at init.
+  mutable uint32_t storage_cp_shard_ = 0;
+
+  // Returns the opaque client iff Storage-CP is enabled, else nullptr.
+  // Performs the one-time lazy init (reads STORAGE_CP_ADDR / STORAGE_CP_SHARD,
+  // builds the channel + stub). Thread-safe.
+  StorageCpClient* GetStorageCpClient() const;
+  // Helper: true iff fname names a real SST (ends in ".sst").
+  static bool IsSstFile(const std::string& fname);
 };
 
 // Returns a `FileSystem` that hashes file contents when naming files, thus

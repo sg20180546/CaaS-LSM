@@ -419,7 +419,8 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
   for (auto& file : state.sst_delete_files) {
     if (!file.only_delete_metadata) {
       candidate_files.emplace_back(
-          MakeTableFileName(file.metadata->fd.GetNumber()), file.path);
+          MakeTableFileName(file.metadata->fd.GetNumber()), file.path,
+          file.metadata->fd.external_path);  // [relink] in-place external file
     }
     if (file.metadata->table_reader_handle) {
       table_cache_->Release(file.metadata->table_reader_handle);
@@ -581,7 +582,12 @@ void DBImpl::PurgeObsoleteFiles(JobContext& state, bool schedule_only) {
     if (type == kTableFile) {
       // evict from cache
       TableCache::Evict(table_cache_.get(), number);
-      fname = MakeTableFileName(candidate_file.file_path, number);
+      // [relink] an in-place external (relinked) file lives at its absolute path,
+      // not file_path/MakeTableFileName(number) — delete it there so the CN's
+      // DeleteFile->RequestDelete reaches the right StorageCP refcount key.
+      fname = candidate_file.external_path.empty()
+                  ? MakeTableFileName(candidate_file.file_path, number)
+                  : candidate_file.external_path;
       dir_to_sync = candidate_file.file_path;
     } else if (type == kBlobFile) {
       fname = BlobFileName(candidate_file.file_path, number);

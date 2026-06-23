@@ -225,6 +225,12 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       std::string unique_id_str = EncodeUniqueIdBytes(&unique_id);
       PutLengthPrefixedSlice(dst, Slice(unique_id_str));
     }
+    // [relink] Only emitted when this file is an in-place external reference.
+    // Empty external_path => nothing written => byte-identical to baseline.
+    if (!f.fd.external_path.empty()) {
+      PutVarint32(dst, NewFileCustomTag::kExternalPath);
+      PutLengthPrefixedSlice(dst, Slice(f.fd.external_path));
+    }
 
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                              dst);
@@ -314,6 +320,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   uint64_t file_size = 0;
   SequenceNumber smallest_seqno = 0;
   SequenceNumber largest_seqno = kMaxSequenceNumber;
+  std::string external_path;  // [relink] empty => normal (no in-place ref)
   if (GetLevel(input, &level, &msg) && GetVarint64(input, &number) &&
       GetVarint64(input, &file_size) && GetInternalKey(input, &f.smallest) &&
       GetInternalKey(input, &f.largest) &&
@@ -393,6 +400,10 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
             return "invalid unique id";
           }
           break;
+        case kExternalPath:
+          // [relink] absolute HDFS path of an in-place referenced SST.
+          external_path = field.ToString();
+          break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it
@@ -406,6 +417,9 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   }
   f.fd =
       FileDescriptor(number, path_id, file_size, smallest_seqno, largest_seqno);
+  // [relink] restore in-place external path (empty unless kExternalPath seen,
+  // i.e. byte-identical decode result for baseline manifests).
+  f.fd.external_path = external_path;
   new_files_.push_back(std::make_pair(level, f));
   return nullptr;
 }

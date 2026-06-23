@@ -121,8 +121,15 @@ Status TableCache::GetTableReader(
     const std::shared_ptr<const SliceTransform>& prefix_extractor,
     bool skip_filters, int level, bool prefetch_index_and_filter_in_cache,
     size_t max_file_size_for_l0_meta_pin, Temperature file_temperature) {
-  std::string fname = TableFileName(
-      ioptions_.cf_paths, file_meta.fd.GetNumber(), file_meta.fd.GetPathId());
+  // [relink] If this file is an in-place external reference, open it directly
+  // at its absolute HDFS path (no rename happened). Empty external_path =>
+  // identical to baseline: derive path from cf_paths + file number.
+  const bool is_external = !file_meta.fd.external_path.empty();
+  std::string fname =
+      is_external
+          ? file_meta.fd.external_path
+          : TableFileName(ioptions_.cf_paths, file_meta.fd.GetNumber(),
+                          file_meta.fd.GetPathId());
   std::unique_ptr<FSRandomAccessFile> file;
   FileOptions fopts = file_options;
   fopts.temperature = file_temperature;
@@ -132,7 +139,9 @@ Status TableCache::GetTableReader(
   }
   if (s.ok()) {
     RecordTick(ioptions_.stats, NO_FILE_OPENS);
-  } else if (s.IsPathNotFound()) {
+  } else if (s.IsPathNotFound() && !is_external) {
+    // [relink] external (absolute) paths are exact; never apply the
+    // Rocks2Level fallback rewrite to them.
     fname = Rocks2LevelTableFileName(fname);
     s = PrepareIOFromReadOptions(ro, ioptions_.clock, fopts.io_options);
     if (s.ok()) {

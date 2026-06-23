@@ -136,8 +136,16 @@ struct JobContext {
   struct CandidateFileInfo {
     std::string file_name;
     std::string file_path;
+    // [relink] if non-empty, the physical SST lives at this absolute path
+    // (in-place cross-dir reference = FileDescriptor::external_path) and must be
+    // deleted HERE, not at file_path/MakeTableFileName(number). Empty => baseline.
+    std::string external_path;
     CandidateFileInfo(std::string name, std::string path)
         : file_name(std::move(name)), file_path(std::move(path)) {}
+    CandidateFileInfo(std::string name, std::string path, std::string ext)
+        : file_name(std::move(name)),
+          file_path(std::move(path)),
+          external_path(std::move(ext)) {}
     bool operator==(const CandidateFileInfo& other) const {
       return file_name == other.file_name && file_path == other.file_path;
     }

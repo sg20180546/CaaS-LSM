@@ -5486,17 +5486,12 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
     largest_user.assign(it->key().data(), it->key().size());
   }
 
-  // ---- 2. Allocate a file number and MOVE the file into the DB dir (no copy). ----
+  // ---- 2. Allocate a file number; reference the file IN PLACE (no rename). ----
+  // [relink] The SST physically stays at `external_file` (a possibly cross-dir
+  // absolute HDFS path). We record that path on the FileDescriptor below so the
+  // table cache opens it directly. The allocated file_number is still used for
+  // MANIFEST identity / metadata only; no file is created at the in-DB path.
   uint64_t file_number = versions_->NewFileNumber();
-  const std::string path_inside_db =
-      TableFileName(cfd->ioptions()->cf_paths, file_number, 0 /* path_id */);
-  {
-    IOOptions io_opts;
-    s = fs_->RenameFile(external_file, path_inside_db, io_opts, nullptr);
-    if (!s.ok()) {
-      return s;
-    }
-  }
 
   // ---- 3. Build FileMetaData with the per-file GSN; commit to the MANIFEST. ----
   // All keys are overridden to `global_seqno` at read time, so the bounds use it too.
@@ -5512,6 +5507,7 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
                       0 /* file_creation_time */, /*file_checksum=*/"",
                       /*file_checksum_func_name=*/"", unique_id);
   f_meta.fd.global_seqno_override = global_seqno;  // [relink] per-file GSN
+  f_meta.fd.external_path = external_file;  // [relink] reference in place (no rename)
 
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());

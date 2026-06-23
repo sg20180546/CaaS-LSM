@@ -9,14 +9,26 @@
 #include <time.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <sstream>
+#include <string>
 
 #include "env_hdfs.h"
 #include "logging/logging.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
 #include "util/string_util.h"
+
+// [relink/Storage-CP] Generated gRPC client for the StorageService refcount/GC
+// CP. These headers are produced at build time into ${CMAKE_CURRENT_BINARY_DIR}
+// (already on the include path) and the generated sources are compiled into the
+// rocksdb library, which also links grpc++/protobuf. Including them here is
+// inert at runtime unless STORAGE_CP_ADDR is set.
+#include <grpcpp/grpcpp.h>
+
+#include "compaction_service.grpc.pb.h"
 
 #define HDFS_EXISTS 0
 #define HDFS_DOESNT_EXIST -1
@@ -404,6 +416,15 @@ class HdfsDirectory : public FSDirectory {
 
 }  // namespace
 
+// [relink/Storage-CP] Opaque holder for the gRPC channel + generated Stub.
+// Defined here (not in the header) so the public header stays free of the
+// generated proto/grpc headers. Only ever constructed when Storage-CP is
+// ENABLED (STORAGE_CP_ADDR non-empty).
+struct HdfsFileSystem::StorageCpClient {
+  std::shared_ptr<grpc::Channel> channel;
+  std::unique_ptr<compactionservice::StorageService::Stub> stub;
+};
+
 // Finally, the HdfsFileSystem
 HdfsFileSystem::HdfsFileSystem(const std::shared_ptr<FileSystem>& base,
                                const std::string& fsname, hdfsFS fileSys)
@@ -414,6 +435,39 @@ HdfsFileSystem::~HdfsFileSystem() {
     fprintf(stderr, "Destroying HdfsFileSystem(%s)\n", fsname_.c_str());
     hdfsDisconnect(fileSys_);
   }
+}
+
+// [relink/Storage-CP] True iff fname names a real SST table file.
+bool HdfsFileSystem::IsSstFile(const std::string& fname) {
+  static const std::string kSstSuffix = ".sst";
+  return fname.size() >= kSstSuffix.size() &&
+         fname.compare(fname.size() - kSstSuffix.size(), kSstSuffix.size(),
+                       kSstSuffix) == 0;
+}
+
+// [relink/Storage-CP] Lazily build (once) the StorageService client from the
+// environment. Returns nullptr when DISABLED (STORAGE_CP_ADDR unset/empty),
+// in which case all callers fall back to the unmodified HDFS path => baseline
+// is BIT-IDENTICAL.
+HdfsFileSystem::StorageCpClient* HdfsFileSystem::GetStorageCpClient() const {
+  std::call_once(storage_cp_init_flag_, [this]() {
+    const char* addr = std::getenv("STORAGE_CP_ADDR");
+    if (addr == nullptr || addr[0] == '\0') {
+      // DISABLED: leave storage_cp_client_ == nullptr.
+      return;
+    }
+    const char* shard = std::getenv("STORAGE_CP_SHARD");
+    storage_cp_shard_ =
+        (shard != nullptr && shard[0] != '\0')
+            ? static_cast<uint32_t>(std::strtoul(shard, nullptr, 10))
+            : 0u;
+    auto client = std::unique_ptr<StorageCpClient>(new StorageCpClient());
+    client->channel = grpc::CreateChannel(
+        std::string(addr), grpc::InsecureChannelCredentials());
+    client->stub = compactionservice::StorageService::NewStub(client->channel);
+    storage_cp_client_ = std::move(client);
+  });
+  return storage_cp_client_.get();
 }
 
 std::string HdfsFileSystem::GetId() const {
@@ -477,6 +531,21 @@ IOStatus HdfsFileSystem::NewWritableFile(
     return IOError(fname, errno);
   }
   result->reset(f);
+
+  // [relink/Storage-CP] Best-effort NotifyCreate so the CP can seed refcount=1
+  // for this new SST. DISABLED (client==nullptr) or non-SST => no-op =>
+  // baseline bit-identical. Never affects the actual file creation above:
+  // errors are swallowed.
+  if (StorageCpClient* client = GetStorageCpClient()) {
+    if (IsSstFile(fname)) {
+      compactionservice::FileRef req;
+      req.set_path(fname);
+      req.set_shard_id(storage_cp_shard_);
+      google::protobuf::Empty reply;
+      grpc::ClientContext ctx;
+      client->stub->NotifyCreate(&ctx, req, &reply);  // ignore status
+    }
+  }
   return IOStatus::OK();
 }
 
@@ -543,6 +612,29 @@ IOStatus HdfsFileSystem::GetChildren(const std::string& path,
 IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
+  // [relink/Storage-CP] When ENABLED and this is a shared SST, route the delete
+  // through the CP's refcount: only physically delete when the CP says the
+  // refcount hit 0 (reply.deleted==true). If the CP RPC fails we conservatively
+  // fall back to the normal physical delete so we never leak the file on the
+  // local-only path. DISABLED or non-SST => unchanged baseline path below.
+  if (StorageCpClient* client = GetStorageCpClient()) {
+    if (IsSstFile(fname)) {
+      compactionservice::FileRef req;
+      req.set_path(fname);
+      req.set_shard_id(storage_cp_shard_);
+      compactionservice::DeleteReply reply;
+      grpc::ClientContext ctx;
+      grpc::Status s = client->stub->RequestDelete(&ctx, req, &reply);
+      if (s.ok()) {
+        if (!reply.deleted()) {
+          // Still referenced by another shard: keep the physical file.
+          return IOStatus::OK();
+        }
+        // refcount reached 0: fall through to physically delete.
+      }
+      // s not ok => fall back to the normal physical delete below.
+    }
+  }
   if (hdfsDelete(fileSys_, fname.c_str(), 1) == 0) {
     return IOStatus::OK();
   }

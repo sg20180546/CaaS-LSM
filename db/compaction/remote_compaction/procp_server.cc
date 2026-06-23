@@ -6,6 +6,8 @@
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 
+#include <set>
+
 #include "compaction_service.grpc.pb.h"
 #include "queue"
 #include "rocksdb/options.h"
@@ -52,6 +54,17 @@ std::priority_queue<uint64_t, std::vector<uint64_t>, TaskCmp>
     task_priority_queue_;
 std::mutex monitor_latch_;
 std::mutex scheduler_latch_;
+
+// [relink/Storage-CP] Per-file refcount over shared SSTs on HDFS.
+// path(full HDFS URI) -> {count, owning shard ids}. Eager: NotifyCreate(=1)/NotifyLink(++)/
+// RequestDelete(--). Physical hdfsDelete is performed by the CN when RequestDelete returns
+// deleted=true (refcount hit 0); a periodic mark-sweep GC (see RunStorageGC) reconciles leaks.
+struct RefEntry {
+  int count = 0;
+  std::set<uint32_t> owners;
+};
+std::unordered_map<std::string, RefEntry> storage_refcount_map_;
+std::mutex storage_latch_;
 
 class ProCPImpl final : public compactionservice::ProCPService::Service {
  public:
@@ -135,6 +148,115 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
     return grpc::Status::OK;
   }
 };
+
+// [relink/Storage-CP] Distributed refcount registry for shared SSTs on HDFS.
+// CN/CSA notify the CP when a shared (aligned/relinked) .sst is physically
+// created or logically linked into another shard, and ask the CP before
+// deleting one. The CP owns the authoritative refcount keyed by full HDFS URI;
+// it never touches HDFS itself this milestone -- the CN performs the actual
+// hdfsDelete iff RequestDelete returns deleted=true (refcount reached 0).
+// ISOLATION: this service only ever runs for files registered via these RPCs.
+// When the relink feature is disabled, FileDescriptor::external_path is empty,
+// CN/CSA never call NotifyCreate/NotifyLink/RequestDelete, storage_refcount_map_
+// stays empty, and librocksdb/serverclient behavior is bit-identical to today.
+class StorageImpl final : public compactionservice::StorageService::Service {
+ public:
+  // A new physical reference to a shared SST. PLAIN COUNT (++), NOT keyed by
+  // owner identity: with remote compaction the CSA (one shard_id) CREATES the
+  // aligned SST while the CN (a different shard_id) later DELETEs it, so gating
+  // the count on owner-set membership would miss the decrement. owners is kept
+  // for debug only. One NewWritableFile => one NotifyCreate per file.
+  grpc::Status NotifyCreate(grpc::ServerContext* context,
+                            const compactionservice::FileRef* request,
+                            google::protobuf::Empty* response) override {
+    std::lock_guard<std::mutex> lock(storage_latch_);
+    auto& e = storage_refcount_map_[request->path()];
+    e.count++;
+    e.owners.insert(request->shard_id());  // debug only
+    std::cout << GetTime() << "[storage] NotifyCreate path=" << request->path()
+              << " shard=" << request->shard_id() << " refcount=" << e.count
+              << std::endl;
+    return grpc::Status::OK;
+  }
+
+  // Logical link of an already-existing shared SST into another shard (relink).
+  // PLAIN COUNT (++) like NotifyCreate.
+  grpc::Status NotifyLink(grpc::ServerContext* context,
+                          const compactionservice::FileRef* request,
+                          google::protobuf::Empty* response) override {
+    std::lock_guard<std::mutex> lock(storage_latch_);
+    auto& e = storage_refcount_map_[request->path()];
+    e.count++;
+    e.owners.insert(request->shard_id());  // debug only
+    std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path()
+              << " shard=" << request->shard_id() << " refcount=" << e.count
+              << std::endl;
+    return grpc::Status::OK;
+  }
+
+  // Drop a shard's reference. Replies deleted=true (so the CN physically
+  // removes the SST from HDFS) only when no shard references it anymore. An
+  // untracked path is treated as unshared -> deleted=true, refcount=0, so the
+  // CN's normal delete path is preserved for non-relinked files.
+  grpc::Status RequestDelete(grpc::ServerContext* context,
+                             const compactionservice::FileRef* request,
+                             compactionservice::DeleteReply* reply) override {
+    std::lock_guard<std::mutex> lock(storage_latch_);
+    auto it = storage_refcount_map_.find(request->path());
+    if (it == storage_refcount_map_.end()) {
+      // Untracked => unshared: tell the CN to delete normally.
+      reply->set_deleted(true);
+      reply->set_refcount(0);
+    } else {
+      auto& e = it->second;
+      e.count--;  // unconditional: the deleter need not be the creator (CSA vs CN)
+      e.owners.erase(request->shard_id());  // debug only
+      if (e.count <= 0) {
+        storage_refcount_map_.erase(it);
+        reply->set_deleted(true);
+        reply->set_refcount(0);
+      } else {
+        reply->set_deleted(false);
+        reply->set_refcount(e.count);
+      }
+    }
+    std::cout << GetTime() << "[storage] RequestDelete path=" << request->path()
+              << " shard=" << request->shard_id()
+              << " deleted=" << reply->deleted()
+              << " refcount=" << reply->refcount() << std::endl;
+    return grpc::Status::OK;
+  }
+};
+
+// [relink/Storage-CP] Background reconciliation of the shared-SST registry.
+// STUB this milestone: just reports how many shared files are tracked.
+// TODO(storage-gc): implement a real mark-sweep GC to reclaim orphaned shared
+// SSTs that leaked due to crashes/lost RequestDelete RPCs:
+//   1. Link libhdfs into procp_server (a later milestone; the CP currently has
+//      no HDFS client).
+//   2. For every registered DB, parse its latest MANIFEST to compute the live
+//      set of referenced .sst paths (the "mark" phase).
+//   3. Union the marks across all DBs/shards and reconcile against
+//      storage_refcount_map_.
+//   4. For each shared .sst on HDFS that is referenced by no live MANIFEST and
+//      is older than a grace period (to avoid racing in-flight compactions),
+//      hdfsDelete it and drop its map entry (the "sweep" phase).
+//   5. Run under storage_latch_ for map access; do HDFS I/O outside the lock.
+[[noreturn]] void RunStorageGC() {
+  while (true) {
+    sleep(300);
+    std::lock_guard<std::mutex> lock(storage_latch_);
+    size_t tracked = storage_refcount_map_.size();
+    size_t shared = 0;
+    for (const auto& kv : storage_refcount_map_) {
+      if (kv.second.count > 1) {
+        shared++;
+      }
+    }
+    std::cout << GetTime() << "[storage-gc] tracked=" << tracked
+              << " shared=" << shared << std::endl;
+  }
+}
 
 grpc::Status DistributeCompactionJob(
     const compactionservice::CompactionTaskArgs& compact_task_args,
@@ -270,15 +392,19 @@ std::string ScheduleCSA(
 int main() {
   std::string server_address(compaction_service_options.pro_cp_address);
   ProCPImpl service;
+  StorageImpl storage_service;
 
   grpc::ServerBuilder builder;
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
   builder.RegisterService(&service);
+  builder.RegisterService(&storage_service);
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
   std::cout << GetTime() << "Server listening on " << server_address
             << std::endl;
   std::thread scheduler(ConsumeTask);
   std::thread monitor(UpdateCSAStatus);
+  std::thread storage_gc(RunStorageGC);
+  storage_gc.detach();
   scheduler.join();
   monitor.join();
   server->Wait();
