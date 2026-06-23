@@ -13,6 +13,9 @@
 #include "rocksdb/options.h"
 #include "thread"
 #include "utils.h"
+#include <cstdlib>
+#include <vector>
+#include "hdfs.h"  // [relink/Storage-CP] libhdfs C API: the CP now owns the physical SST delete
 
 ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
 std::unordered_map<uint64_t, compactionservice::AddTaskArgs> task_args_map_;
@@ -56,15 +59,21 @@ std::mutex monitor_latch_;
 std::mutex scheduler_latch_;
 
 // [relink/Storage-CP] Per-file refcount over shared SSTs on HDFS.
-// path(full HDFS URI) -> {count, owning shard ids}. Eager: NotifyCreate(=1)/NotifyLink(++)/
-// RequestDelete(--). Physical hdfsDelete is performed by the CN when RequestDelete returns
-// deleted=true (refcount hit 0); a periodic mark-sweep GC (see RunStorageGC) reconciles leaks.
+// path(bare HDFS path, e.g. /kg/s0/000123.sst) -> {count, owning shard ids}.
+// Eager: NotifyCreate(=1)/NotifyLink(++)/RequestDelete(--). When refcount reaches 0 no live
+// shard references the file anymore, so the CP (which now links libhdfs) OWNS the physical
+// delete: RequestDelete queues the path on storage_pending_delete_ and the periodic GC thread
+// (RunStorageGC, every STORAGE_GC_INTERVAL_S, default 60s) batch-hdfsDeletes it; the CN never
+// hdfsDeletes a tracked file. refcount==0 is definitive (every reference released => no live
+// MANIFEST points at it), so the batch delete needs NO MANIFEST scan. A MANIFEST mark-sweep is
+// only a *future* backstop for files leaked by a lost RequestDelete (CN crash), out of scope here.
 struct RefEntry {
   int count = 0;
   std::set<uint32_t> owners;
 };
 std::unordered_map<std::string, RefEntry> storage_refcount_map_;
-std::mutex storage_latch_;
+std::vector<std::string> storage_pending_delete_;  // refcount-0 paths awaiting the CP's batch hdfsDelete
+std::mutex storage_latch_;                          // guards storage_refcount_map_ + storage_pending_delete_
 
 class ProCPImpl final : public compactionservice::ProCPService::Service {
  public:
@@ -194,10 +203,11 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     return grpc::Status::OK;
   }
 
-  // Drop a shard's reference. Replies deleted=true (so the CN physically
-  // removes the SST from HDFS) only when no shard references it anymore. An
-  // untracked path is treated as unshared -> deleted=true, refcount=0, so the
-  // CN's normal delete path is preserved for non-relinked files.
+  // Drop a shard's reference. For a TRACKED file the CP owns deletion: when the
+  // refcount hits 0 the path is queued for the CP's batch GC (RunStorageGC) and the
+  // reply is deleted=false (the CN must NOT delete it). An UNTRACKED path (never saw a
+  // NotifyCreate) is treated as unshared -> deleted=true so the CN's normal delete path
+  // stays intact for non-relinked files / pre-STORAGE_CP files.
   grpc::Status RequestDelete(grpc::ServerContext* context,
                              const compactionservice::FileRef* request,
                              compactionservice::DeleteReply* reply) override {
@@ -212,8 +222,12 @@ class StorageImpl final : public compactionservice::StorageService::Service {
       e.count--;  // unconditional: the deleter need not be the creator (CSA vs CN)
       e.owners.erase(request->shard_id());  // debug only
       if (e.count <= 0) {
+        // No shard references it anymore. The CP owns the physical delete: queue it
+        // for the periodic batch GC and tell the CN NOT to delete. refcount==0 is
+        // definitive, so no MANIFEST check is needed.
         storage_refcount_map_.erase(it);
-        reply->set_deleted(true);
+        storage_pending_delete_.push_back(request->path());
+        reply->set_deleted(false);
         reply->set_refcount(0);
       } else {
         reply->set_deleted(false);
@@ -228,33 +242,51 @@ class StorageImpl final : public compactionservice::StorageService::Service {
   }
 };
 
-// [relink/Storage-CP] Background reconciliation of the shared-SST registry.
-// STUB this milestone: just reports how many shared files are tracked.
-// TODO(storage-gc): implement a real mark-sweep GC to reclaim orphaned shared
-// SSTs that leaked due to crashes/lost RequestDelete RPCs:
-//   1. Link libhdfs into procp_server (a later milestone; the CP currently has
-//      no HDFS client).
-//   2. For every registered DB, parse its latest MANIFEST to compute the live
-//      set of referenced .sst paths (the "mark" phase).
-//   3. Union the marks across all DBs/shards and reconcile against
-//      storage_refcount_map_.
-//   4. For each shared .sst on HDFS that is referenced by no live MANIFEST and
-//      is older than a grace period (to avoid racing in-flight compactions),
-//      hdfsDelete it and drop its map entry (the "sweep" phase).
-//   5. Run under storage_latch_ for map access; do HDFS I/O outside the lock.
+// [relink/Storage-CP] Lazy/batched physical delete owned by the CP.
+// Every STORAGE_GC_INTERVAL_S (default 60s) the CP drains the refcount-0 paths that
+// RequestDelete queued and hdfsDeletes them in one pass. This is the "Lazy GC": instead of
+// the CN deleting each obsolete SST inline, the CP accumulates them and reclaims in batch.
+// The CP connects to the NameNode EXPLICITLY (a bare path on the default fs would hit the
+// LOCAL fs -- fs.defaultFS is unset on this cluster). A failed delete is re-queued, never
+// leaked. (A MANIFEST mark-sweep for lost-RPC/crash leaks would slot in here as a later
+// backstop; refcount-0 reclamation needs no MANIFEST.) HDFS I/O is done outside storage_latch_.
 [[noreturn]] void RunStorageGC() {
+  int interval = 60;
+  if (const char* s = getenv("STORAGE_GC_INTERVAL_S")) { int v = atoi(s); if (v > 0) interval = v; }
+  const char* nn_host = getenv("STORAGE_GC_NN_HOST"); if (!nn_host || !*nn_host) nn_host = "192.168.88.87";
+  int nn_port = 9000;
+  if (const char* p = getenv("STORAGE_GC_NN_PORT")) { int v = atoi(p); if (v > 0) nn_port = v; }
+  const char* user = getenv("HADOOP_USER_NAME"); if (!user || !*user) user = "sbyeon12";
+  hdfsFS fs = nullptr;
   while (true) {
-    sleep(300);
-    std::lock_guard<std::mutex> lock(storage_latch_);
-    size_t tracked = storage_refcount_map_.size();
-    size_t shared = 0;
-    for (const auto& kv : storage_refcount_map_) {
-      if (kv.second.count > 1) {
-        shared++;
-      }
+    sleep(interval);
+    std::vector<std::string> batch;
+    size_t tracked = 0, shared = 0;
+    {
+      std::lock_guard<std::mutex> lock(storage_latch_);
+      batch.swap(storage_pending_delete_);
+      tracked = storage_refcount_map_.size();
+      for (const auto& kv : storage_refcount_map_) if (kv.second.count > 1) shared++;
     }
-    std::cout << GetTime() << "[storage-gc] tracked=" << tracked
-              << " shared=" << shared << std::endl;
+    if (!batch.empty() && fs == nullptr) {
+      fs = hdfsConnectAsUser(nn_host, nn_port, user);
+      if (fs == nullptr)
+        std::cout << GetTime() << "[storage-gc] hdfsConnect FAILED " << nn_host << ":" << nn_port
+                  << " (retry next cycle)" << std::endl;
+    }
+    int deleted = 0;
+    std::vector<std::string> requeue;
+    for (const auto& path : batch) {
+      if (fs != nullptr && hdfsDelete(fs, path.c_str(), /*recursive=*/0) == 0) deleted++;
+      else requeue.push_back(path);  // transient failure -> retry next cycle, never leak
+    }
+    if (!requeue.empty()) {
+      std::lock_guard<std::mutex> lock(storage_latch_);
+      for (auto& p : requeue) storage_pending_delete_.push_back(std::move(p));
+    }
+    std::cout << GetTime() << "[storage-gc] interval=" << interval << "s tracked=" << tracked
+              << " shared=" << shared << " batch=" << batch.size() << " deleted=" << deleted
+              << " requeued=" << requeue.size() << std::endl;
   }
 }
 
