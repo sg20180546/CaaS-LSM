@@ -24,6 +24,7 @@
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
+#include "db/bucket_util.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
@@ -3209,12 +3210,27 @@ void VersionStorageInfo::ComputeCompactionScore(
       // overwrites/deletions).
       int num_sorted_runs = 0;
       uint64_t total_size = 0;
+      // [BucketLSM / relink — G5 only] also track per-bucket count of NON-being-compacted L0 files, so
+      // the bucketed L0 score below uses the hottest bucket's count with the SAME being_compacted
+      // semantics as num_sorted_runs (excludes in-flight files -> no re-trigger of an active bucket).
+      const bool l0_bucketed = (level == 0 && immutable_options.l0_bucket_count > 1);
+      std::vector<int> l0_bucket_runs;
+      if (l0_bucketed) l0_bucket_runs.assign(immutable_options.l0_bucket_count, 0);
       for (auto* f : files_[level]) {
         total_downcompact_bytes += static_cast<double>(f->fd.GetFileSize());
         if (!f->being_compacted) {
           total_size += f->compensated_file_size;
           num_sorted_runs++;
+          if (l0_bucketed) {
+            l0_bucket_runs[BucketOf(f->smallest.user_key(),
+                                    immutable_options.l0_bucket_key_space,
+                                    immutable_options.l0_bucket_count)]++;
+          }
         }
+      }
+      int l0_max_bucket_runs = 0;
+      if (l0_bucketed) {
+        for (int c : l0_bucket_runs) l0_max_bucket_runs = std::max(l0_max_bucket_runs, c);
       }
       if (compaction_style_ == kCompactionStyleUniversal) {
         // For universal compaction, we use level0 score to indicate
@@ -3253,7 +3269,15 @@ void VersionStorageInfo::ComputeCompactionScore(
               score);
         }
       } else {
-        score = static_cast<double>(num_sorted_runs) /
+        // [BucketLSM / relink — G5 only] When L0 is bucketed, trigger L0->L1 on
+        // the HOTTEST bucket's file count, not the inflated total, so one flush
+        // emitting N bucket-pure files does not over-trigger. Gated: off-path
+        // (l0_bucket_count<=1) uses num_sorted_runs exactly as the original.
+        int l0_trigger_count = num_sorted_runs;
+        if (immutable_options.l0_bucket_count > 1) {
+          l0_trigger_count = l0_max_bucket_runs;  // [BucketLSM] hottest bucket, being_compacted-excluded
+        }
+        score = static_cast<double>(l0_trigger_count) /
                 mutable_cf_options.level0_file_num_compaction_trigger;
         if (compaction_style_ == kCompactionStyleLevel && num_levels() > 1) {
           // Level-based involves L0->L0 compactions that can lead to oversized
@@ -4309,6 +4333,33 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
     }
   }
   set_l0_delay_trigger_count(num_l0_count);
+
+  // [BucketLSM / relink — G5 only] Per-bucket L0 file count. With one flush
+  // producing N bucket-pure L0 files, the TOTAL L0 count inflates and would
+  // stall / over-trigger spuriously. When l0_bucket_count>1 we cache the MAX
+  // number of L0 files in any single bucket; the write-stall (column_family.cc)
+  // and L0->L1 compaction trigger (ComputeCompactionScore) use it instead of
+  // the total. When bucketing is OFF we set it to the total so callers can read
+  // it uniformly, but off-path callers keep using l0_delay_trigger_count() so
+  // baselines stay bit-identical. The per-bucket scan is only done when
+  // bucketing is on, so the baseline cost is unchanged.
+  if (ioptions.l0_bucket_count > 1) {
+    std::vector<int> per_bucket(ioptions.l0_bucket_count, 0);
+    for (const auto& f : files_[0]) {
+      // L0 files are bucket-pure, so the smallest key's bucket == the file's
+      // bucket. FileMetaData carries no bucket field; derive it here.
+      uint64_t b = BucketOf(f->smallest.user_key(), ioptions.l0_bucket_key_space,
+                            ioptions.l0_bucket_count);
+      per_bucket[b]++;
+    }
+    int max_in_bucket = 0;
+    for (int c : per_bucket) {
+      if (c > max_in_bucket) max_in_bucket = c;
+    }
+    l0_max_bucket_count_ = max_in_bucket;
+  } else {
+    l0_max_bucket_count_ = num_l0_count;
+  }
 
   level_max_bytes_.resize(ioptions.num_levels);
   if (!ioptions.level_compaction_dynamic_level_bytes) {

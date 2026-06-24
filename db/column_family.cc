@@ -939,8 +939,20 @@ WriteStallCondition ColumnFamilyData::RecalculateWriteStallConditions(
     uint64_t compaction_needed_bytes =
         vstorage->estimated_compaction_needed_bytes();
 
+    // [BucketLSM / relink — G5 only] When L0 is bucketed, the write-stall must
+    // look at the MAX number of L0 files in any single bucket, not the inflated
+    // total (one flush emits N bucket-pure L0 files). Reads probe only one
+    // bucket, so the per-bucket count preserves read latency while still
+    // protecting write throughput. Gated: off-path (l0_bucket_count<=1) passes
+    // l0_delay_trigger_count() exactly as the original. Only the input count is
+    // swapped; the STOP/SLOWDOWN comparisons in GetWriteStallConditionAndCause
+    // are untouched.
+    int num_l0_for_stall = vstorage->l0_delay_trigger_count();
+    if (ioptions()->l0_bucket_count > 1) {
+      num_l0_for_stall = vstorage->l0_max_bucket_count();
+    }
     auto write_stall_condition_and_cause = GetWriteStallConditionAndCause(
-        imm()->NumNotFlushed(), vstorage->l0_delay_trigger_count(),
+        imm()->NumNotFlushed(), num_l0_for_stall,
         vstorage->estimated_compaction_needed_bytes(), mutable_cf_options,
         *ioptions());
     write_stall_condition = write_stall_condition_and_cause.first;

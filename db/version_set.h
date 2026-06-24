@@ -305,6 +305,13 @@ class VersionStorageInfo {
 
   void set_l0_delay_trigger_count(int v) { l0_delay_trigger_count_ = v; }
 
+  // [BucketLSM / relink] MAX number of L0 files in any single bucket. Only
+  // meaningful when ColumnFamilyOptions::l0_bucket_count > 1; computed in
+  // CalculateBaseBytes. When bucketing is off it is set to the total L0 file
+  // count so callers can use it uniformly, but off-path callers must keep using
+  // l0_delay_trigger_count() so baselines stay bit-identical.
+  int l0_max_bucket_count() const { return l0_max_bucket_count_; }
+
   // REQUIRES: This version has been saved (see VersionBuilder::SaveTo)
   int NumLevelFiles(int level) const {
     assert(finalized_);
@@ -692,6 +699,9 @@ class VersionStorageInfo {
   std::vector<int> compaction_level_;
   int l0_delay_trigger_count_ = 0;  // Count used to trigger slow down and stop
                                     // for number of L0 files.
+  // [BucketLSM / relink] MAX number of L0 files in any single bucket (==total
+  // when l0_bucket_count<=1). Computed in CalculateBaseBytes.
+  int l0_max_bucket_count_ = 0;
 
   // Compact cursors for round-robin compactions in each level
   std::vector<InternalKey> compact_cursor_;

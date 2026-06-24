@@ -2334,9 +2334,15 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
       // triggers. If it stalled in these conditions, that'd mean the stall
       // triggers are so low that stalling is needed for any background work. In
       // that case we shouldn't wait since background work won't be scheduled.
+      // [BucketLSM / relink — G5 only] use the per-bucket max L0 count (consistent with the primary
+      // stall decision in RecalculateWriteStallConditions) so this predictive check doesn't mis-predict
+      // on the inflated total. Off-path (l0_bucket_count<=1): l0_delay_trigger_count(), bit-identical.
+      const int l0_for_stall = (cfd->ioptions()->l0_bucket_count > 1)
+                                   ? vstorage->l0_max_bucket_count()
+                                   : vstorage->l0_delay_trigger_count();
       if (cfd->imm()->NumNotFlushed() <
               cfd->ioptions()->min_write_buffer_number_to_merge &&
-          vstorage->l0_delay_trigger_count() <
+          l0_for_stall <
               mutable_cf_options.level0_file_num_compaction_trigger) {
         break;
       }
@@ -2346,7 +2352,7 @@ Status DBImpl::WaitUntilFlushWouldNotStallWrites(ColumnFamilyData* cfd,
       // mode due to pending compaction bytes, but that's less common
       write_stall_condition = ColumnFamilyData::GetWriteStallConditionAndCause(
                                   cfd->imm()->NumNotFlushed() + 1,
-                                  vstorage->l0_delay_trigger_count() + 1,
+                                  l0_for_stall + 1,
                                   vstorage->estimated_compaction_needed_bytes(),
                                   mutable_cf_options, *cfd->ioptions())
                                   .first;
