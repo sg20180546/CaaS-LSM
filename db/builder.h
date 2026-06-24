@@ -72,6 +72,15 @@ extern Status BuildTable(
     BlobFileCompletionCallback* blob_callback = nullptr,
     uint64_t* num_input_entries = nullptr,
     uint64_t* memtable_payload_bytes = nullptr,
-    uint64_t* memtable_garbage_bytes = nullptr);
+    uint64_t* memtable_garbage_bytes = nullptr,
+    // [BucketLSM / relink — G5 only] When non-null AND
+    // ioptions.l0_bucket_count > 1, a single flush is split into N
+    // bucket-pure L0 SST files: output is cut every time BucketOf(user_key)
+    // changes. The FIRST file stays in `meta` (original single-file path,
+    // file number pre-assigned by the caller). The 2nd..Nth completed files'
+    // metadata are appended here (file numbers allocated from `versions`).
+    // When null or l0_bucket_count <= 1, behavior is byte-for-byte the
+    // original single-file path (baseline isolation invariant).
+    std::vector<FileMetaData>* extra_metas = nullptr);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -826,6 +826,10 @@ Status FlushJob::WriteLevel0Table() {
 
   std::vector<BlobFileAddition> blob_file_additions;
 
+  // [BucketLSM / relink — G5 only] Extra (2nd..Nth) bucket-pure L0 files
+  // produced by BucketFlush. Empty unless l0_bucket_count > 1.
+  std::vector<FileMetaData> extra_metas_;
+
   {
     auto write_hint = cfd_->CalculateSSTWriteHint(0);
     Env::IOPriority io_priority = GetRateLimiterPriorityForWrite();
@@ -930,6 +934,9 @@ Status FlushJob::WriteLevel0Table() {
           meta_.fd.GetNumber());
       const SequenceNumber job_snapshot_seq =
           job_context_->GetJobSnapshotSequence();
+      // [BucketLSM / relink — G5 only] When l0_bucket_count > 1, BuildTable
+      // splits this flush into N bucket-pure L0 files: the first stays in
+      // `meta_`, the rest land here. Off (<=1) => stays empty, original path.
       s = BuildTable(
           dbname_, versions_, db_options_, tboptions, file_options_,
           cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
@@ -940,7 +947,8 @@ Status FlushJob::WriteLevel0Table() {
           BlobFileCreationReason::kFlush, seqno_to_time_mapping_, event_logger_,
           job_context_->job_id, io_priority, &table_properties_, write_hint,
           full_history_ts_low, blob_callback_, &num_input_entries,
-          &memtable_payload_bytes, &memtable_garbage_bytes);
+          &memtable_payload_bytes, &memtable_garbage_bytes,
+          &extra_metas_);
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();
@@ -1002,6 +1010,22 @@ Status FlushJob::WriteLevel0Table() {
                    meta_.file_creation_time, meta_.file_checksum,
                    meta_.file_checksum_func_name, meta_.unique_id);
 
+    // [BucketLSM] Register the extra bucket-pure L0 files (2nd..Nth) in the same
+    // VersionEdit so they all install/rollback atomically with this flush. Empty
+    // unless l0_bucket_count > 1.
+    for (const FileMetaData& em : extra_metas_) {
+      if (em.fd.GetFileSize() == 0) {
+        continue;
+      }
+      edit_->AddFile(0 /* level */, em.fd.GetNumber(), em.fd.GetPathId(),
+                     em.fd.GetFileSize(), em.smallest, em.largest,
+                     em.fd.smallest_seqno, em.fd.largest_seqno,
+                     em.marked_for_compaction, em.temperature,
+                     em.oldest_blob_file_number, em.oldest_ancester_time,
+                     em.file_creation_time, em.file_checksum,
+                     em.file_checksum_func_name, em.unique_id);
+    }
+
     edit_->SetBlobFileAdditions(std::move(blob_file_additions));
   }
 #ifndef ROCKSDB_LITE
@@ -1025,6 +1049,14 @@ Status FlushJob::WriteLevel0Table() {
   if (has_output) {
     stats.bytes_written = meta_.fd.GetFileSize();
     stats.num_output_files = 1;
+    // [BucketLSM] account the extra bucket-pure L0 files too.
+    for (const FileMetaData& em : extra_metas_) {
+      if (em.fd.GetFileSize() == 0) {
+        continue;
+      }
+      stats.bytes_written += em.fd.GetFileSize();
+      stats.num_output_files += 1;
+    }
   }
 
   const auto& blobs = edit_->GetBlobFileAdditions();

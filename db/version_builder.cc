@@ -26,6 +26,7 @@
 #include "cache/cache_reservation_manager.h"
 #include "db/blob/blob_file_meta.h"
 #include "db/dbformat.h"
+#include "db/bucket_util.h"
 #include "db/internal_stats.h"
 #include "db/table_cache.h"
 #include "db/version_set.h"
@@ -395,6 +396,21 @@ class VersionBuilder::Rep {
                 << lhs->fd.GetNumber() << ", #" << rhs->fd.GetNumber();
 
             return Status::Corruption("VersionBuilder", oss.str());
+          }
+
+          // [BucketLSM / relink — l0_bucket_count>1, G5 ONLY] Under L0 bucketing, one flush emits
+          // multiple bucket-PURE L0 files; files in DIFFERENT buckets are key-disjoint (share no user
+          // key) so their seqno ranges may freely interleave. The global strictly-decreasing
+          // smallest_seqno L0 invariant does NOT apply across buckets — reads disambiguate by key range,
+          // not by global seqno order, and the NewestFirstBySeqNo sort still orders same-bucket files
+          // newest-first. So skip the cross-bucket seqno check; enforce it only WITHIN a bucket.
+          // Gated on l0_bucket_count>1 => baselines (0) take the original check unchanged.
+          if (ioptions_->l0_bucket_count > 1 &&
+              BucketOf(lhs->smallest.user_key(), ioptions_->l0_bucket_key_space,
+                       ioptions_->l0_bucket_count) !=
+                  BucketOf(rhs->smallest.user_key(), ioptions_->l0_bucket_key_space,
+                           ioptions_->l0_bucket_count)) {
+            return Status::OK();
           }
 
           if (rhs->fd.smallest_seqno == rhs->fd.largest_seqno) {
