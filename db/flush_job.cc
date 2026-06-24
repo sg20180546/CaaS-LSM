@@ -13,6 +13,7 @@
 #include <cinttypes>
 #include <vector>
 
+#include "db/bucket_util.h"
 #include "db/builder.h"
 #include "db/db_iter.h"
 #include "db/dbformat.h"
@@ -809,6 +810,302 @@ bool FlushJob::MemPurgeDecider(double threshold) {
           threshold);
 }
 
+namespace {
+
+// [BucketLSM C2] Big-endian 8-byte encoding of v, so KeyValue8() of the result
+// == v. Used only to build an efficient Seek hint to a bucket's lower bound;
+// correctness comes from the BucketOf() filter, not from this encoding, so it is
+// safe for keys of any (fixed) width.
+inline std::string EncodeKey8BE(uint64_t v) {
+  std::string s(8, '\0');
+  for (int i = 7; i >= 0; --i) {
+    s[i] = static_cast<char>(v & 0xff);
+    v >>= 8;
+  }
+  return s;
+}
+
+// [BucketLSM C2] Lower KeyValue8 bound (inclusive) of uniform bucket `bucket`:
+// the smallest v with floor(v*count/key_space) == bucket, i.e.
+// ceil(bucket*key_space/count). Identical math to UniformBucketBoundaries().
+inline uint64_t UniformBucketLowerValue(uint64_t bucket, uint64_t key_space,
+                                        uint64_t count) {
+  if (bucket == 0 || count == 0) return 0;
+  return static_cast<uint64_t>(
+      ((unsigned __int128)bucket * key_space + (count - 1)) / count);
+}
+
+// [BucketLSM C2] InternalIterator that exposes exactly the keys of ONE bucket
+// from an underlying (per-worker) merging iterator. Membership uses BucketOf()
+// on the user key — the SAME function BucketFlush cutting, bucket-aware scan and
+// per-bucket compaction use — so it is exactly consistent with the rest of the
+// engine and correct for any fixed key width. A big-endian Seek hint jumps near
+// the bucket start; SkipToTarget() then steps over any earlier-bucket straggler
+// (possible only for sub-8-byte keys). Iteration ends as soon as BucketOf >
+// target. This relies on BucketOf being monotonic over sorted keys — the same
+// fixed-width assumption the serial BucketFlush cutter already depends on; a
+// violation surfaces as the caller's num_input_entries mismatch (fail-loud),
+// never silent data loss. Forward-only; reverse ops are unused in flush.
+class BucketFilterIterator : public InternalIterator {
+ public:
+  BucketFilterIterator(InternalIterator* iter, uint64_t target_bucket,
+                       const std::vector<uint64_t>* bnd, uint64_t key_space,
+                       uint64_t count, std::string seek_hint)
+      : iter_(iter),
+        target_(target_bucket),
+        bnd_(bnd),
+        key_space_(key_space),
+        count_(count),
+        seek_hint_(std::move(seek_hint)) {}
+
+  void SeekToFirst() override {
+    if (seek_hint_.empty()) {
+      iter_->SeekToFirst();
+    } else {
+      iter_->Seek(seek_hint_);
+    }
+    SkipToTarget();
+  }
+  void Next() override { iter_->Next(); }
+  bool Valid() const override {
+    return iter_->Valid() && BucketOfKey(iter_->key()) == target_;
+  }
+  Slice key() const override { return iter_->key(); }
+  Slice value() const override { return iter_->value(); }
+  Status status() const override { return iter_->status(); }
+
+  void Seek(const Slice&) override { assert(false); }
+  void SeekForPrev(const Slice&) override { assert(false); }
+  void SeekToLast() override { assert(false); }
+  void Prev() override { assert(false); }
+
+ private:
+  uint64_t BucketOfKey(const Slice& internal_key) const {
+    Slice uk = ExtractUserKey(internal_key);
+    return bnd_ ? BucketOf(uk, *bnd_) : BucketOf(uk, key_space_, count_);
+  }
+  void SkipToTarget() {
+    while (iter_->Valid() && BucketOfKey(iter_->key()) < target_) {
+      iter_->Next();
+    }
+  }
+
+  InternalIterator* const iter_;
+  const uint64_t target_;
+  const std::vector<uint64_t>* const bnd_;
+  const uint64_t key_space_;
+  const uint64_t count_;
+  const std::string seek_hint_;
+};
+
+}  // namespace
+
+// [BucketLSM C2 — G5 only] See flush_job.h for contract. Builds the N
+// bucket-pure L0 files of one flush concurrently by running the UNMODIFIED
+// single-file BuildTable (extra_metas=nullptr) per bucket over a
+// BucketFilterIterator, then fills meta_/extra_metas exactly like the serial
+// path so the caller's install/stats code is untouched. builder.cc is never
+// entered on its bucketing branch — strongest isolation.
+Status FlushJob::BuildBucketTablesParallel(
+    const ReadOptions& ro, const std::vector<uint64_t>& nonempty_buckets,
+    uint64_t l0_bucket_count, uint64_t l0_bucket_key_space,
+    const std::shared_ptr<const std::vector<uint64_t>>& bucket_bnd,
+    uint64_t current_time, uint64_t oldest_key_time,
+    uint64_t oldest_ancester_time, Env::IOPriority io_priority,
+    Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
+    SequenceNumber job_snapshot_seq, std::vector<FileMetaData>* extra_metas,
+    std::vector<BlobFileAddition>* blob_file_additions,
+    uint64_t* num_input_entries, uint64_t* memtable_payload_bytes,
+    uint64_t* memtable_garbage_bytes, IOStatus* io_s) {
+  const size_t nb = nonempty_buckets.size();
+  assert(nb > 1);
+  const ImmutableOptions* iopts = cfd_->ioptions();
+
+  // Per-bucket build context. A worker touches ONLY its own element, so no
+  // element is shared across threads (the vector itself is never resized once
+  // built, so concurrent element access needs no lock).
+  struct BucketBuild {
+    uint64_t bucket = 0;
+    FileMetaData meta;
+    TableProperties tp;
+    std::vector<BlobFileAddition> blobs;
+    uint64_t num_input = 0;
+    uint64_t payload = 0;
+    uint64_t garbage = 0;
+    std::string fname;
+    Status status;
+    IOStatus io_status;
+  };
+  std::vector<BucketBuild> builds(nb);
+
+  // Assign file numbers serially in this thread (deterministic order). The first
+  // non-empty bucket reuses meta_'s pre-allocated number; the rest get fresh
+  // ones — mirrors builder.cc make_next_meta(). Workers never call NewFileNumber
+  // (extra_metas=nullptr => builder.cc's only NewFileNumber site is unreached).
+  for (size_t i = 0; i < nb; i++) {
+    builds[i].bucket = nonempty_buckets[i];
+    if (i == 0) {
+      builds[i].meta = meta_;  // fd (pre-allocated) + ancester/creation time
+    } else {
+      builds[i].meta.fd =
+          FileDescriptor(versions_->NewFileNumber(), meta_.fd.GetPathId(), 0);
+      builds[i].meta.oldest_ancester_time = oldest_ancester_time;
+      builds[i].meta.file_creation_time = current_time;
+      builds[i].meta.temperature = meta_.temperature;
+    }
+  }
+
+  std::atomic<bool> has_error{false};
+  auto build_one = [&](size_t i) {
+    if (has_error.load(std::memory_order_acquire)) {
+      builds[i].status = Status::Aborted("another bucket failed");
+      return;
+    }
+    BucketBuild& b = builds[i];
+
+    // Independent per-worker iterators over the immutable memtables.
+    Arena warena;
+    std::vector<InternalIterator*> witers;
+    witers.reserve(mems_.size());
+    for (MemTable* m : mems_) {
+      witers.push_back(m->NewIterator(ro, &warena));
+    }
+    ScopedArenaIterator wmerge(NewMergingIterator(
+        &cfd_->internal_comparator(), witers.data(),
+        static_cast<int>(witers.size()), &warena));
+
+    std::string seek_hint;  // empty => SeekToFirst (bucket spanning -inf)
+    if (b.bucket > 0) {
+      uint64_t lower_v =
+          bucket_bnd ? (*bucket_bnd)[b.bucket - 1]
+                     : UniformBucketLowerValue(b.bucket, l0_bucket_key_space,
+                                               l0_bucket_count);
+      seek_hint = EncodeKey8BE(lower_v);
+      PutFixed64(&seek_hint,
+                 PackSequenceAndType(kMaxSequenceNumber, kValueTypeForSeek));
+    }
+    BucketFilterIterator fit(wmerge.get(), b.bucket, bucket_bnd.get(),
+                             l0_bucket_key_space, l0_bucket_count,
+                             std::move(seek_hint));
+
+    TableBuilderOptions tbo(
+        *iopts, mutable_cf_options_, cfd_->internal_comparator(),
+        cfd_->int_tbl_prop_collector_factories(), output_compression_,
+        mutable_cf_options_.compression_opts, cfd_->GetID(), cfd_->GetName(),
+        0 /* level */, false /* is_bottommost */,
+        TableFileCreationReason::kFlush, oldest_key_time, current_time, db_id_,
+        db_session_id_, 0 /* target_file_size */, b.meta.fd.GetNumber());
+
+    std::vector<std::unique_ptr<FragmentedRangeTombstoneIterator>> no_range_del;
+    b.status = BuildTable(
+        dbname_, versions_, db_options_, tbo, file_options_,
+        cfd_->table_cache(), &fit, std::move(no_range_del), &b.meta, &b.blobs,
+        existing_snapshots_, earliest_write_conflict_snapshot_,
+        job_snapshot_seq, snapshot_checker_,
+        mutable_cf_options_.paranoid_file_checks, cfd_->internal_stats(),
+        &b.io_status, io_tracer_, BlobFileCreationReason::kFlush,
+        seqno_to_time_mapping_, event_logger_, job_context_->job_id, io_priority,
+        &b.tp, write_hint, full_history_ts_low, blob_callback_, &b.num_input,
+        &b.payload, &b.garbage, /*extra_metas=*/nullptr);
+    b.fname = TableFileName(iopts->cf_paths, b.meta.fd.GetNumber(),
+                            b.meta.fd.GetPathId());
+    if (!b.status.ok()) {
+      has_error.store(true, std::memory_order_release);
+      ROCKS_LOG_ERROR(db_options_.info_log,
+                      "[%s] [JOB %d] parallel BucketFlush: bucket %" PRIu64
+                      " (file #%" PRIu64 ") failed: %s\n",
+                      cfd_->GetName().c_str(), job_context_->job_id, b.bucket,
+                      b.meta.fd.GetNumber(), b.status.ToString().c_str());
+    }
+  };
+
+  // Bounded worker pool capped at max_subcompactions (the configured
+  // parallelism budget). This thread participates as one worker.
+  const uint32_t maxsub = std::max<uint32_t>(1, db_options_.max_subcompactions);
+  const size_t cap = std::min<size_t>(nb, maxsub);
+  if (cap <= 1) {
+    ROCKS_LOG_WARN(
+        db_options_.info_log,
+        "[%s] [JOB %d] parallel_split_flush ON but max_subcompactions <= 1: "
+        "%zu bucket files built single-threaded\n",
+        cfd_->GetName().c_str(), job_context_->job_id, nb);
+  } else {
+    ROCKS_LOG_INFO(db_options_.info_log,
+                   "[%s] [JOB %d] parallel BucketFlush: %zu buckets, %zu "
+                   "workers\n",
+                   cfd_->GetName().c_str(), job_context_->job_id, nb, cap);
+  }
+  std::atomic<size_t> next_idx{0};
+  auto worker_loop = [&]() {
+    for (size_t i = next_idx.fetch_add(1); i < nb; i = next_idx.fetch_add(1)) {
+      build_one(i);
+    }
+  };
+  std::vector<port::Thread> pool;
+  pool.reserve(cap - 1);
+  for (size_t t = 1; t < cap; t++) pool.emplace_back(worker_loop);
+  worker_loop();
+  for (auto& th : pool) th.join();
+
+  // First error wins. On error, delete every successfully-created non-empty file
+  // (we will not install them) so no orphan SSTs are left behind.
+  Status first_err;
+  for (const BucketBuild& b : builds) {
+    if (!b.status.ok() && first_err.ok()) first_err = b.status;
+    if (!b.io_status.ok() && io_s->ok()) *io_s = b.io_status;
+  }
+  if (!first_err.ok()) {
+    for (const BucketBuild& b : builds) {
+      if (b.status.ok() && b.meta.fd.GetFileSize() > 0 && !b.fname.empty()) {
+        db_options_.fs->DeleteFile(b.fname, IOOptions(), nullptr)
+            .PermitUncheckedError();
+      }
+    }
+    return first_err;
+  }
+
+  // Success: sum the per-flush counters (disjoint buckets => exact totals).
+  *num_input_entries = 0;
+  *memtable_payload_bytes = 0;
+  *memtable_garbage_bytes = 0;
+  for (BucketBuild& b : builds) {
+    *num_input_entries += b.num_input;
+    *memtable_payload_bytes += b.payload;
+    *memtable_garbage_bytes += b.garbage;
+    for (BlobFileAddition& add : b.blobs) {
+      blob_file_additions->push_back(std::move(add));
+    }
+  }
+
+  // Pick the first NON-EMPTY file as the primary (meta_); the rest are extras. A
+  // bucket pre-counted non-empty can still finalize empty if the compaction
+  // filter dropped all its keys, so we must not assume builds[0] is non-empty
+  // (else has_output=false would drop the whole flush => data loss).
+  int primary = -1;
+  for (size_t i = 0; i < nb; i++) {
+    if (builds[i].meta.fd.GetFileSize() > 0) {
+      primary = static_cast<int>(i);
+      break;
+    }
+  }
+  if (primary < 0) {
+    // All buckets filtered to empty: no output. Leave meta_ empty (size 0); the
+    // caller's has_output gate then skips install. Each empty file was already
+    // deleted by its own BuildTable.
+    meta_ = builds[0].meta;
+    return Status::OK();
+  }
+  meta_ = builds[primary].meta;
+  table_properties_ = builds[primary].tp;
+  for (size_t i = 0; i < nb; i++) {
+    if (static_cast<int>(i) == primary) continue;
+    if (builds[i].meta.fd.GetFileSize() > 0) {
+      extra_metas->push_back(builds[i].meta);
+    }
+  }
+  return Status::OK();
+}
+
 Status FlushJob::WriteLevel0Table() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
@@ -934,21 +1231,73 @@ Status FlushJob::WriteLevel0Table() {
           meta_.fd.GetNumber());
       const SequenceNumber job_snapshot_seq =
           job_context_->GetJobSnapshotSequence();
-      // [BucketLSM / relink — G5 only] When l0_bucket_count > 1, BuildTable
-      // splits this flush into N bucket-pure L0 files: the first stays in
-      // `meta_`, the rest land here. Off (<=1) => stays empty, original path.
-      s = BuildTable(
-          dbname_, versions_, db_options_, tboptions, file_options_,
-          cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
-          &blob_file_additions, existing_snapshots_,
-          earliest_write_conflict_snapshot_, job_snapshot_seq,
-          snapshot_checker_, mutable_cf_options_.paranoid_file_checks,
-          cfd_->internal_stats(), &io_s, io_tracer_,
-          BlobFileCreationReason::kFlush, seqno_to_time_mapping_, event_logger_,
-          job_context_->job_id, io_priority, &table_properties_, write_hint,
-          full_history_ts_low, blob_callback_, &num_input_entries,
-          &memtable_payload_bytes, &memtable_garbage_bytes,
-          &extra_metas_);
+
+      // [BucketLSM C2 — G5 only] Choose PARALLEL BucketFlush over the serial
+      // BuildTable when: bucketing is ON (l0_bucket_count>1), parallel_split_flush
+      // is set, there are NO range tombstones (per-bucket iterators exclude them;
+      // the serial path enforces NotSupported), and there is >1 non-empty bucket.
+      // Any failed condition falls through to the unmodified BuildTable call, so
+      // baselines and the serial-bucketing path stay byte-for-byte unchanged.
+      const ImmutableOptions* iopts = cfd_->ioptions();
+      const uint64_t l0_bucket_count = iopts->l0_bucket_count;
+      bool used_parallel_bucket_flush = false;
+      if (l0_bucket_count > 1 && iopts->parallel_split_flush &&
+          range_del_iters.empty()) {
+        // Per-flush boundary snapshot (one consistent mapping for the whole
+        // flush, matching builder.cc). null => uniform key_space/count.
+        std::shared_ptr<const std::vector<uint64_t>> l0_bucket_bnd;
+        if (iopts->l0_bucket_boundaries) {
+          l0_bucket_bnd = iopts->l0_bucket_boundaries->Get();
+          if (l0_bucket_bnd && l0_bucket_bnd->empty()) l0_bucket_bnd = nullptr;
+        }
+        // Pre-count: one in-memory pass over the shared merging iterator to find
+        // the set of non-empty buckets (scheduling empty buckets would create +
+        // delete N empty HDFS files — the very cost C2 removes). `iter` is
+        // re-seekable, so the serial fallback below re-Seeks it.
+        const uint64_t nb_total =
+            l0_bucket_bnd ? (l0_bucket_bnd->size() + 1) : l0_bucket_count;
+        std::vector<char> seen(nb_total, 0);
+        for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+          Slice uk = ExtractUserKey(iter->key());
+          uint64_t b = l0_bucket_bnd ? BucketOf(uk, *l0_bucket_bnd)
+                                     : BucketOf(uk, iopts->l0_bucket_key_space,
+                                               l0_bucket_count);
+          if (b < nb_total) seen[b] = 1;
+        }
+        if (iter->status().ok()) {
+          std::vector<uint64_t> nonempty;
+          for (uint64_t b = 0; b < nb_total; b++) {
+            if (seen[b]) nonempty.push_back(b);
+          }
+          if (nonempty.size() > 1) {
+            s = BuildBucketTablesParallel(
+                ro, nonempty, l0_bucket_count, iopts->l0_bucket_key_space,
+                l0_bucket_bnd, current_time, oldest_key_time,
+                oldest_ancester_time, io_priority, write_hint,
+                full_history_ts_low, job_snapshot_seq, &extra_metas_,
+                &blob_file_additions, &num_input_entries,
+                &memtable_payload_bytes, &memtable_garbage_bytes, &io_s);
+            used_parallel_bucket_flush = true;
+          }
+        }
+      }
+      // [BucketLSM / relink — G5 only] Serial path: when l0_bucket_count > 1,
+      // BuildTable splits this flush into N bucket-pure L0 files (first in
+      // `meta_`, rest in extra_metas_). Off (<=1) => original single-file path.
+      if (!used_parallel_bucket_flush) {
+        s = BuildTable(
+            dbname_, versions_, db_options_, tboptions, file_options_,
+            cfd_->table_cache(), iter.get(), std::move(range_del_iters), &meta_,
+            &blob_file_additions, existing_snapshots_,
+            earliest_write_conflict_snapshot_, job_snapshot_seq,
+            snapshot_checker_, mutable_cf_options_.paranoid_file_checks,
+            cfd_->internal_stats(), &io_s, io_tracer_,
+            BlobFileCreationReason::kFlush, seqno_to_time_mapping_,
+            event_logger_, job_context_->job_id, io_priority,
+            &table_properties_, write_hint, full_history_ts_low, blob_callback_,
+            &num_input_entries, &memtable_payload_bytes, &memtable_garbage_bytes,
+            &extra_metas_);
+      }
       // TODO: Cleanup io_status in BuildTable and table builders
       assert(!s.ok() || io_s.ok());
       io_s.PermitUncheckedError();

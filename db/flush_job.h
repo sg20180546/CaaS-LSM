@@ -103,6 +103,31 @@ class FlushJob {
   void RecordFlushIOStats();
   Status WriteLevel0Table();
 
+  // [BucketLSM C2 — G5 only, gated parallel_split_flush && l0_bucket_count>1]
+  // Parallel BucketFlush: build this flush's N bucket-pure L0 SST files
+  // concurrently (one worker per non-empty bucket, capped at max_subcompactions)
+  // by running the UNMODIFIED single-file BuildTable per bucket over a
+  // bucket-filtered iterator. Fills meta_ (first non-empty bucket) and
+  // *extra_metas (the rest) exactly like the serial BuildTable path, so the
+  // caller's install/stats code is unchanged. `nonempty_buckets` is the sorted
+  // set of buckets that hold at least one key (pre-counted by the caller).
+  // `bucket_bnd` is the per-flush boundary snapshot (null => uniform key_space).
+  // On any worker error, every successfully-created file is deleted (no orphans)
+  // and the first error is returned. Never reads/writes builder.cc's bucketing
+  // path (extra_metas=nullptr per worker => vanilla single-file build).
+  Status BuildBucketTablesParallel(
+      const ReadOptions& ro,
+      const std::vector<uint64_t>& nonempty_buckets, uint64_t l0_bucket_count,
+      uint64_t l0_bucket_key_space,
+      const std::shared_ptr<const std::vector<uint64_t>>& bucket_bnd,
+      uint64_t current_time, uint64_t oldest_key_time,
+      uint64_t oldest_ancester_time, Env::IOPriority io_priority,
+      Env::WriteLifeTimeHint write_hint, const std::string* full_history_ts_low,
+      SequenceNumber job_snapshot_seq, std::vector<FileMetaData>* extra_metas,
+      std::vector<BlobFileAddition>* blob_file_additions,
+      uint64_t* num_input_entries, uint64_t* memtable_payload_bytes,
+      uint64_t* memtable_garbage_bytes, IOStatus* io_s);
+
   // Memtable Garbage Collection algorithm: a MemPurge takes the list
   // of immutable memtables and filters out (or "purge") the outdated bytes
   // out of it. The output (the filtered bytes, or "useful payload") is

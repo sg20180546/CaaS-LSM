@@ -924,6 +924,7 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       blob_cache(cf_options.blob_cache),
       l0_bucket_count(cf_options.l0_bucket_count),
       l0_bucket_key_space(cf_options.l0_bucket_key_space),
+      parallel_split_flush(cf_options.parallel_split_flush),
       // [BucketLSM Phase 7] allocate the RCU boundary publisher iff bucketing is
       // ON. Copy-construction of ImmutableCFOptions shallow-copies this shared_ptr
       // so the canonical cfd->ioptions_ and all its by-value reads share ONE

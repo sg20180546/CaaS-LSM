@@ -249,6 +249,15 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   uint64_t l0_bucket_count = 0;
   uint64_t l0_bucket_key_space = 0;
 
+  // [BucketLSM C2 / relink — option-gated, set on RELINK (G5) shards ONLY] When true
+  // AND l0_bucket_count > 1, a single flush builds its N bucket-pure L0 SST files in
+  // PARALLEL (one worker per non-empty bucket, capped at max_subcompactions) instead
+  // of writing them serially. Removes the serial N-times HDFS create/write/close
+  // round-trip that dominates flush when bucket count ~= core count. false (default)
+  // OR l0_bucket_count <= 1 => the serial BuildTable path runs byte-for-byte
+  // unchanged, so baselines stay bit-identical (isolation invariant).
+  bool parallel_split_flush = false;
+
   // If non-nullptr, use the specified function to put keys in contiguous
   // groups called "prefixes". These prefixes are used to place one
   // representative entry for the group into the Bloom filter
