@@ -25,6 +25,7 @@
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
 #include "db/bucket_util.h"
+#include "db/bucket_util_io.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_source.h"
 #include "db/compaction/compaction.h"
@@ -3243,9 +3244,8 @@ void VersionStorageInfo::ComputeCompactionScore(
           total_size += f->compensated_file_size;
           num_sorted_runs++;
           if (l0_bucketed) {
-            l0_bucket_runs[BucketOf(f->smallest.user_key(),
-                                    immutable_options.l0_bucket_key_space,
-                                    immutable_options.l0_bucket_count)]++;
+            l0_bucket_runs[BucketOfCF(f->smallest.user_key(),
+                                      immutable_options)]++;
           }
         }
       }
@@ -4369,8 +4369,7 @@ void VersionStorageInfo::CalculateBaseBytes(const ImmutableOptions& ioptions,
     for (const auto& f : files_[0]) {
       // L0 files are bucket-pure, so the smallest key's bucket == the file's
       // bucket. FileMetaData carries no bucket field; derive it here.
-      uint64_t b = BucketOf(f->smallest.user_key(), ioptions.l0_bucket_key_space,
-                            ioptions.l0_bucket_count);
+      uint64_t b = BucketOfCF(f->smallest.user_key(), ioptions);
       per_bucket[b]++;
     }
     int max_in_bucket = 0;

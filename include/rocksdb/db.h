@@ -1677,6 +1677,19 @@ class DB {
         "UnregisterFileInPlace is not supported in this DB implementation");
   }
 
+  // [BucketLSM Phase 7] Install a new dynamic L0-bucket boundary list for this
+  // column family (used by the serverclient BucketManager's split/merge). Each
+  // entry is the big-endian-8 value of the first key of bucket i+1; strictly
+  // increasing; size must be <= l0_bucket_count-1. Takes effect on the next
+  // flush/compaction/scan via the RCU publisher. Requires l0_bucket_count>1 (G5);
+  // default impl NotSupported so other DB implementations are unaffected.
+  virtual Status SetBucketBoundaries(
+      ColumnFamilyHandle* /*column_family*/,
+      const std::vector<uint64_t>& /*boundaries*/) {
+    return Status::NotSupported(
+        "SetBucketBoundaries is not supported in this DB implementation");
+  }
+
   // CreateColumnFamilyWithImport() will create a new column family with
   // column_family_name and import external SST files specified in metadata into
   // this column family.

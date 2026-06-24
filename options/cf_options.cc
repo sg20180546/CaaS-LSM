@@ -5,6 +5,8 @@
 
 #include "options/cf_options.h"
 
+#include "db/bucket_util.h"  // [BucketLSM] BucketBoundaryPublisher (fwd-declared in cf_options.h)
+
 #include <cassert>
 #include <cinttypes>
 #include <limits>
@@ -921,7 +923,14 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       sst_partitioner_factory(cf_options.sst_partitioner_factory),
       blob_cache(cf_options.blob_cache),
       l0_bucket_count(cf_options.l0_bucket_count),
-      l0_bucket_key_space(cf_options.l0_bucket_key_space) {}
+      l0_bucket_key_space(cf_options.l0_bucket_key_space),
+      // [BucketLSM Phase 7] allocate the RCU boundary publisher iff bucketing is
+      // ON. Copy-construction of ImmutableCFOptions shallow-copies this shared_ptr
+      // so the canonical cfd->ioptions_ and all its by-value reads share ONE
+      // publisher (SetBucketBoundaries via any handle is visible everywhere).
+      l0_bucket_boundaries(cf_options.l0_bucket_count > 1
+                               ? std::make_shared<BucketBoundaryPublisher>()
+                               : nullptr) {}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

@@ -15,6 +15,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// [BucketLSM Phase 7] fwd-decl (defined in db/bucket_util.h) to avoid a cross-dir
+// include from this options/ header. ImmutableCFOptions holds it via shared_ptr.
+class BucketBoundaryPublisher;
+
 // ImmutableCFOptions is a data struct used by RocksDB internal. It contains a
 // subset of Options that should not be changed during the entire lifetime
 // of DB. Raw pointers defined in this struct do not have ownership to the data
@@ -91,6 +95,14 @@ struct ImmutableCFOptions {
   // See include/rocksdb/options.h ColumnFamilyOptions::l0_bucket_count.
   uint64_t l0_bucket_count;
   uint64_t l0_bucket_key_space;
+
+  // [BucketLSM Phase 7] Dynamic (non-uniform) bucket boundary publisher (RCU).
+  // Shared across all by-value copies of this ImmutableCFOptions, so a publish via
+  // DB::SetBucketBoundaries() through the canonical cfd->ioptions() is visible at
+  // every BucketOf call site. Allocated iff l0_bucket_count>1; nullptr off-path
+  // => uniform mapping => baselines bit-identical. (fwd-declared to avoid a
+  // cross-dir include of db/bucket_util.h in this options/ header.)
+  std::shared_ptr<BucketBoundaryPublisher> l0_bucket_boundaries;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

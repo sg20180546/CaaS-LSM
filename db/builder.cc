@@ -131,6 +131,15 @@ Status BuildTable(
                          ioptions.l0_bucket_count > 1;
   const uint64_t l0_bucket_count = ioptions.l0_bucket_count;
   const uint64_t l0_bucket_key_space = ioptions.l0_bucket_key_space;
+  // [BucketLSM Phase 7] Snapshot the dynamic boundary list ONCE per flush so every
+  // bucket-cut decision below uses one consistent mapping (a concurrent
+  // SetBucketBoundaries must not split this flush across two mappings -> would
+  // break bucket-purity). null => uniform key_space/count (default / baseline).
+  std::shared_ptr<const BucketBoundaries> l0_bucket_bnd;
+  if (bucketing && ioptions.l0_bucket_boundaries) {
+    l0_bucket_bnd = ioptions.l0_bucket_boundaries->Get();
+    if (l0_bucket_bnd && l0_bucket_bnd->empty()) l0_bucket_bnd = nullptr;
+  }
   // All file names created (current `meta` + any extra bucket files), so that
   // every partial file is cleaned up on error.
   std::vector<std::string> created_fnames;
@@ -412,7 +421,9 @@ Status BuildTable(
       // bucket boundary is exactly BucketOf(prev) != BucketOf(cur).
       if (bucketing) {
         const uint64_t cur_bucket =
-            BucketOf(ikey.user_key, l0_bucket_key_space, l0_bucket_count);
+            l0_bucket_bnd ? BucketOf(ikey.user_key, *l0_bucket_bnd)
+                          : BucketOf(ikey.user_key, l0_bucket_key_space,
+                                     l0_bucket_count);
         if (have_prev_user_key && cur_bucket != prev_bucket) {
           // Finalize the current (non-empty) file and start a new one.
           finalize_output_file(cur_meta);

@@ -50,6 +50,7 @@
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
 #include "db/transaction_log_impl.h"
+#include "db/bucket_util.h"  // [BucketLSM] BucketOf / BucketBoundaries (SetBucketBoundaries)
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
@@ -5555,6 +5556,63 @@ Status DBImpl::UnregisterFileInPlace(ColumnFamilyHandle* column_family, int leve
   InstrumentedMutexLock l(&mutex_);
   Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                     &mutex_, directories_.GetDbDir());
+  if (s.ok()) {
+    SuperVersionContext sv_ctx(/*create_superversion=*/true);
+    InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
+                                       *cfd->GetLatestMutableCFOptions());
+    sv_ctx.Clean();
+  }
+  return s;
+}
+
+// [BucketLSM Phase 7] Install a new dynamic L0-bucket boundary list (serverclient
+// BucketManager split/merge). Publishes via the RCU publisher (read live by
+// BucketOf at flush/compaction/scan), then forces a fresh Version so the per-bucket
+// compaction score / write-stall recompute under the new mapping. Gated on
+// l0_bucket_count>1 (G5); off-path returns NotSupported, baselines unaffected.
+Status DBImpl::SetBucketBoundaries(ColumnFamilyHandle* column_family,
+                                   const std::vector<uint64_t>& boundaries) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  const ImmutableCFOptions* iopt = cfd->ioptions();
+  if (iopt->l0_bucket_count <= 1 || !iopt->l0_bucket_boundaries) {
+    return Status::NotSupported("SetBucketBoundaries requires l0_bucket_count>1");
+  }
+  // size <= l0_bucket_count-1 keeps live bucket ids within the static per-bucket
+  // arrays (version_set sizes those with l0_bucket_count); strictly increasing.
+  if (boundaries.size() + 1 > iopt->l0_bucket_count) {
+    return Status::InvalidArgument("too many boundaries (> l0_bucket_count-1)");
+  }
+  for (size_t i = 1; i < boundaries.size(); i++) {
+    if (boundaries[i] <= boundaries[i - 1]) {
+      return Status::InvalidArgument("boundaries must be strictly increasing");
+    }
+  }
+  auto new_bnd = std::make_shared<const BucketBoundaries>(boundaries);
+
+  InstrumentedMutexLock l(&mutex_);
+  // Defense-in-depth (D3.4): the manager only moves a boundary inside a bucket
+  // with NO live L0, so no live L0 file should straddle a NEW boundary. Re-verify
+  // here (its smallest/largest must map to the same new bucket) to keep L0
+  // bucket-pure and close the GetColumnFamilyMetaData->publish race; reject Busy.
+  {
+    const auto* vstorage = cfd->current()->storage_info();
+    for (FileMetaData* f : vstorage->LevelFiles(0)) {
+      if (BucketOf(f->smallest.user_key(), *new_bnd) !=
+          BucketOf(f->largest.user_key(), *new_bnd)) {
+        return Status::Busy("a live L0 file would straddle a new bucket boundary");
+      }
+    }
+  }
+  iopt->l0_bucket_boundaries->Set(new_bnd);
+  // Append a new (empty) version so ComputeCompactionScore re-runs with the new
+  // boundary mapping, then reinstall the SuperVersion + reschedule.
+  VersionEdit dummy_edit;
+  Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(),
+                                    &dummy_edit, &mutex_, directories_.GetDbDir());
   if (s.ok()) {
     SuperVersionContext sv_ctx(/*create_superversion=*/true);
     InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,

@@ -533,6 +533,11 @@ class DBImpl : public DB {
   virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
                                        uint64_t file_number) override;
 
+  // [BucketLSM Phase 7] install new dynamic L0-bucket boundaries (split/merge).
+  virtual Status SetBucketBoundaries(
+      ColumnFamilyHandle* column_family,
+      const std::vector<uint64_t>& boundaries) override;
+
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& options, const std::string& column_family_name,

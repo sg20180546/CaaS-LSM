@@ -27,6 +27,7 @@
 #include "db/blob/blob_file_meta.h"
 #include "db/dbformat.h"
 #include "db/bucket_util.h"
+#include "db/bucket_util_io.h"
 #include "db/internal_stats.h"
 #include "db/table_cache.h"
 #include "db/version_set.h"
@@ -406,10 +407,8 @@ class VersionBuilder::Rep {
           // newest-first. So skip the cross-bucket seqno check; enforce it only WITHIN a bucket.
           // Gated on l0_bucket_count>1 => baselines (0) take the original check unchanged.
           if (ioptions_->l0_bucket_count > 1 &&
-              BucketOf(lhs->smallest.user_key(), ioptions_->l0_bucket_key_space,
-                       ioptions_->l0_bucket_count) !=
-                  BucketOf(rhs->smallest.user_key(), ioptions_->l0_bucket_key_space,
-                           ioptions_->l0_bucket_count)) {
+              BucketOfCF(lhs->smallest.user_key(), *ioptions_) !=
+                  BucketOfCF(rhs->smallest.user_key(), *ioptions_)) {
             return Status::OK();
           }
 
