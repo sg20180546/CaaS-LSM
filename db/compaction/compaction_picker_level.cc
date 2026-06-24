@@ -631,7 +631,11 @@ bool LevelCompactionBuilder::TryPickL0TrivialMove() {
       vstorage_->GetOverlappingInputs(output_level_, &my_smallest, &my_largest,
                                       &output_level_inputs.files);
       if (output_level_inputs.empty()) {
-        assert(!file->being_compacted);
+        // [BucketLSM Phase4] Under bucketed parallel L0 compaction the file here
+        // may already be being_compacted (another bucket's trivial move / L0->Lbase);
+        // breaking avoids double-marking it. No-op for baselines: the upstream
+        // single-L0 guard means no L0 file is being compacted when we reach here.
+        if (file->being_compacted) break;
         start_level_inputs_.files.push_back(file);
       } else {
         break;
@@ -820,6 +824,14 @@ bool LevelCompactionBuilder::PickFileToCompact() {
 
 bool LevelCompactionBuilder::PickIntraL0Compaction() {
   start_level_inputs_.clear();
+  // [BucketLSM Phase4] Intra-L0 merges a seqno-contiguous run of L0 files that can
+  // span MULTIPLE buckets into one wide multi-bucket L0 output, breaking the
+  // bucket-pure / key-disjoint invariant that Phase2 scan-pruning and Phase4
+  // parallel per-bucket compaction depend on. Disable it under bucketing; per-bucket
+  // L0->Lbase compaction drains L0 instead. No-op for baselines (l0_bucket_count<=1).
+  if (ioptions_.l0_bucket_count > 1) {
+    return false;
+  }
   const std::vector<FileMetaData*>& level_files =
       vstorage_->LevelFiles(0 /* level */);
   if (level_files.size() <

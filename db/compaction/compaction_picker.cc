@@ -1234,6 +1234,18 @@ bool CompactionPicker::GetOverlappingL0Files(
   vstorage->GetOverlappingInputs(0, &smallest, &largest,
                                  &(start_level_inputs->files));
 
+  // [BucketLSM Phase4] With bucketed L0 the single-L0-compaction rule is relaxed
+  // (disjoint buckets compact in parallel), but GetOverlappingInputs(0,...) above
+  // does NOT skip being_compacted files, and IsRangeInCompaction() below only
+  // guards the Lbase output range -- it misses an in-flight INTRA-L0 compaction
+  // (output_level==0) or an empty-Lbase pick. Without this check a being_compacted
+  // L0 file could reach MarkFilesBeingCompacted -> assert/double-delete. Reject the
+  // pick if any pulled-in L0 file is already being compacted. No-op under the old
+  // single-L0 invariant (no L0 file is being compacted here) -> baselines unchanged.
+  if (AreFilesInCompaction(start_level_inputs->files)) {
+    return false;
+  }
+
   // If we include more L0 files in the same compaction run it can
   // cause the 'smallest' and 'largest' key to get extended to a
   // larger range. So, re-invoke GetRange to get the new key range
