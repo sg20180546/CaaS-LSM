@@ -86,6 +86,11 @@ struct ImmutableCFOptions {
   std::shared_ptr<SstPartitionerFactory> sst_partitioner_factory;
 
   std::shared_ptr<Cache> blob_cache;
+
+  // [BucketLSM / relink — G5 only] >1 = L0 bucketing ON; 0/1 = OFF (vanilla).
+  // See include/rocksdb/options.h ColumnFamilyOptions::l0_bucket_count.
+  uint64_t l0_bucket_count;
+  uint64_t l0_bucket_key_space;
 };
 
 struct ImmutableOptions : public ImmutableDBOptions, public ImmutableCFOptions {

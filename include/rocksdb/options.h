@@ -240,6 +240,15 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   // Dynamically changeable through SetOptions() API
   int level0_file_num_compaction_trigger = 4;
 
+  // [BucketLSM / relink — option-gated, set on RELINK (G5) shards ONLY] When > 1, L0 is partitioned
+  // into l0_bucket_count NON-overlapping buckets via
+  //   BucketOf(key) = bigendian8(key) * l0_bucket_count / l0_bucket_key_space
+  // enabling BucketFlush (one flush -> N bucket-pure L0 files), per-bucket write-stall &
+  // compaction-trigger (max-over-buckets L0 count), and bucket-aware scan (skip non-overlapping L0).
+  // 0 or 1 = OFF: vanilla RocksDB behavior, so baselines stay bit-identical (isolation invariant).
+  uint64_t l0_bucket_count = 0;
+  uint64_t l0_bucket_key_space = 0;
+
   // If non-nullptr, use the specified function to put keys in contiguous
   // groups called "prefixes". These prefixes are used to place one
   // representative entry for the group into the Bloom filter
