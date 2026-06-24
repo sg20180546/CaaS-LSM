@@ -160,7 +160,9 @@ void LevelCompactionBuilder::PickFileToCompact(
     start_level_ = level_file.first;
     if ((compact_to_next_level &&
          start_level_ == vstorage_->num_non_empty_levels() - 1) ||
-        (start_level_ == 0 &&
+        // [BucketLSM Phase4 / G5 only] bucketed L0 allows parallel disjoint-bucket
+        // L0->Lbase compactions; off-path keeps the single-L0-compaction rule.
+        (start_level_ == 0 && ioptions_.l0_bucket_count <= 1 &&
          !compaction_picker_->level0_compactions_in_progress()->empty())) {
       continue;
     }
@@ -708,11 +710,17 @@ bool LevelCompactionBuilder::TryExtendNonL0TrivialMove(int start_index) {
 }
 
 bool LevelCompactionBuilder::PickFileToCompact() {
-  // level 0 files are overlapping. So we cannot pick more
-  // than one concurrent compactions at this level. This
-  // could be made better by looking at key-ranges that are
-  // being compacted at level 0.
-  if (start_level_ == 0 &&
+  // level 0 files are overlapping. So we normally cannot pick more than one
+  // concurrent compaction at this level.
+  // [BucketLSM Phase4 / G5 only] When L0 is bucketed (l0_bucket_count>1) the L0
+  // files are bucket-pure and key-disjoint across buckets, so L0->Lbase
+  // compactions on DIFFERENT buckets are non-overlapping and may run in parallel
+  // (this is the dst-jam fix: running_comp 1->N). The being_compacted skip and
+  // the FilesRangeOverlapWithCompaction() check below reject any pick whose range
+  // overlaps an in-flight compaction, so the loop lands on a free bucket. Off-path
+  // (l0_bucket_count<=1) keeps the original single-L0-compaction rule -> baselines
+  // bit-identical.
+  if (start_level_ == 0 && ioptions_.l0_bucket_count <= 1 &&
       !compaction_picker_->level0_compactions_in_progress()->empty()) {
     TEST_SYNC_POINT("LevelCompactionPicker::PickCompactionBySize:0");
     return false;

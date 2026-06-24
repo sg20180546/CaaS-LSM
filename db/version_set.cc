@@ -1921,9 +1921,30 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
   auto* arena = merge_iter_builder->GetArena();
   if (level == 0) {
     // Merge all level zero files together since they may overlap
+    // [BucketLSM Phase2 / G5 only] When L0 is bucketed (l0_bucket_count>1) the L0
+    // files are bucket-pure and key-disjoint, so a bounded scan can skip any L0
+    // file whose key range lies entirely outside [iterate_lower_bound,
+    // iterate_upper_bound) -- it holds no in-range keys. This reclaims the SCAN
+    // fanout that BucketFlush's N-way L0 split adds (a range query plants a child
+    // iterator only on the buckets it overlaps, not all N). Gated on
+    // l0_bucket_count>1 so baselines add every L0 file exactly as before
+    // (bit-identical). Bounds are user keys: lower inclusive, upper exclusive.
+    const bool l0_bucket_scan = cfd_->ioptions()->l0_bucket_count > 1;
+    const Comparator* l0_ucmp =
+        l0_bucket_scan ? cfd_->internal_comparator().user_comparator() : nullptr;
+    const Slice* l0_lo = read_options.iterate_lower_bound;
+    const Slice* l0_up = read_options.iterate_upper_bound;
     TruncatedRangeDelIterator* tombstone_iter = nullptr;
     for (size_t i = 0; i < storage_info_.LevelFilesBrief(0).num_files; i++) {
       const auto& file = storage_info_.LevelFilesBrief(0).files[i];
+      if (l0_bucket_scan &&
+          ((l0_lo != nullptr && AfterFile(l0_ucmp, l0_lo, &file)) ||
+           (l0_up != nullptr &&
+            l0_ucmp->CompareWithoutTimestamp(
+                *l0_up, ExtractUserKey(file.smallest_key)) <= 0))) {
+        // Key range disjoint from [lo, up) -> no in-range keys; skip this file.
+        continue;
+      }
       auto table_iter = cfd_->table_cache()->NewIterator(
           read_options, soptions, cfd_->internal_comparator(),
           *file.file_metadata, /*range_del_agg=*/nullptr,

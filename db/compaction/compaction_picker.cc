@@ -1217,9 +1217,14 @@ void CompactionPicker::PickFilesMarkedForCompaction(
 bool CompactionPicker::GetOverlappingL0Files(
     VersionStorageInfo* vstorage, CompactionInputFiles* start_level_inputs,
     int output_level, int* parent_index) {
-  // Two level 0 compaction won't run at the same time, so don't need to worry
-  // about files on level 0 being compacted.
-  assert(level0_compactions_in_progress()->empty());
+  // Two level 0 compactions won't run at the same time (so files on level 0 are
+  // not being compacted) -- EXCEPT under BucketLSM (l0_bucket_count>1, G5 only)
+  // where disjoint-bucket L0->Lbase compactions run in parallel. The
+  // GetOverlappingInputs() range expansion below stays within the picked bucket
+  // (other buckets are key-disjoint), and IsRangeInCompaction() rejects a range
+  // already being compacted, so concurrency is still safe.
+  assert(ioptions_.l0_bucket_count > 1 ||
+         level0_compactions_in_progress()->empty());
   InternalKey smallest, largest;
   GetRange(*start_level_inputs, &smallest, &largest);
   // Note that the next call will discard the file we placed in
