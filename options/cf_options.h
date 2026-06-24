@@ -96,9 +96,9 @@ struct ImmutableCFOptions {
   uint64_t l0_bucket_count;
   uint64_t l0_bucket_key_space;
 
-  // [BucketLSM C2 — G5 only] true + l0_bucket_count>1 => parallel BucketFlush.
-  // See include/rocksdb/options.h ColumnFamilyOptions::parallel_split_flush.
-  bool parallel_split_flush;
+  // [BucketLSM C2 — G5 only] >1 + l0_bucket_count>1 => parallel BucketFlush with
+  // this many workers. See include/rocksdb/options.h ColumnFamilyOptions.
+  uint32_t parallel_split_flush;
 
   // [BucketLSM Phase 7] Dynamic (non-uniform) bucket boundary publisher (RCU).
   // Shared across all by-value copies of this ImmutableCFOptions, so a publish via

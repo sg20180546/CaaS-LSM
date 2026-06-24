@@ -1019,22 +1019,14 @@ Status FlushJob::BuildBucketTablesParallel(
     }
   };
 
-  // Bounded worker pool capped at max_subcompactions (the configured
-  // parallelism budget). This thread participates as one worker.
-  const uint32_t maxsub = std::max<uint32_t>(1, db_options_.max_subcompactions);
-  const size_t cap = std::min<size_t>(nb, maxsub);
-  if (cap <= 1) {
-    ROCKS_LOG_WARN(
-        db_options_.info_log,
-        "[%s] [JOB %d] parallel_split_flush ON but max_subcompactions <= 1: "
-        "%zu bucket files built single-threaded\n",
-        cfd_->GetName().c_str(), job_context_->job_id, nb);
-  } else {
-    ROCKS_LOG_INFO(db_options_.info_log,
-                   "[%s] [JOB %d] parallel BucketFlush: %zu buckets, %zu "
-                   "workers\n",
-                   cfd_->GetName().c_str(), job_context_->job_id, nb, cap);
-  }
+  // Bounded worker pool capped at the configured worker count
+  // (parallel_split_flush). This thread participates as one worker. Entered only
+  // when parallel_split_flush > 1 and nb > 1, so cap >= 2.
+  const uint32_t cap_cfg = std::max<uint32_t>(1, iopts->parallel_split_flush);
+  const size_t cap = std::min<size_t>(nb, cap_cfg);
+  ROCKS_LOG_INFO(db_options_.info_log,
+                 "[%s] [JOB %d] parallel BucketFlush: %zu buckets, %zu workers\n",
+                 cfd_->GetName().c_str(), job_context_->job_id, nb, cap);
   std::atomic<size_t> next_idx{0};
   auto worker_loop = [&]() {
     for (size_t i = next_idx.fetch_add(1); i < nb; i = next_idx.fetch_add(1)) {
@@ -1241,7 +1233,7 @@ Status FlushJob::WriteLevel0Table() {
       const ImmutableOptions* iopts = cfd_->ioptions();
       const uint64_t l0_bucket_count = iopts->l0_bucket_count;
       bool used_parallel_bucket_flush = false;
-      if (l0_bucket_count > 1 && iopts->parallel_split_flush &&
+      if (l0_bucket_count > 1 && iopts->parallel_split_flush > 1 &&
           range_del_iters.empty()) {
         // Per-flush boundary snapshot (one consistent mapping for the whole
         // flush, matching builder.cc). null => uniform key_space/count.

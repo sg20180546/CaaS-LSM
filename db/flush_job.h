@@ -105,7 +105,7 @@ class FlushJob {
 
   // [BucketLSM C2 — G5 only, gated parallel_split_flush && l0_bucket_count>1]
   // Parallel BucketFlush: build this flush's N bucket-pure L0 SST files
-  // concurrently (one worker per non-empty bucket, capped at max_subcompactions)
+  // concurrently (cap = min(non-empty buckets, parallel_split_flush) workers)
   // by running the UNMODIFIED single-file BuildTable per bucket over a
   // bucket-filtered iterator. Fills meta_ (first non-empty bucket) and
   // *extra_metas (the rest) exactly like the serial BuildTable path, so the
