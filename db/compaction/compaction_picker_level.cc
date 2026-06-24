@@ -9,10 +9,13 @@
 
 #include "db/compaction/compaction_picker_level.h"
 
+#include <algorithm>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "db/bucket_util_io.h"  // [BucketLSM Phase 6] BucketOfCF dispatch
 #include "db/version_edit.h"
 #include "logging/log_buffer.h"
 #include "test_util/sync_point.h"
@@ -107,6 +110,15 @@ class LevelCompactionBuilder {
   // Returns true if `inputs` is populated with a span of files to be compacted;
   // otherwise, returns false.
   bool PickIntraL0Compaction();
+
+  // [BucketLSM Phase 6 / G5] BucketCompaction-Scheduler: seed start_level_inputs_
+  // from the hottest (most L0 files) not-being-compacted bucket, tie-breaking by
+  // smallest BucketCompaction size. Returns true if a bucket was picked.
+  bool PickBucketL0ToCompact();
+  // BucketCompaction size = bucket L0 bytes + bytes of L1 files overlapping the
+  // bucket's L0 key range [lo,hi].
+  uint64_t BucketCompactionSize(const InternalKey& lo, const InternalKey& hi,
+                                uint64_t l0_bytes);
 
   // Return true if TrivialMove is extended. `start_index` is the index of
   // the intiial file picked, which should already be in `start_level_inputs_`.
@@ -713,6 +725,98 @@ bool LevelCompactionBuilder::TryExtendNonL0TrivialMove(int start_index) {
   return false;
 }
 
+uint64_t LevelCompactionBuilder::BucketCompactionSize(const InternalKey& lo,
+                                                      const InternalKey& hi,
+                                                      uint64_t l0_bytes) {
+  std::vector<FileMetaData*> l1;
+  vstorage_->GetOverlappingInputs(output_level_, &lo, &hi, &l1);
+  uint64_t bytes = l0_bytes;
+  for (FileMetaData* f : l1) bytes += f->fd.GetFileSize();
+  return bytes;
+}
+
+bool LevelCompactionBuilder::PickBucketL0ToCompact() {
+  const std::vector<FileMetaData*>& level_files = vstorage_->LevelFiles(0);
+  struct BInfo {
+    int count = 0;
+    uint64_t bytes = 0;
+    int rep = -1;        // representative (lowest-index) file of this bucket
+    InternalKey lo, hi;  // the bucket's L0 key range
+    bool range_init = false;
+  };
+  std::unordered_map<uint64_t, BInfo> bstat;
+  const InternalKeyComparator* icmp = compaction_picker_->icmp();
+  for (int i = 0; i < static_cast<int>(level_files.size()); i++) {
+    FileMetaData* f = level_files[i];
+    if (f->being_compacted) continue;
+    uint64_t b = BucketOfCF(f->smallest.user_key(), ioptions_);
+    BInfo& e = bstat[b];
+    e.count++;
+    e.bytes += f->fd.GetFileSize();
+    if (e.rep < 0) e.rep = i;
+    if (!e.range_init) {
+      e.lo = f->smallest;
+      e.hi = f->largest;
+      e.range_init = true;
+    } else {
+      if (icmp->Compare(f->smallest, e.lo) < 0) e.lo = f->smallest;
+      if (icmp->Compare(f->largest, e.hi) > 0) e.hi = f->largest;
+    }
+  }
+  if (bstat.empty()) return false;
+
+  // Priority: most L0 files first; tie-break smallest BucketCompaction size;
+  // then lowest bucket id (deterministic).
+  std::vector<uint64_t> buckets;
+  buckets.reserve(bstat.size());
+  for (auto& kv : bstat) buckets.push_back(kv.first);
+  std::sort(buckets.begin(), buckets.end(), [&](uint64_t a, uint64_t c) {
+    const BInfo& ba = bstat[a];
+    const BInfo& bc = bstat[c];
+    if (ba.count != bc.count) return ba.count > bc.count;
+    uint64_t sa = BucketCompactionSize(ba.lo, ba.hi, ba.bytes);
+    uint64_t sc = BucketCompactionSize(bc.lo, bc.hi, bc.bytes);
+    if (sa != sc) return sa < sc;
+    return a < c;
+  });
+
+  // Try the highest-priority bucket whose pick does not overlap an in-flight
+  // compaction (same validation as the default PickFileToCompact loop). Seeding
+  // any one file of the bucket is enough: GetOverlappingL0Files later expands to
+  // the whole bucket via key-range overlap.
+  for (uint64_t b : buckets) {
+    const int index = bstat[b].rep;
+    FileMetaData* f = level_files[index];
+    start_level_inputs_.clear();
+    start_level_inputs_.level = 0;
+    start_level_inputs_.files.push_back(f);
+    if (!compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &start_level_inputs_) ||
+        compaction_picker_->FilesRangeOverlapWithCompaction(
+            {start_level_inputs_}, output_level_,
+            Compaction::EvaluatePenultimateLevel(vstorage_, ioptions_,
+                                                 start_level_, output_level_))) {
+      start_level_inputs_.clear();
+      continue;
+    }
+    InternalKey smallest, largest;
+    compaction_picker_->GetRange(start_level_inputs_, &smallest, &largest);
+    CompactionInputFiles output_level_inputs;
+    output_level_inputs.level = output_level_;
+    vstorage_->GetOverlappingInputs(output_level_, &smallest, &largest,
+                                    &output_level_inputs.files);
+    if (!output_level_inputs.empty() &&
+        !compaction_picker_->ExpandInputsToCleanCut(cf_name_, vstorage_,
+                                                    &output_level_inputs)) {
+      start_level_inputs_.clear();
+      continue;
+    }
+    base_index_ = index;
+    return true;
+  }
+  return false;
+}
+
 bool LevelCompactionBuilder::PickFileToCompact() {
   // level 0 files are overlapping. So we normally cannot pick more than one
   // concurrent compaction at this level.
@@ -737,6 +841,15 @@ bool LevelCompactionBuilder::PickFileToCompact() {
 
   if (TryPickL0TrivialMove()) {
     return true;
+  }
+
+  // [BucketLSM Phase 6 / G5 only] BucketCompaction-Scheduler (paper §V-B): when L0
+  // is bucketed, select the (not-being-compacted) bucket with the MOST L0 files,
+  // tie-break by SMALLEST BucketCompaction size (bucket L0 bytes + overlapping L1
+  // bytes), instead of the default FilesByCompactionPri order. Off-path (<=1)
+  // falls through to the original selection below -> baselines bit-identical.
+  if (start_level_ == 0 && ioptions_.l0_bucket_count > 1) {
+    return PickBucketL0ToCompact();
   }
 
   const std::vector<FileMetaData*>& level_files =
