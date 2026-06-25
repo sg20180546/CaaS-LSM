@@ -8,6 +8,7 @@
 
 #include <string>
 #include <thread>
+#include <cstdlib>
 
 #include "compaction_service.grpc.pb.h"
 #include "rocksdb/db.h"
@@ -139,6 +140,17 @@ int main(int argc, char** argv) {
         std::string("192.168.88.") + argv[1] + ":8010";
     std::cout << GetTime() << "csa_address overridden to "
               << compaction_service_options.csa_address << std::endl;
+  }
+  // [tuning] per-CSA concurrent compaction-task limit, overridable via env so we can
+  // sweep it without recompiling. Default stays 5 (options.h). The CSA enforces this
+  // (queues when over) and reports it to the CP, which schedules accordingly.
+  if (const char* s = getenv("CSA_MAX_CONCURRENT_TASKS")) {
+    int v = atoi(s);
+    if (v > 0) {
+      compaction_service_options.csa_max_concurrent_tasks = v;
+      std::cout << GetTime() << "csa_max_concurrent_tasks overridden to " << v
+                << std::endl;
+    }
   }
   std::string server_address(compaction_service_options.csa_address);
   CSAImpl service;
