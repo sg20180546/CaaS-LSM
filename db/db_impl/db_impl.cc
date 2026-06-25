@@ -5667,6 +5667,37 @@ Status DBImpl::UnregisterFileInPlace(ColumnFamilyHandle* column_family, int leve
   return s;
 }
 
+// [relink §21] BATCH unregister: remove N files from the MANIFEST in ONE VersionEdit +
+// ONE LogAndApply + ONE SuperVersion install. Symmetric to UnregisterFileInPlace above;
+// used by the relink src-drop so it is file-count-independent (vs 1 fsync + 1 Version
+// rebuild per file).
+Status DBImpl::UnregisterFilesInPlace(
+    ColumnFamilyHandle* column_family,
+    const std::vector<std::pair<int, uint64_t>>& level_and_file) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  if (level_and_file.empty()) return Status::OK();
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  for (const auto& lf : level_and_file) {
+    edit.DeleteFile(lf.first /* level */, lf.second /* file_number */);
+  }
+
+  InstrumentedMutexLock l(&mutex_);
+  Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
+                                    &mutex_, directories_.GetDbDir());
+  if (s.ok()) {
+    SuperVersionContext sv_ctx(/*create_superversion=*/true);
+    InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
+                                       *cfd->GetLatestMutableCFOptions());
+    sv_ctx.Clean();
+  }
+  return s;
+}
+
 // [BucketLSM Phase 7] Install a new dynamic L0-bucket boundary list (serverclient
 // BucketManager split/merge). Publishes via the RCU publisher (read live by
 // BucketOf at flush/compaction/scan), then forces a fresh Version so the per-bucket

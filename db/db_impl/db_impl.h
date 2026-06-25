@@ -539,6 +539,11 @@ class DBImpl : public DB {
   virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
                                        uint64_t file_number) override;
 
+  // [relink §21] batch variant: N files -> 1 VersionEdit + 1 LogAndApply + 1 install.
+  virtual Status UnregisterFilesInPlace(
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::pair<int, uint64_t>>& level_and_file) override;
+
   // [BucketLSM Phase 7] install new dynamic L0-bucket boundaries (split/merge).
   virtual Status SetBucketBoundaries(
       ColumnFamilyHandle* column_family,

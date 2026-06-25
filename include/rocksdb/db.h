@@ -1703,6 +1703,17 @@ class DB {
         "UnregisterFileInPlace is not supported in this DB implementation");
   }
 
+  // [relink §21] BATCH unregister: remove N files from the MANIFEST in ONE VersionEdit +
+  // ONE LogAndApply + ONE SuperVersion install (vs 1 each per file). Each pair is
+  // {level, file_number}. Symmetric to RegisterExternalFilesInPlace; used by the relink
+  // src-drop so it is file-count-independent in fsyncs / Version rebuilds.
+  virtual Status UnregisterFilesInPlace(
+      ColumnFamilyHandle* /*column_family*/,
+      const std::vector<std::pair<int, uint64_t>>& /*level_and_file*/) {
+    return Status::NotSupported(
+        "UnregisterFilesInPlace is not supported in this DB implementation");
+  }
+
   // [BucketLSM Phase 7] Install a new dynamic L0-bucket boundary list for this
   // column family (used by the serverclient BucketManager's split/merge). Each
   // entry is the big-endian-8 value of the first key of bucket i+1; strictly
