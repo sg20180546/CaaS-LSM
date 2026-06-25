@@ -277,8 +277,15 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     int deleted = 0;
     std::vector<std::string> requeue;
     for (const auto& path : batch) {
-      if (fs != nullptr && hdfsDelete(fs, path.c_str(), /*recursive=*/0) == 0) deleted++;
-      else requeue.push_back(path);  // transient failure -> retry next cycle, never leak
+      if (fs == nullptr) { requeue.push_back(path); continue; }  // no fs yet -> retry
+      if (hdfsDelete(fs, path.c_str(), /*recursive=*/0) == 0) { deleted++; continue; }
+      // hdfsDelete failed. A path whose bytes were renamed AWAY (RenameFile transfers
+      // the refcount: RequestDelete(old key) queues a path that no longer exists) or a
+      // double-queued path is ALREADY gone -> count it reclaimed, do NOT requeue
+      // (requeueing a phantom forever would bloat the queue). Only a path that STILL
+      // exists is a real transient failure worth retrying.
+      if (hdfsExists(fs, path.c_str()) != 0) { deleted++; continue; }  // gone => reclaimed
+      requeue.push_back(path);  // still exists => transient failure, retry next cycle
     }
     if (!requeue.empty()) {
       std::lock_guard<std::mutex> lock(storage_latch_);

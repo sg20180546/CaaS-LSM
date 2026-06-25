@@ -702,6 +702,31 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
                                     IODebugContext* /*dbg*/) {
   hdfsDelete(fileSys_, target.c_str(), 1);
   if (hdfsRename(fileSys_, src.c_str(), target.c_str()) == 0) {
+    // [relink/Storage-CP] The CP refcount is keyed by PATH, so a rename moves the
+    // bytes to a NEW key. Transfer the refcount with the bytes: seed the target (so
+    // the CN's later DeleteFile drives it to 0 and the CP GC reclaims it) and release
+    // the src key. Without this the CSA-output path that the CN adopts via rename
+    // (compaction_service_job.cc -- the only engine .sst->.sst rename) orphans at
+    // refcount=1 forever: the CP map climbs unbounded and the GC never reclaims
+    // (tracked++, batch=0/deleted=0), the live bytes at the target are UNTRACKED, and
+    // HDFS bloats -> throughput collapse. DISABLED (client==nullptr) or non-SST =>
+    // no-op => baseline bit-identical. Errors swallowed; never affects the rename.
+    if (StorageCpClient* client = GetStorageCpClient()) {
+      if (IsSstFile(src) && IsSstFile(target)) {
+        compactionservice::FileRef cr;
+        cr.set_path(target);
+        cr.set_shard_id(storage_cp_shard_);
+        google::protobuf::Empty creply;
+        grpc::ClientContext cctx;
+        client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
+        compactionservice::FileRef dr;
+        dr.set_path(src);
+        dr.set_shard_id(storage_cp_shard_);
+        compactionservice::DeleteReply dreply;
+        grpc::ClientContext dctx;
+        client->stub->RequestDelete(&dctx, dr, &dreply);  // -1 on the old key
+      }
+    }
     return IOStatus::OK();
   }
   return IOError(src, errno);
