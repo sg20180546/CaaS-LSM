@@ -146,6 +146,20 @@ struct GetMergeOperandsOptions {
 using TablePropertiesCollection =
     std::unordered_map<std::string, std::shared_ptr<const TableProperties>>;
 
+// [relink §21] One file to register via RegisterExternalFilesInPlace (batch). If
+// smallest_user/largest_user are both non-empty AND file_size > 0, the file is NOT
+// opened — the caller supplies the user-key bounds + size (the relink src already knows
+// them from GetColumnFamilyMetaData, so the dst skips a per-file HDFS open). Otherwise
+// the bounds/size are read from the file (fallback, matches RegisterExternalFileInPlace).
+struct ExternalFileForRegister {
+  std::string external_file;        // absolute path to the existing SST (referenced in place)
+  int level = 0;                    // target level
+  SequenceNumber global_seqno = 0;  // per-file GSN override (applied to all keys at read time)
+  std::string smallest_user;        // [opt] smallest user key (skip open if set + size>0)
+  std::string largest_user;         // [opt] largest user key
+  uint64_t file_size = 0;           // [opt] file size in bytes
+};
+
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
@@ -1664,6 +1678,18 @@ class DB {
       int /*level*/, SequenceNumber /*global_seqno*/) {
     return Status::NotSupported(
         "RegisterExternalFileInPlace is not supported in this DB implementation");
+  }
+
+  // [relink §21] BATCH register: register N existing SSTs into the MANIFEST at their
+  // per-file (level, GSN) in ONE VersionEdit + ONE LogAndApply (1 fsync for all, vs 1
+  // per file). When a file's user-key bounds + size are supplied (ExternalFileForRegister),
+  // its HDFS open is skipped. Equivalent to calling RegisterExternalFileInPlace per file
+  // but file-count-independent in fsyncs (and HDFS opens, when bounds are given).
+  virtual Status RegisterExternalFilesInPlace(
+      ColumnFamilyHandle* /*column_family*/,
+      const std::vector<ExternalFileForRegister>& /*files*/) {
+    return Status::NotSupported(
+        "RegisterExternalFilesInPlace is not supported in this DB implementation");
   }
 
   // [relink] Remove a (relinked) file from this column family's MANIFEST WITHOUT

@@ -5538,6 +5538,108 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
   return s;
 }
 
+// [relink §21] BATCH register: N files in ONE VersionEdit + ONE LogAndApply (1 fsync for
+// all, vs 1 per file). When a file supplies user-key bounds + size, its HDFS open is
+// skipped (the relink src already knows them). Builds each FileMetaData exactly like the
+// single RegisterExternalFileInPlace above, then commits them together.
+Status DBImpl::RegisterExternalFilesInPlace(
+    ColumnFamilyHandle* column_family,
+    const std::vector<ExternalFileForRegister>& files) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  if (files.empty()) return Status::OK();
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+
+  VersionEdit edit;
+  edit.SetColumnFamily(cfd->GetID());
+  SequenceNumber max_gsn = 0;
+
+  for (const auto& fr : files) {
+    std::string smallest_user = fr.smallest_user;
+    std::string largest_user = fr.largest_user;
+    uint64_t file_size = fr.file_size;
+
+    // [§21 opt3] Skip the per-file HDFS open iff the caller supplied bounds + size;
+    // otherwise read them from the file (fallback, identical to the single API).
+    if (smallest_user.empty() || largest_user.empty() || file_size == 0) {
+      Options ropts;
+      ropts.env = env_;
+      ropts.comparator = cfd->user_comparator();
+      ropts.table_factory = cfd->ioptions()->table_factory;
+      SstFileReader reader(ropts);
+      Status os = reader.Open(fr.external_file);
+      if (!os.ok()) return os;
+      if (file_size == 0) {
+        IOOptions io_opts;
+        os = fs_->GetFileSize(fr.external_file, io_opts, &file_size, nullptr);
+        if (!os.ok()) return os;
+      }
+      if (smallest_user.empty() || largest_user.empty()) {
+        ReadOptions ro;
+        ro.fill_cache = false;
+        std::unique_ptr<Iterator> it(reader.NewIterator(ro));
+        it->SeekToFirst();
+        if (!it->Valid()) {
+          return it->status().ok()
+                     ? Status::Corruption("RegisterExternalFilesInPlace: empty SST")
+                     : it->status();
+        }
+        smallest_user.assign(it->key().data(), it->key().size());
+        it->SeekToLast();
+        if (!it->Valid()) {
+          return it->status().ok()
+                     ? Status::Corruption("RegisterExternalFilesInPlace: no last key")
+                     : it->status();
+        }
+        largest_user.assign(it->key().data(), it->key().size());
+      }
+    }
+
+    uint64_t file_number = versions_->NewFileNumber();
+    InternalKey smallest_ikey(Slice(smallest_user), fr.global_seqno,
+                              kValueTypeForSeek);
+    InternalKey largest_ikey(Slice(largest_user), fr.global_seqno,
+                             kValueTypeForSeek);
+    UniqueId64x2 unique_id{};
+    FileMetaData f_meta(file_number, 0 /* path_id */, file_size, smallest_ikey,
+                        largest_ikey, fr.global_seqno /* smallest_seqno */,
+                        fr.global_seqno /* largest_seqno */,
+                        false /* marked_for_compaction */, Temperature::kUnknown,
+                        kInvalidBlobFileNumber, 0 /* oldest_ancester_time */,
+                        0 /* file_creation_time */, /*file_checksum=*/"",
+                        /*file_checksum_func_name=*/"", unique_id);
+    f_meta.fd.global_seqno_override = fr.global_seqno;  // [relink] per-file GSN
+    f_meta.fd.external_path = fr.external_file;  // [relink] reference in place
+    edit.AddFile(fr.level, f_meta);
+    if (fr.global_seqno != kDisableGlobalSequenceNumber &&
+        fr.global_seqno > max_gsn) {
+      max_gsn = fr.global_seqno;
+    }
+  }
+
+  Status s;
+  {
+    InstrumentedMutexLock l(&mutex_);
+    s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
+                               &mutex_, directories_.GetDbDir());
+    if (s.ok()) {
+      if (max_gsn != kDisableGlobalSequenceNumber &&
+          max_gsn > versions_->LastSequence()) {
+        versions_->SetLastAllocatedSequence(max_gsn);
+        versions_->SetLastPublishedSequence(max_gsn);
+        versions_->SetLastSequence(max_gsn);
+      }
+      SuperVersionContext sv_ctx(/*create_superversion=*/true);
+      InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
+                                         *cfd->GetLatestMutableCFOptions());
+      sv_ctx.Clean();
+    }
+  }
+  return s;
+}
+
 // [relink] Remove a relinked file from this CF's MANIFEST. The physical file has been
 // renamed into another DB by RegisterExternalFileInPlace, so the obsolete-file deletion
 // triggered by removing it here is a harmless no-op (the path no longer exists). Used by

@@ -529,6 +529,12 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family, const std::string& external_file,
       int level, SequenceNumber global_seqno) override;
 
+  // [relink §21] batch variant: N files -> 1 VersionEdit + 1 LogAndApply (skips per-file
+  // HDFS open when user-key bounds + size are supplied in ExternalFileForRegister).
+  virtual Status RegisterExternalFilesInPlace(
+      ColumnFamilyHandle* column_family,
+      const std::vector<ExternalFileForRegister>& files) override;
+
   // [relink] remove a relinked file from the MANIFEST (no physical delete).
   virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
                                        uint64_t file_number) override;
