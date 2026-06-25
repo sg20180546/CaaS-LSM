@@ -427,12 +427,26 @@ int main() {
   StorageImpl storage_service;
 
   grpc::ServerBuilder builder;
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  int selected_port = 0;
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(),
+                           &selected_port);
   builder.RegisterService(&service);
   builder.RegisterService(&storage_service);
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
+  // A stale procp still holding pro_cp_address makes AddListeningPort fail; gRPC
+  // leaves selected_port==0 (and may return a non-listening server). Previously we
+  // printed "Server listening" unconditionally and ran on -- the GC thread ticked
+  // while 8020 was dead, so every NotifyCreate/Link/RequestDelete got "Connection
+  // refused" and relink silently fell back to GC. Fail LOUD + exit so the launcher
+  // (start_cp.sh) detects it instead of leaving a non-listening zombie.
+  if (!server || selected_port == 0) {
+    std::cerr << GetTime() << "FATAL: procp failed to bind " << server_address
+              << " (selected_port=" << selected_port
+              << "; stale procp still holding the port?). Exiting." << std::endl;
+    return 1;
+  }
   std::cout << GetTime() << "Server listening on " << server_address
-            << std::endl;
+            << " (port=" << selected_port << ")" << std::endl;
   std::thread scheduler(ConsumeTask);
   std::thread monitor(UpdateCSAStatus);
   std::thread storage_gc(RunStorageGC);
