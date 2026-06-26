@@ -446,6 +446,22 @@ std::string ScheduleCSA(
 }
 
 int main() {
+  // ProCP dispatch knobs — env-overridable so we can push the post-migration compaction
+  // burst to the (idle) CSAs instead of falling back to local CN. Defaults stay 5 so
+  // baselines are unchanged. PROCP_MAX_ACCUMULATION = queue depth before shedding to
+  // local; PROCP_MAX_RESCHEDULE = per-task CSA-busy retries before local fallback.
+  if (const char* s = getenv("PROCP_MAX_ACCUMULATION")) {
+    unsigned long long v = strtoull(s, nullptr, 10);
+    if (v > 0) compaction_service_options.max_accumulation_in_procp = v;
+  }
+  if (const char* s = getenv("PROCP_MAX_RESCHEDULE")) {
+    unsigned long long v = strtoull(s, nullptr, 10);
+    if (v > 0) compaction_service_options.max_reschedule = v;
+  }
+  std::cout << GetTime() << "ProCP knobs: max_accumulation_in_procp="
+            << compaction_service_options.max_accumulation_in_procp
+            << " max_reschedule=" << compaction_service_options.max_reschedule
+            << std::endl;
   std::string server_address(compaction_service_options.pro_cp_address);
   ProCPImpl service;
   StorageImpl storage_service;
