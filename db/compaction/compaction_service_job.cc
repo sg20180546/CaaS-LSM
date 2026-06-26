@@ -9,6 +9,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "compaction_service.grpc.pb.h"
+#include "db/bucket_util.h"  // [BucketLSM §25] EncodeBoundaries
 #include "db/compaction/compaction_job.h"
 #include "db/compaction/compaction_state.h"
 #include "logging/logging.h"
@@ -62,6 +63,20 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
       compaction->column_family_data()->GetName();
   compaction_input.column_family.options =
       compaction->column_family_data()->GetLatestCFOptions();
+  // [BucketLSM §25] GetLatestCFOptions() carries static l0_bucket_count/key_space but NOT the live
+  // DYNAMIC boundaries (RCU publisher). Snapshot them here so the remote CSA computes BucketOf with the
+  // SAME boundaries as the CN -> no false force_consistency_checks Corruption on bucketed L0. Empty
+  // publisher/snapshot (baselines or uniform) leaves the encoding "" => unchanged.
+  {
+    auto pub = compaction->column_family_data()->ioptions()->l0_bucket_boundaries;
+    if (pub) {
+      auto snap = pub->Get();
+      if (snap && !snap->empty()) {
+        compaction_input.column_family.options.l0_bucket_boundaries_encoded =
+            EncodeBoundaries(*snap);
+      }
+    }
+  }
   compaction_input.db_options =
       BuildDBOptions(db_options_, mutable_db_options_copy_);
   compaction_input.snapshots = existing_snapshots_;

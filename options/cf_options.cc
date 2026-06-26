@@ -614,6 +614,12 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, l0_bucket_key_space),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // [BucketLSM §25] dynamic-boundary snapshot string; rides the cf-options serialization to the
+        // remote CSA (same channel as l0_bucket_count). Empty for baselines/uniform => no behavior change.
+        {"l0_bucket_boundaries_encoded",
+         {offsetof(struct ImmutableCFOptions, l0_bucket_boundaries_encoded),
+          OptionType::kString, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"bloom_locality",
          {offsetof(struct ImmutableCFOptions, bloom_locality),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
@@ -939,6 +945,7 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       blob_cache(cf_options.blob_cache),
       l0_bucket_count(cf_options.l0_bucket_count),
       l0_bucket_key_space(cf_options.l0_bucket_key_space),
+      l0_bucket_boundaries_encoded(cf_options.l0_bucket_boundaries_encoded),
       parallel_split_flush(cf_options.parallel_split_flush),
       // [BucketLSM Phase 7] allocate the RCU boundary publisher iff bucketing is
       // ON. Copy-construction of ImmutableCFOptions shallow-copies this shared_ptr
@@ -946,7 +953,19 @@ ImmutableCFOptions::ImmutableCFOptions(const ColumnFamilyOptions& cf_options)
       // publisher (SetBucketBoundaries via any handle is visible everywhere).
       l0_bucket_boundaries(cf_options.l0_bucket_count > 1
                                ? std::make_shared<BucketBoundaryPublisher>()
-                               : nullptr) {}
+                               : nullptr) {
+  // [BucketLSM §25] Seed the publisher with the propagated DYNAMIC boundaries (if any). A remote CSA
+  // receives them via the serialized cf options (l0_bucket_boundaries_encoded) and decodes here so its
+  // BucketOf matches the CN's dynamic boundaries -> no false force_consistency_checks Corruption.
+  // Off-path (publisher nullptr) or empty encoding => uniform mapping (baselines unchanged).
+  if (l0_bucket_boundaries && !cf_options.l0_bucket_boundaries_encoded.empty()) {
+    BucketBoundaries v = DecodeBoundaries(cf_options.l0_bucket_boundaries_encoded);
+    if (!v.empty()) {
+      l0_bucket_boundaries->Set(
+          std::make_shared<const BucketBoundaries>(std::move(v)));
+    }
+  }
+}
 
 ImmutableOptions::ImmutableOptions() : ImmutableOptions(Options()) {}
 

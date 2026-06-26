@@ -96,6 +96,11 @@ struct ImmutableCFOptions {
   uint64_t l0_bucket_count;
   uint64_t l0_bucket_key_space;
 
+  // [BucketLSM §25] see ColumnFamilyOptions::l0_bucket_boundaries_encoded. Round-trips via
+  // cf_immutable_options_type_info; the ImmutableCFOptions ctor decodes it into l0_bucket_boundaries
+  // (publisher) so a remote CSA uses the CN's dynamic boundaries.
+  std::string l0_bucket_boundaries_encoded;
+
   // [BucketLSM C2 — G5 only] >1 + l0_bucket_count>1 => parallel BucketFlush with
   // this many workers. See include/rocksdb/options.h ColumnFamilyOptions.
   uint32_t parallel_split_flush;

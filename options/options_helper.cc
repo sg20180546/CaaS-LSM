@@ -316,6 +316,7 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   // is the ImmutableCFOptions ctor; serialization is the type_info; this is the missing reverse copy.)
   cf_opts->l0_bucket_count = ioptions.l0_bucket_count;
   cf_opts->l0_bucket_key_space = ioptions.l0_bucket_key_space;
+  cf_opts->l0_bucket_boundaries_encoded = ioptions.l0_bucket_boundaries_encoded;  // [§25] reverse copy
   cf_opts->optimize_filters_for_hits = ioptions.optimize_filters_for_hits;
   cf_opts->force_consistency_checks = ioptions.force_consistency_checks;
   cf_opts->memtable_insert_with_hint_prefix_extractor =

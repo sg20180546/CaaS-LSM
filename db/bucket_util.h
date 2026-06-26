@@ -13,7 +13,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "rocksdb/slice.h"
@@ -45,6 +47,33 @@ inline uint64_t BucketOf(const Slice& user_key, uint64_t key_space,
 // (exclusive upper bound between bucket i and i+1). Sorted strictly increasing;
 // size == (live_bucket_count - 1). Empty => single degenerate bucket 0.
 using BucketBoundaries = std::vector<uint64_t>;
+
+// [BucketLSM §25] Encode/decode the boundary list as a comma-separated decimal string so the live
+// DYNAMIC boundaries can ride the CompactionServiceInput cf-options string to the remote CSA. Without
+// this the CSA computes BucketOf with static-uniform boundaries, disagreeing with the CN's dynamic
+// boundaries -> version_builder false force_consistency_checks Corruption on bucketed L0. Empty <-> "".
+inline std::string EncodeBoundaries(const BucketBoundaries& b) {
+  std::string s;
+  for (size_t i = 0; i < b.size(); i++) {
+    if (i) s.push_back(',');
+    s += std::to_string(b[i]);
+  }
+  return s;
+}
+inline BucketBoundaries DecodeBoundaries(const std::string& s) {
+  BucketBoundaries b;
+  size_t i = 0;
+  while (i < s.size()) {
+    size_t j = s.find(',', i);
+    if (j == std::string::npos) j = s.size();
+    if (j > i) {
+      b.push_back(static_cast<uint64_t>(
+          std::strtoull(s.substr(i, j - i).c_str(), nullptr, 10)));
+    }
+    i = j + 1;
+  }
+  return b;
+}
 
 // Bucket id of a user key against an explicit boundary list. id = #boundaries <=
 // key = upper_bound index. Seeded with UniformBucketBoundaries() this is

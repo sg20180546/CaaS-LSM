@@ -249,6 +249,13 @@ struct ColumnFamilyOptions : public AdvancedColumnFamilyOptions {
   uint64_t l0_bucket_count = 0;
   uint64_t l0_bucket_key_space = 0;
 
+  // [BucketLSM §25] Encoded snapshot of the DYNAMIC bucket boundaries (comma-separated big-endian-8
+  // values). The CN injects the live snapshot per-compaction so it serializes into the
+  // CompactionServiceInput cf-options string -> the remote CSA decodes it and computes BucketOf with
+  // the SAME boundaries as the CN (else static-uniform mismatch -> false force_consistency_checks
+  // Corruption). Empty => uniform (l0_bucket_count/key_space). Harmless ("") in a persisted OPTIONS file.
+  std::string l0_bucket_boundaries_encoded = "";
+
   // [BucketLSM C2 / relink — option-gated, set on RELINK (G5) shards ONLY] Worker
   // count for PARALLEL BucketFlush. When > 1 AND l0_bucket_count > 1, a single flush
   // builds its N bucket-pure L0 SST files concurrently with up to this many workers
