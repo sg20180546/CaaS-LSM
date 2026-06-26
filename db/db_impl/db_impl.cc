@@ -5680,13 +5680,50 @@ Status DBImpl::UnregisterFilesInPlace(
   if (level_and_file.empty()) return Status::OK();
   auto* cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+
+  // [relink Fix A / D1=A, 2026-06-26] Drop from the src MANIFEST ONLY the files that are NOT currently
+  // being compacted. Removing a being_compacted file yanks it out from under an in-flight compaction;
+  // under REMOTE=1 the CSA re-reads inputs from HDFS and OpenAndCompact then FAILS on the now-
+  // inconsistent input set (migration_mechanism_0625_9: ~50% CSA task failures + src runC frozen). A
+  // skipped file stays at src and is removed naturally when its own compaction installs (it DeleteFiles
+  // its inputs); the dst already references it via relink-register, so no data is lost. The
+  // being_compacted check + the DeleteFile edit are built under mutex_ here so classify+drop is atomic
+  // (closes the GetColumnFamilyMetaData snapshot TOCTOU in ExportRelink). RELINK-ONLY: the sole caller
+  // is serverclient ExportRelink, so baselines never reach this path.
+  InstrumentedMutexLock l(&mutex_);
+  auto* vstorage = cfd->current()->storage_info();
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
+  int dropped = 0, skipped_busy = 0, skipped_gone = 0;
   for (const auto& lf : level_and_file) {
-    edit.DeleteFile(lf.first /* level */, lf.second /* file_number */);
+    const int level = lf.first;
+    const uint64_t fnum = lf.second;
+    bool found = false, busy = false;
+    for (FileMetaData* f : vstorage->LevelFiles(level)) {
+      if (f->fd.GetNumber() == fnum) {
+        found = true;
+        busy = f->being_compacted;
+        break;
+      }
+    }
+    if (!found) {  // already gone (compacted away since the export snapshot) -> nothing to drop
+      skipped_gone++;
+      continue;
+    }
+    if (busy) {  // leave it; its in-flight compaction removes it on install
+      skipped_busy++;
+      continue;
+    }
+    edit.DeleteFile(level, fnum);
+    dropped++;
   }
-
-  InstrumentedMutexLock l(&mutex_);
+  if (skipped_busy || skipped_gone) {
+    fprintf(stderr,
+            "[relink] UnregisterFilesInPlace: dropped=%d skipped_being_compacted=%d "
+            "skipped_already_gone=%d (of %zu)\n",
+            dropped, skipped_busy, skipped_gone, level_and_file.size());
+  }
+  if (dropped == 0) return Status::OK();
   Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                     &mutex_, directories_.GetDbDir());
   if (s.ok()) {
