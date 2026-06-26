@@ -53,6 +53,7 @@ std::unordered_map<uint64_t, compactionservice::CompactionReply>
     task_reply_map_;
 std::atomic<uint64_t> next_task_id_ = 0;
 std::unordered_map<uint64_t, uint64_t> reschedule_num;
+std::unordered_map<uint64_t, uint64_t> submit_fail_num_;  // [F2b] CSA-reported failures per task
 std::priority_queue<uint64_t, std::vector<uint64_t>, TaskCmp>
     task_priority_queue_;
 std::mutex monitor_latch_;
@@ -110,8 +111,23 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
       return grpc::Status::OK;
     }
     if (request->compaction_reply().code() != 0) {
+      // [F2b, 2026-06-26] Bound failure retries. A deterministically-failing remote compaction (e.g.
+      // a real Corruption) was re-queued here FOREVER, so CheckTask kept returning 99 and the CN's
+      // poll parked -> src freeze. After max_reschedule failures make it TERMINAL: store the failed
+      // reply so CheckTask returns its real code -> the CN gets a failure (kUseLocal) instead of hanging.
+      if (++submit_fail_num_[request->task_id()] >
+          compaction_service_options.max_reschedule) {
+        std::cout << GetTime() << "Compaction task (" << request->task_id()
+                  << ") failed " << submit_fail_num_[request->task_id()]
+                  << "x -> TERMINAL (returning failure to CN)" << std::endl;
+        task_reply_map_[request->task_id()] = request->compaction_reply();
+        task_args_map_.erase(request->task_id());
+        submit_fail_num_.erase(request->task_id());
+        return grpc::Status::OK;
+      }
       std::cout << GetTime() << "Compaction task (" << request->task_id()
-                << ") failed" << std::endl;
+                << ") failed (retry " << submit_fail_num_[request->task_id()]
+                << ")" << std::endl;
       task_priority_queue_.push(request->task_id());
       return grpc::Status::OK;
     }
@@ -119,6 +135,7 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
               << ") success" << std::endl;
     task_reply_map_[request->task_id()] = request->compaction_reply();
     task_args_map_.erase(request->task_id());
+    submit_fail_num_.erase(request->task_id());
     return grpc::Status::OK;
   }
 

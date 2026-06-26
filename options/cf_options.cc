@@ -599,6 +599,21 @@ static std::unordered_map<std::string, OptionTypeInfo>
         {"num_levels",
          {offsetof(struct ImmutableCFOptions, num_levels), OptionType::kInt,
           OptionVerificationType::kNormal, OptionTypeFlags::kNone}},
+        // [BucketLSM relink F1, 2026-06-26] Register l0_bucket_count + l0_bucket_key_space in the CF
+        // options serialization so they ride the existing CompactionServiceInput cf-options string to
+        // the REMOTE CSA (same channel the aligned-SST partitioner uses). Without this they deserialize
+        // as 0 on the CSA -> version_builder applies the STRICT L0-seqno check to bucket-pure L0 (whose
+        // seqno ranges legitimately overlap) -> force_consistency_checks Corruption -> ~50% remote
+        // compaction failures -> src freeze (migration_mechanism_0625_10). Baselines (0) serialize 0 =>
+        // no behavior change (isolation invariant holds).
+        {"l0_bucket_count",
+         {offsetof(struct ImmutableCFOptions, l0_bucket_count),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"l0_bucket_key_space",
+         {offsetof(struct ImmutableCFOptions, l0_bucket_key_space),
+          OptionType::kUInt64T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"bloom_locality",
          {offsetof(struct ImmutableCFOptions, bloom_locality),
           OptionType::kUInt32T, OptionVerificationType::kNormal,

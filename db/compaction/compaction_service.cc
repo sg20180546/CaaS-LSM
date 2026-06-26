@@ -39,6 +39,14 @@ class ProCPClient {
     if (!status.ok()) {
       return ROCKSDB_NAMESPACE::Status::IOError(status.error_message());
     }
+    // [F2a, 2026-06-26] Bound this otherwise-deadline-less poll. code()==99 means "no terminal result
+    // yet". If a remote task never produces one (e.g. ProCP infinitely re-queues a persistently-failing
+    // compaction), this loop would park the CN compaction thread FOREVER (the migration_mechanism src
+    // freeze: num-running-compactions pinned, 0-byte progress). After max_poll intervals give up ->
+    // Aborted -> WaitForCompleteV2 returns kUseLocal -> the CN runs the compaction LOCALLY (thread freed).
+    int poll_count = 0;
+    const int max_poll =
+        options.check_time_interval > 0 ? 600 / options.check_time_interval : 600;
     do {
       grpc::ClientContext check_task_context;
       sleep(options.check_time_interval);
@@ -46,7 +54,10 @@ class ProCPClient {
       if (!status.ok()) {
         return ROCKSDB_NAMESPACE::Status::IOError(status.error_message());
       }
-    } while (compaction_reply.code() == 99);
+    } while (compaction_reply.code() == 99 && ++poll_count < max_poll);
+    if (compaction_reply.code() == 99) {
+      return ROCKSDB_NAMESPACE::Status::Aborted("remote compaction poll timed out");
+    }
     if (compaction_reply.code() != 0) {
       return ROCKSDB_NAMESPACE::Status::Aborted();
     }
