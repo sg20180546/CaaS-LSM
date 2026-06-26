@@ -306,6 +306,16 @@ void UpdateColumnFamilyOptions(const ImmutableCFOptions& ioptions,
   cf_opts->level_compaction_dynamic_file_size =
       ioptions.level_compaction_dynamic_file_size;
   cf_opts->num_levels = ioptions.num_levels;
+  // [BucketLSM relink F1, 2026-06-26] copy l0_bucket_count + l0_bucket_key_space back to
+  // ColumnFamilyOptions. GetColumnFamilyOptionsFromString parses the cf-options string into the
+  // ImmutableCFOptions configurable (via the cf_immutable_options_type_info entries) and then rebuilds
+  // a ColumnFamilyOptions through THIS function. Without copying them here, the deserialized values are
+  // dropped -> the remote CSA's cf options get l0_bucket_count=0 -> version_builder applies the strict
+  // cross-bucket L0-seqno check to bucket-pure L0 (seqno ranges legitimately overlap) ->
+  // force_consistency_checks Corruption -> ~50% remote compaction failures -> src freeze. (Forward copy
+  // is the ImmutableCFOptions ctor; serialization is the type_info; this is the missing reverse copy.)
+  cf_opts->l0_bucket_count = ioptions.l0_bucket_count;
+  cf_opts->l0_bucket_key_space = ioptions.l0_bucket_key_space;
   cf_opts->optimize_filters_for_hits = ioptions.optimize_filters_for_hits;
   cf_opts->force_consistency_checks = ioptions.force_consistency_checks;
   cf_opts->memtable_insert_with_hint_prefix_extractor =
