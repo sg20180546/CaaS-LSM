@@ -400,13 +400,31 @@ std::string ScheduleCSA(
         task_priority_queue_.size() >
             compaction_service_options.max_accumulation_in_procp ||
         reschedule_num[task_id] > compaction_service_options.max_reschedule) {
+      // [diag 2026-06-27] Record WHICH of the three conditions forced this local
+      // fallback, plus the live values, all read here under scheduler_latch_ so they
+      // match the branch decision. 0626_8 showed mass "immediate" fallbacks (no prior
+      // "all busy") even though the CSAs were registered ~70s earlier and never went
+      // Offline, with fresh unique task_ids and a tiny queue -- none of the three
+      // conditions should have been true. This pins it: csa_empty (map empty / not
+      // visible to this thread) vs queue_over vs reschedule_over.
+      const char* why =
+          csa_status_map_.empty()
+              ? "csa_empty"
+              : (task_priority_queue_.size() >
+                         compaction_service_options.max_accumulation_in_procp
+                     ? "queue_over"
+                     : "reschedule_over");
+      uint64_t diag_q = task_priority_queue_.size();
+      uint64_t diag_resched = reschedule_num[task_id];
+      size_t diag_csa = csa_status_map_.size();
       compactionservice::CompactionReply compactionReply;
       compactionReply.set_code(1);
       task_reply_map_[task_id] = compactionReply;
       task_args_map_.erase(task_id);
       scheduler_latch_.unlock();
-      std::cout << GetTime() << "Fallback compaction task (" << task_id << ")"
-                << std::endl;
+      std::cout << GetTime() << "Fallback compaction task (" << task_id
+                << ") reason=" << why << " csa_map=" << diag_csa
+                << " qsize=" << diag_q << " resched=" << diag_resched << std::endl;
       continue;
     }
     auto worker_address =

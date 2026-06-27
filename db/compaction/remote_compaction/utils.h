@@ -22,26 +22,33 @@ typedef struct MEMPACKED {
 double get_memoccupy() {
   FILE* fd;
   char buff[256];
-  MEM_OCCUPY m;
 
 #ifdef HDFS
   fd = fopen("/proc/meminfo", "r");
 #else
   fd = fopen("/Users/liin/meminfo", "r");
 #endif
-  fgets(buff, sizeof(buff), fd);
-  sscanf(buff, "%s %lu ", m.name1, &m.MemTotal);
-  fgets(buff, sizeof(buff), fd);
-  sscanf(buff, "%s %lu ", m.name2, &m.MemFree);
-  fgets(buff, sizeof(buff), fd);
-  sscanf(buff, "%s %lu ", m.name3, &m.Buffers);
-  fgets(buff, sizeof(buff), fd);
-  sscanf(buff, "%s %lu ", m.name4, &m.Cached);
-  fgets(buff, sizeof(buff), fd);
-  sscanf(buff, "%s %lu", m.name5, &m.SwapCached);
+  if (!fd) return 1.0;  // can't read -> assume idle, don't wrongly reject the CSA
 
+  // Return the fraction of memory AVAILABLE for new work, not strictly-free.
+  // The old code read /proc/meminfo positionally and returned MemFree/MemTotal.
+  // MemFree EXCLUDES the page cache, so on an HDFS storage node with a warm cache
+  // it sits far below ScheduleCSA's 0.3 gate (e.g. node87: MemFree 23% but
+  // MemAvailable 86%) -> the CSA is permanently rejected -> remote compaction never
+  // runs (Distributed~=0, everything falls back to local CN). MemAvailable counts
+  // the reclaimable page cache, which is the right "can this node take work?" signal.
+  char name[64];
+  unsigned long val = 0, mem_total = 0, mem_avail = 0, mem_free = 0;
+  while (fgets(buff, sizeof(buff), fd)) {
+    if (sscanf(buff, "%63s %lu", name, &val) != 2) continue;
+    if (strcmp(name, "MemTotal:") == 0) mem_total = val;
+    else if (strcmp(name, "MemAvailable:") == 0) mem_avail = val;
+    else if (strcmp(name, "MemFree:") == 0) mem_free = val;
+  }
   fclose(fd);
-  return static_cast<double>(m.MemFree) / static_cast<double>(m.MemTotal);
+  if (mem_total == 0) return 1.0;
+  unsigned long usable = mem_avail ? mem_avail : mem_free;  // fallback if no MemAvailable
+  return static_cast<double>(usable) / static_cast<double>(mem_total);
 }
 
 inline char* GetTime() {
