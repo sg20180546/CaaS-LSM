@@ -45,8 +45,13 @@ class ProCPClient {
     // freeze: num-running-compactions pinned, 0-byte progress). After max_poll intervals give up ->
     // Aborted -> WaitForCompleteV2 returns kUseLocal -> the CN runs the compaction LOCALLY (thread freed).
     int poll_count = 0;
+    // [heartbeat 2026-06-29] This cap is now only a SAFETY NET. The real "is the remote task dead?"
+    // decision is made by ProCP via CSA heartbeats: CheckTask returns a non-99 abort code only after a
+    // task goes silent > stale window, so a slow-but-progressing compaction is NOT killed at 600s and
+    // redone locally (the retry-churn / src-freeze bug). Raised 600 -> 1800 so even the net doesn't
+    // prematurely abort a long, healthy remote compaction.
     const int max_poll =
-        options.check_time_interval > 0 ? 600 / options.check_time_interval : 600;
+        options.check_time_interval > 0 ? 1800 / options.check_time_interval : 1800;
     do {
       grpc::ClientContext check_task_context;
       sleep(options.check_time_interval);

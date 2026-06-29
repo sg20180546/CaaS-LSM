@@ -14,6 +14,7 @@
 #include "thread"
 #include "utils.h"
 #include <cstdlib>
+#include <chrono>  // [heartbeat] steady_clock for per-task liveness timestamps
 #include <vector>
 #include "hdfs.h"  // [relink/Storage-CP] libhdfs C API: the CP now owns the physical SST delete
 
@@ -54,6 +55,13 @@ std::unordered_map<uint64_t, compactionservice::CompactionReply>
 std::atomic<uint64_t> next_task_id_ = 0;
 std::unordered_map<uint64_t, uint64_t> reschedule_num;
 std::unordered_map<uint64_t, uint64_t> submit_fail_num_;  // [F2b] CSA-reported failures per task
+// [heartbeat 2026-06-29] Last time the CSA pinged that a task is still PROGRESSING. CheckTask tells the
+// CN to give up (fall back to local) ONLY when a task goes silent > kHeartbeatStaleSec, so a slow-but-
+// running remote compaction is no longer killed+retried (the retry-churn / src-freeze bug). All accesses
+// are under scheduler_latch_ (SubmitTask / CheckTask / ConsumeTask-dispatch), so no extra lock needed.
+std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> last_heartbeat_;
+static constexpr int kHeartbeatCode = 424242;   // SubmitTask sentinel: a ping, not a result (!=0,!=99,!=10)
+static constexpr int kHeartbeatStaleSec = 150;  // 2.5x the CSA's 60s ping interval -> declared stuck
 std::priority_queue<uint64_t, std::vector<uint64_t>, TaskCmp>
     task_priority_queue_;
 std::mutex monitor_latch_;
@@ -107,6 +115,12 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
     std::cout << GetTime() << "Submit compaction task: (" << request->task_id()
               << ")" << std::endl;
     std::lock_guard<std::mutex> lock(scheduler_latch_);
+    if (request->compaction_reply().code() == kHeartbeatCode) {
+      // [heartbeat] Not a result -> just record liveness so CheckTask keeps the CN waiting
+      // instead of timing the (still-progressing) remote compaction out and retrying it.
+      last_heartbeat_[request->task_id()] = std::chrono::steady_clock::now();
+      return grpc::Status::OK;
+    }
     if (task_args_map_.count(request->task_id()) == 0) {
       return grpc::Status::OK;
     }
@@ -144,8 +158,22 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
                          compactionservice::CompactionReply* reply) override {
     std::lock_guard<std::mutex> lock(scheduler_latch_);
     if (task_reply_map_.count(request->task_id()) == 0) {
-      std::cout << GetTime() << "Check compaction task (" << request->task_id()
-                << "): Not finished" << std::endl;
+      // [heartbeat] Abort (tell the CN to fall back to local) ONLY if the task went silent for
+      // > kHeartbeatStaleSec. A slow-but-progressing remote compaction keeps pinging -> stays 99 ->
+      // CN keeps waiting instead of killing+retrying it. (Routine "Not finished" logging removed:
+      // it was ~193k lines/run of pure noise + CPU on node53.)
+      auto hb = last_heartbeat_.find(request->task_id());
+      if (hb != last_heartbeat_.end() &&
+          std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::steady_clock::now() - hb->second)
+                  .count() > kHeartbeatStaleSec) {
+        std::cout << GetTime() << "Check compaction task (" << request->task_id()
+                  << "): STALE (no heartbeat > " << kHeartbeatStaleSec
+                  << "s) -> abort to CN" << std::endl;
+        last_heartbeat_.erase(hb);
+        reply->set_code(10);  // kAborted: CN sees code!=0 -> kUseLocal -> runs it locally
+        return grpc::Status::OK;
+      }
       reply->set_code(99);
       return grpc::Status::OK;
     }
@@ -439,6 +467,7 @@ std::string ScheduleCSA(
       continue;
     }
     csa_task_list_[worker_address].emplace_back(task_id);
+    last_heartbeat_[task_id] = std::chrono::steady_clock::now();  // [heartbeat] grace until 1st CSA ping
     scheduler_latch_.unlock();
     monitor_latch_.lock();
     std::cout << GetTime() << "Memory usage is "

@@ -8,6 +8,7 @@
 
 #include <string>
 #include <thread>
+#include <atomic>  // [heartbeat] hb_done flag
 #include <cstdlib>
 
 #include "compaction_service.grpc.pb.h"
@@ -20,6 +21,9 @@
 #endif
 
 ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
+// [heartbeat 2026-06-29] Sentinel in CompactionReply.code() telling ProCP "this task is still
+// progressing" (a ping, not a result). MUST match procp_server.cc's kHeartbeatCode.
+static constexpr int kHeartbeatCode = 424242;
 
 class CSAImpl final : public compactionservice::CSAService::Service {
  public:
@@ -61,10 +65,29 @@ class CSAImpl final : public compactionservice::CSAService::Service {
           compaction_task_args.compaction_args();
       uint64_t start_time;
       uint64_t open_db_latency;
+      // [heartbeat 2026-06-29] Ping ProCP every 60s while this (possibly slow) compaction runs, so the
+      // CN's CheckTask poll sees it is still PROGRESSING and does NOT abort+retry a slow-but-running
+      // remote compaction (the retry-churn / src-freeze bug). Overhead: 1 RPC / 60s / running task.
+      std::atomic<bool> hb_done(false);
+      uint64_t hb_task_id = compaction_task_args.task_id();
+      std::thread hb_thread([this, hb_task_id, &hb_done] {
+        while (!hb_done.load()) {
+          for (int i = 0; i < 60 && !hb_done.load(); ++i) sleep(1);
+          if (hb_done.load()) break;
+          grpc::ClientContext hb_ctx;
+          compactionservice::SubmitTaskArgs hb_args;
+          hb_args.set_task_id(hb_task_id);
+          hb_args.mutable_compaction_reply()->set_code(kHeartbeatCode);
+          google::protobuf::Empty hb_resp;
+          stub_->SubmitTask(&hb_ctx, hb_args, &hb_resp);
+        }
+      });
       rocksdb::Status s = ROCKSDB_NAMESPACE::DB::OpenAndCompact(
           compaction_args.name(), compaction_args.output_directory(),
           compaction_args.input(), &compaction_service_result, &start_time,
           &open_db_latency, options_override);
+      hb_done.store(true);
+      hb_thread.join();
       compactionservice::CompactionReply compaction_reply;
       uint64_t process_latency =
           start_time - compaction_task_args.compaction_args().trigger_ms();
