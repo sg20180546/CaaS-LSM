@@ -16,6 +16,7 @@
 #include <string>
 
 #include "env_hdfs.h"
+#include "hdfs_trace.h"
 #include "logging/logging.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
@@ -87,7 +88,9 @@ class HdfsReadableFile : virtual public FSSequentialFile,
       : fileSys_(fileSys), filename_(fname), hfile_(nullptr) {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile opening file %s\n",
                     filename_.c_str());
-    hfile_ = hdfsOpenFile(fileSys_, filename_.c_str(), O_RDONLY, 0, 0, 0);
+    hfile_ = HDFS_TRACE_CALL(
+        "open_r", 0, -1,
+        hdfsOpenFile(fileSys_, filename_.c_str(), O_RDONLY, 0, 0, 0));
     ROCKS_LOG_DEBUG(mylog,
                     "[hdfs] HdfsReadableFile opened file %s hfile_=0x%p\n",
                     filename_.c_str(), hfile_);
@@ -118,7 +121,9 @@ class HdfsReadableFile : virtual public FSSequentialFile,
 
     // Read a total of n bytes repeatedly until we hit error or eof
     while (remaining_bytes > 0) {
-      bytes_read = hdfsRead(fileSys_, hfile_, buffer, remaining_bytes);
+      bytes_read = HDFS_TRACE_CALL(
+          "seqread", remaining_bytes, -1,
+          hdfsRead(fileSys_, hfile_, buffer, remaining_bytes));
       if (bytes_read <= 0) {
         break;
       }
@@ -149,9 +154,10 @@ class HdfsReadableFile : virtual public FSSequentialFile,
     IOStatus s;
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile preading %s\n",
                     filename_.c_str());
-    tSize bytes_read =
+    tSize bytes_read = HDFS_TRACE_CALL(
+        "pread", n, offset,
         hdfsPread(fileSys_, hfile_, offset, static_cast<void*>(scratch),
-                  static_cast<tSize>(n));
+                  static_cast<tSize>(n)));
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile pread %s\n",
                     filename_.c_str());
     *result = Slice(scratch, (bytes_read < 0) ? 0 : bytes_read);
@@ -194,7 +200,8 @@ class HdfsReadableFile : virtual public FSSequentialFile,
   tOffset fileSize() {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile fileSize %s\n",
                     filename_.c_str());
-    hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, filename_.c_str());
+    hdfsFileInfo* pFileInfo = HDFS_TRACE_CALL(
+        "getinfo", 0, -1, hdfsGetPathInfo(fileSys_, filename_.c_str()));
     tOffset size = 0L;
     if (pFileInfo != nullptr) {
       size = pFileInfo->mSize;
@@ -222,7 +229,9 @@ class HdfsWritableFile : public FSWritableFile {
         hfile_(nullptr) {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile opening %s\n",
                     filename_.c_str());
-    hfile_ = hdfsOpenFile(fileSys_, filename_.c_str(), O_WRONLY, 0, 0, 0);
+    hfile_ = HDFS_TRACE_CALL(
+        "open_w", 0, -1,
+        hdfsOpenFile(fileSys_, filename_.c_str(), O_WRONLY, 0, 0, 0));
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile opened %s\n",
                     filename_.c_str());
     assert(hfile_ != nullptr);
@@ -253,7 +262,9 @@ class HdfsWritableFile : public FSWritableFile {
                     filename_.c_str());
     const char* src = data.data();
     size_t left = data.size();
-    size_t ret = hdfsWrite(fileSys_, hfile_, src, static_cast<tSize>(left));
+    size_t ret = HDFS_TRACE_CALL(
+        "write", left, -1,
+        hdfsWrite(fileSys_, hfile_, src, static_cast<tSize>(left)));
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Appended %s\n",
                     filename_.c_str());
     if (ret != left) {
@@ -264,7 +275,9 @@ class HdfsWritableFile : public FSWritableFile {
 
   // This is used by HdfsLogger to write data to the debug log file
   IOStatus Append(const char* src, size_t size) {
-    if (hdfsWrite(fileSys_, hfile_, src, static_cast<tSize>(size)) !=
+    if (HDFS_TRACE_CALL("writelog", size, -1,
+                        hdfsWrite(fileSys_, hfile_, src,
+                                  static_cast<tSize>(size))) !=
         static_cast<tSize>(size)) {
       return IOError(filename_, errno);
     }
@@ -280,10 +293,10 @@ class HdfsWritableFile : public FSWritableFile {
                 IODebugContext* /*dbg*/) override {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Sync %s\n",
                     filename_.c_str());
-    if (hdfsFlush(fileSys_, hfile_) == -1) {
+    if (HDFS_TRACE_CALL("flush", 0, -1, hdfsFlush(fileSys_, hfile_)) == -1) {
       return IOError(filename_, errno);
     }
-    if (hdfsHSync(fileSys_, hfile_) == -1) {
+    if (HDFS_TRACE_CALL("hsync", 0, -1, hdfsHSync(fileSys_, hfile_)) == -1) {
       return IOError(filename_, errno);
     }
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Synced %s\n",
@@ -565,7 +578,7 @@ IOStatus HdfsFileSystem::NewDirectory(const std::string& name,
 IOStatus HdfsFileSystem::FileExists(const std::string& fname,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
-  int value = hdfsExists(fileSys_, fname.c_str());
+  int value = HDFS_TRACE_CALL("exists", 0, -1, hdfsExists(fileSys_, fname.c_str()));
   switch (value) {
     case HDFS_EXISTS:
       return IOStatus::OK();
@@ -588,7 +601,9 @@ IOStatus HdfsFileSystem::GetChildren(const std::string& path,
   if (s.ok()) {
     int numEntries = 0;
     hdfsFileInfo* pHdfsFileInfo = 0;
-    pHdfsFileInfo = hdfsListDirectory(fileSys_, path.c_str(), &numEntries);
+    pHdfsFileInfo = HDFS_TRACE_CALL(
+        "listdir", 0, -1,
+        hdfsListDirectory(fileSys_, path.c_str(), &numEntries));
     if (numEntries >= 0) {
       for (int i = 0; i < numEntries; i++) {
         std::string pathname(pHdfsFileInfo[i].mName);
@@ -635,7 +650,7 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
       // s not ok => fall back to the normal physical delete below.
     }
   }
-  if (hdfsDelete(fileSys_, fname.c_str(), 1) == 0) {
+  if (HDFS_TRACE_CALL("delete", 0, -1, hdfsDelete(fileSys_, fname.c_str(), 1)) == 0) {
     return IOStatus::OK();
   }
   return IOError(fname, errno);
@@ -644,7 +659,7 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
 IOStatus HdfsFileSystem::CreateDir(const std::string& name,
                                    const IOOptions& /*options*/,
                                    IODebugContext* /*dbg*/) {
-  if (hdfsCreateDirectory(fileSys_, name.c_str()) == 0) {
+  if (HDFS_TRACE_CALL("mkdir", 0, -1, hdfsCreateDirectory(fileSys_, name.c_str())) == 0) {
     return IOStatus::OK();
   }
   return IOError(name, errno);
@@ -671,7 +686,8 @@ IOStatus HdfsFileSystem::GetFileSize(const std::string& fname,
                                      const IOOptions& /*options*/,
                                      uint64_t* size, IODebugContext* /*dbg*/) {
   *size = 0L;
-  hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, fname.c_str());
+  hdfsFileInfo* pFileInfo = HDFS_TRACE_CALL(
+      "getinfo", 0, -1, hdfsGetPathInfo(fileSys_, fname.c_str()));
   if (pFileInfo != nullptr) {
     *size = pFileInfo->mSize;
     hdfsFreeFileInfo(pFileInfo, 1);
@@ -684,7 +700,8 @@ IOStatus HdfsFileSystem::GetFileModificationTime(const std::string& fname,
                                                  const IOOptions& /*options*/,
                                                  uint64_t* time,
                                                  IODebugContext* /*dbg*/) {
-  hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, fname.c_str());
+  hdfsFileInfo* pFileInfo = HDFS_TRACE_CALL(
+      "getinfo", 0, -1, hdfsGetPathInfo(fileSys_, fname.c_str()));
   if (pFileInfo != nullptr) {
     *time = static_cast<uint64_t>(pFileInfo->mLastMod);
     hdfsFreeFileInfo(pFileInfo, 1);
@@ -700,8 +717,9 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
                                     const std::string& target,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
-  hdfsDelete(fileSys_, target.c_str(), 1);
-  if (hdfsRename(fileSys_, src.c_str(), target.c_str()) == 0) {
+  HDFS_TRACE_CALL("delete", 0, -1, hdfsDelete(fileSys_, target.c_str(), 1));
+  if (HDFS_TRACE_CALL("rename", 0, -1,
+                      hdfsRename(fileSys_, src.c_str(), target.c_str())) == 0) {
     // [relink/Storage-CP] The CP refcount is keyed by PATH, so a rename moves the
     // bytes to a NEW key. Transfer the refcount with the bytes: seed the target (so
     // the CN's later DeleteFile drives it to 0 and the CP GC reclaims it) and release
@@ -773,7 +791,8 @@ IOStatus HdfsFileSystem::NewLogger(const std::string& fname,
 IOStatus HdfsFileSystem::IsDirectory(const std::string& path,
                                      const IOOptions& /*options*/, bool* is_dir,
                                      IODebugContext* /*dbg*/) {
-  hdfsFileInfo* pFileInfo = hdfsGetPathInfo(fileSys_, path.c_str());
+  hdfsFileInfo* pFileInfo = HDFS_TRACE_CALL(
+      "getinfo", 0, -1, hdfsGetPathInfo(fileSys_, path.c_str()));
   if (pFileInfo != nullptr) {
     if (is_dir != nullptr) {
       *is_dir = (pFileInfo->mKind == kObjectKindDirectory);
