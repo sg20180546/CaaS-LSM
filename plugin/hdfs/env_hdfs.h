@@ -96,6 +96,13 @@ class HdfsFileSystem : public FileSystemWrapper {
   IOStatus NewLogger(const std::string& /*fname*/, const IOOptions& /*options*/,
                      std::shared_ptr<Logger>* /*result*/,
                      IODebugContext* /*dbg*/) override;
+  // [relink/Storage-CP] Bump the CP refcount for `path` because a SECOND shard
+  // now references it in place (external_path relink). Called from the engine
+  // via StorageCpNotifyLink() at the moment the reference is installed, so the
+  // increment cannot be lost by building the migration driver without gRPC
+  // (the 2026-08-08 dangling-reference bug). No-op when Storage-CP is disabled.
+  void NotifyRelinkLink(const std::string& path) const;
+
   IOStatus IsDirectory(const std::string& /*path*/,
                        const IOOptions& /*options*/, bool* /*is_dir*/,
                        IODebugContext* /*dbg*/) override;
@@ -126,6 +133,11 @@ class HdfsFileSystem : public FileSystemWrapper {
   StorageCpClient* GetStorageCpClient() const;
   // Helper: true iff fname names a real SST (ends in ".sst").
   static bool IsSstFile(const std::string& fname);
+  // Rate-limited report of one hook RPC's outcome. Hook failures used to be
+  // discarded, which made a completely inert refcount indistinguishable from a
+  // working one for months; never swallow a status silently again.
+  void LogStorageRpc(const char* op, const std::string& path, bool ok,
+                     const std::string& err) const;
 };
 
 // Returns a `FileSystem` that hashes file contents when naming files, thus

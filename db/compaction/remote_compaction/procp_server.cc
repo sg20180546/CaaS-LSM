@@ -83,6 +83,11 @@ struct RefEntry {
 std::unordered_map<std::string, RefEntry> storage_refcount_map_;
 std::vector<std::string> storage_pending_delete_;  // refcount-0 paths awaiting the CP's batch hdfsDelete
 std::mutex storage_latch_;                          // guards storage_refcount_map_ + storage_pending_delete_
+// [diag 2026-08-08] Deletes requested for a path the CP never saw created. Any
+// non-zero value means the refcount is not fully armed (a NotifyCreate is being
+// lost), which is the precondition for the relink dangling-reference bug — so
+// it is reported every GC tick and a relink run should be gated on it staying 0.
+uint64_t storage_untracked_deletes_ = 0;  // guarded by storage_latch_
 
 class ProCPImpl final : public compactionservice::ProCPService::Service {
  public:
@@ -250,18 +255,41 @@ class StorageImpl final : public compactionservice::StorageService::Service {
 
   // Drop a shard's reference. For a TRACKED file the CP owns deletion: when the
   // refcount hits 0 the path is queued for the CP's batch GC (RunStorageGC) and the
-  // reply is deleted=false (the CN must NOT delete it). An UNTRACKED path (never saw a
-  // NotifyCreate) is treated as unshared -> deleted=true so the CN's normal delete path
-  // stays intact for non-relinked files / pre-STORAGE_CP files.
+  // reply is deleted=false (the CN must NOT delete it).
+  //
+  // ★ 2026-08-08 UNTRACKED is now FAIL-SAFE. It used to answer deleted=true
+  // ("never saw a NotifyCreate => nobody shares it => delete normally"), which
+  // is only sound if every create is guaranteed to have been reported. It was
+  // not: in 0807_2 the CP received no NotifyCreate at all, so a relinked file
+  // looked unshared, the owning shard physically deleted it, and the migration
+  // destination was left with 56 dangling external_path references (its scans
+  // spun in HDFS retries and its compaction stopped for the rest of the run).
+  // "I have never heard of this file" is ignorance, not proof of exclusivity,
+  // so we keep the bytes and let the mark-sweep GC reclaim them later: a leak
+  // is recoverable, deleting a file another shard still reads is not. The
+  // untracked count is surfaced in the storage-gc line so a run can be gated on
+  // it being 0. STORAGE_CP_UNTRACKED_DELETE=1 restores the old behavior.
   grpc::Status RequestDelete(grpc::ServerContext* context,
                              const compactionservice::FileRef* request,
                              compactionservice::DeleteReply* reply) override {
     std::lock_guard<std::mutex> lock(storage_latch_);
     auto it = storage_refcount_map_.find(request->path());
     if (it == storage_refcount_map_.end()) {
-      // Untracked => unshared: tell the CN to delete normally.
-      reply->set_deleted(true);
+      static const bool untracked_delete =
+          std::getenv("STORAGE_CP_UNTRACKED_DELETE") != nullptr;
+      storage_untracked_deletes_++;
+      reply->set_deleted(untracked_delete);
       reply->set_refcount(0);
+      if (storage_untracked_deletes_ <= 5 ||
+          storage_untracked_deletes_ % 1000 == 0) {
+        std::cout << GetTime() << "[storage] ★UNTRACKED RequestDelete path="
+                  << request->path() << " shard=" << request->shard_id()
+                  << " -> " << (untracked_delete ? "ALLOW DELETE (unsafe mode)"
+                                                 : "KEEP (fail-safe)")
+                  << " (#" << storage_untracked_deletes_
+                  << "; refcount armed? tracked=" << storage_refcount_map_.size()
+                  << ")" << std::endl;
+      }
     } else {
       auto& e = it->second;
       e.count--;  // unconditional: the deleter need not be the creator (CSA vs CN)
@@ -336,9 +364,16 @@ class StorageImpl final : public compactionservice::StorageService::Service {
       std::lock_guard<std::mutex> lock(storage_latch_);
       for (auto& p : requeue) storage_pending_delete_.push_back(std::move(p));
     }
+    uint64_t untracked;
+    {
+      std::lock_guard<std::mutex> lock(storage_latch_);
+      untracked = storage_untracked_deletes_;
+    }
     std::cout << GetTime() << "[storage-gc] interval=" << interval << "s tracked=" << tracked
               << " shared=" << shared << " batch=" << batch.size() << " deleted=" << deleted
-              << " requeued=" << requeue.size() << std::endl;
+              << " requeued=" << requeue.size() << " untracked_deletes=" << untracked
+              << (tracked == 0 ? "  ★REFCOUNT NOT ARMED (no NotifyCreate ever received)" : "")
+              << std::endl;
   }
 }
 

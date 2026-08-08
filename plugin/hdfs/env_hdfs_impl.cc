@@ -16,6 +16,11 @@
 #include <string>
 
 #include "env_hdfs.h"
+#include "storage_cp_hook.h"
+
+#include <atomic>
+#include <chrono>
+
 #include "logging/logging.h"
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
@@ -454,6 +459,7 @@ HdfsFileSystem::StorageCpClient* HdfsFileSystem::GetStorageCpClient() const {
     const char* addr = std::getenv("STORAGE_CP_ADDR");
     if (addr == nullptr || addr[0] == '\0') {
       // DISABLED: leave storage_cp_client_ == nullptr.
+      fprintf(stderr, "[storage-cp] DISABLED (STORAGE_CP_ADDR unset)\n");
       return;
     }
     const char* shard = std::getenv("STORAGE_CP_SHARD");
@@ -466,8 +472,54 @@ HdfsFileSystem::StorageCpClient* HdfsFileSystem::GetStorageCpClient() const {
         std::string(addr), grpc::InsecureChannelCredentials());
     client->stub = compactionservice::StorageService::NewStub(client->channel);
     storage_cp_client_ = std::move(client);
+    // [diag 2026-08-08] The refcount was silently inert for months (procp saw
+    // tracked=0 across 0806_2/0807_1/0807_2) because every hook swallowed its
+    // RPC status. Say out loud that the client armed, and probe the channel: a
+    // gRPC channel constructs fine against a dead peer, so without this an
+    // unreachable CP looks exactly like a healthy one.
+    bool up = storage_cp_client_->channel->WaitForConnected(
+        std::chrono::system_clock::now() + std::chrono::seconds(5));
+    fprintf(stderr, "[storage-cp] ARMED addr=%s shard=%u channel=%s\n", addr,
+            storage_cp_shard_, up ? "READY" : "NOT-READY(will retry per-RPC)");
   });
   return storage_cp_client_.get();
+}
+
+// [relink/Storage-CP diag] Log the outcome of one hook RPC. Failures used to be
+// swallowed entirely, which is how a fully inert refcount looked identical to a
+// working one. Rate-limited (first kLogFirst of each kind, then every 1000th)
+// so a 250k-op/s run cannot drown the log.
+void HdfsFileSystem::LogStorageRpc(const char* op, const std::string& path,
+                                   bool ok, const std::string& err) const {
+  static std::atomic<uint64_t> n_ok{0}, n_err{0};
+  constexpr uint64_t kLogFirst = 5, kLogEvery = 1000;
+  uint64_t n = ok ? ++n_ok : ++n_err;
+  if (n <= kLogFirst || n % kLogEvery == 0) {
+    fprintf(stderr, "[storage-cp] %s %s %s (#%llu)%s%s\n", op,
+            ok ? "ok" : "FAILED", path.c_str(), (unsigned long long)n,
+            err.empty() ? "" : " err=", err.c_str());
+  }
+}
+
+// [relink/Storage-CP] refcount++ for a file this shard now references in place.
+void HdfsFileSystem::NotifyRelinkLink(const std::string& path) const {
+  StorageCpClient* client = GetStorageCpClient();
+  if (client == nullptr || !IsSstFile(path)) return;
+  compactionservice::FileRef req;
+  req.set_path(path);
+  req.set_shard_id(storage_cp_shard_);
+  google::protobuf::Empty reply;
+  grpc::ClientContext ctx;
+  grpc::Status s = client->stub->NotifyLink(&ctx, req, &reply);
+  LogStorageRpc("NotifyLink", path, s.ok(), s.error_message());
+}
+
+// Engine-facing entry point (declared in storage_cp_hook.h). Unwraps whatever
+// FileSystem wrappers the DB stacked on top and no-ops if HDFS is not underneath.
+void StorageCpNotifyLink(FileSystem* fs, const std::string& path) {
+  if (fs == nullptr) return;
+  const HdfsFileSystem* hfs = fs->CheckedCast<HdfsFileSystem>();
+  if (hfs != nullptr) hfs->NotifyRelinkLink(path);
 }
 
 std::string HdfsFileSystem::GetId() const {
@@ -532,10 +584,12 @@ IOStatus HdfsFileSystem::NewWritableFile(
   }
   result->reset(f);
 
-  // [relink/Storage-CP] Best-effort NotifyCreate so the CP can seed refcount=1
-  // for this new SST. DISABLED (client==nullptr) or non-SST => no-op =>
-  // baseline bit-identical. Never affects the actual file creation above:
-  // errors are swallowed.
+  // [relink/Storage-CP] NotifyCreate so the CP can seed refcount=1 for this new
+  // SST. DISABLED (client==nullptr) or non-SST => no-op => baseline
+  // bit-identical. Never affects the actual file creation above: a failure is
+  // reported but not propagated. NOTE the status is no longer discarded — a
+  // dropped NotifyCreate leaves the file untracked at the CP, and an untracked
+  // file is exactly what makes a later RequestDelete unsafe for relink.
   if (StorageCpClient* client = GetStorageCpClient()) {
     if (IsSstFile(fname)) {
       compactionservice::FileRef req;
@@ -543,7 +597,8 @@ IOStatus HdfsFileSystem::NewWritableFile(
       req.set_shard_id(storage_cp_shard_);
       google::protobuf::Empty reply;
       grpc::ClientContext ctx;
-      client->stub->NotifyCreate(&ctx, req, &reply);  // ignore status
+      grpc::Status s = client->stub->NotifyCreate(&ctx, req, &reply);
+      LogStorageRpc("NotifyCreate", fname, s.ok(), s.error_message());
     }
   }
   return IOStatus::OK();
@@ -614,9 +669,17 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
                                     IODebugContext* /*dbg*/) {
   // [relink/Storage-CP] When ENABLED and this is a shared SST, route the delete
   // through the CP's refcount: only physically delete when the CP says the
-  // refcount hit 0 (reply.deleted==true). If the CP RPC fails we conservatively
-  // fall back to the normal physical delete so we never leak the file on the
-  // local-only path. DISABLED or non-SST => unchanged baseline path below.
+  // refcount hit 0 (reply.deleted==true). DISABLED or non-SST => unchanged
+  // baseline path below.
+  //
+  // ★ 2026-08-08: an RPC failure now KEEPS the file instead of falling through
+  // to hdfsDelete. The old fail-OPEN fallback is what destroyed the relink dst
+  // in 0807_2 — the CP never learned about the file, the source's compaction
+  // deleted it anyway, and the dst was left with 56 dangling external_path
+  // references (FileNotFoundException + a permanently stalled dst). Keeping an
+  // unconfirmed file leaks storage, which the CP's mark-sweep GC can reclaim;
+  // deleting one that another shard still references is unrecoverable data
+  // loss. Set STORAGE_CP_UNSAFE_DELETE_ON_RPC_FAIL=1 for the old behavior.
   if (StorageCpClient* client = GetStorageCpClient()) {
     if (IsSstFile(fname)) {
       compactionservice::FileRef req;
@@ -625,14 +688,19 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
       compactionservice::DeleteReply reply;
       grpc::ClientContext ctx;
       grpc::Status s = client->stub->RequestDelete(&ctx, req, &reply);
+      LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
       if (s.ok()) {
         if (!reply.deleted()) {
-          // Still referenced by another shard: keep the physical file.
+          // Still referenced by another shard (or the CP owns the delete):
+          // keep the physical file.
           return IOStatus::OK();
         }
         // refcount reached 0: fall through to physically delete.
+      } else {
+        static const bool unsafe =
+            std::getenv("STORAGE_CP_UNSAFE_DELETE_ON_RPC_FAIL") != nullptr;
+        if (!unsafe) return IOStatus::OK();  // fail-SAFE: keep, let GC reclaim
       }
-      // s not ok => fall back to the normal physical delete below.
     }
   }
   if (hdfsDelete(fileSys_, fname.c_str(), 1) == 0) {
@@ -718,13 +786,18 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
         cr.set_shard_id(storage_cp_shard_);
         google::protobuf::Empty creply;
         grpc::ClientContext cctx;
-        client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
+        grpc::Status cs =
+            client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
+        LogStorageRpc("NotifyCreate(rename)", target, cs.ok(),
+                      cs.error_message());
         compactionservice::FileRef dr;
         dr.set_path(src);
         dr.set_shard_id(storage_cp_shard_);
         compactionservice::DeleteReply dreply;
         grpc::ClientContext dctx;
-        client->stub->RequestDelete(&dctx, dr, &dreply);  // -1 on the old key
+        grpc::Status ds =
+            client->stub->RequestDelete(&dctx, dr, &dreply);  // -1 on old key
+        LogStorageRpc("RequestDelete(rename)", src, ds.ok(), ds.error_message());
       }
     }
     return IOStatus::OK();

@@ -109,6 +109,11 @@
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "utilities/trace/replayer_impl.h"
+#ifdef HDFS
+// [relink/Storage-CP] refcount++ when this shard adopts an external_path
+// reference. Header is free of hdfs.h/grpc so it costs nothing here.
+#include "plugin/hdfs/storage_cp_hook.h"
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -5535,6 +5540,12 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
       sv_ctx.Clean();
     }
   }
+#ifdef HDFS
+  // [relink/Storage-CP] The reference is now durable in this shard's MANIFEST,
+  // so claim it at the CP before the owning shard's compaction can obsolete and
+  // delete the bytes underneath us.
+  if (s.ok()) StorageCpNotifyLink(fs_.get(), external_file);
+#endif
   return s;
 }
 
@@ -5637,6 +5648,14 @@ Status DBImpl::RegisterExternalFilesInPlace(
       sv_ctx.Clean();
     }
   }
+#ifdef HDFS
+  // [relink/Storage-CP] Batch variant of the same claim: every file in this
+  // edit is now referenced by this shard as well as by its owner, so each needs
+  // its refcount bumped or the owner's next compaction will delete it.
+  if (s.ok()) {
+    for (const auto& fr : files) StorageCpNotifyLink(fs_.get(), fr.external_file);
+  }
+#endif
   return s;
 }
 
