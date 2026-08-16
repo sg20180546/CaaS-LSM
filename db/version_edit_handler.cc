@@ -737,8 +737,16 @@ Status VersionEditHandlerPointInTime::MaybeCreateVersion(
     const FileMetaData& meta = elem.second;
     const FileDescriptor& fd = meta.fd;
     uint64_t file_num = fd.GetNumber();
+    // [relink] An in-place external reference lives at its absolute HDFS path
+    // (no rename happened) — verify THAT file, not dbdir/<num>.sst. Otherwise
+    // the point-in-time replay marks every relinked file missing and freezes
+    // the secondary's view at the relink edit; a remote CSA then fails all
+    // post-relink compactions ("Cannot find matched SST files") and the CN
+    // falls back to local. Empty external_path => baseline path, unchanged.
     const std::string fpath =
-        MakeTableFileName(cfd->ioptions()->cf_paths[0].path, file_num);
+        fd.external_path.empty()
+            ? MakeTableFileName(cfd->ioptions()->cf_paths[0].path, file_num)
+            : fd.external_path;
     s = VerifyFile(fpath, meta);
     if (s.IsPathNotFound() || s.IsNotFound() || s.IsCorruption()) {
       missing_files.insert(file_num);

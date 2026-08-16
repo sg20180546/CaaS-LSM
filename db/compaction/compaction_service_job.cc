@@ -37,6 +37,30 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
   const std::vector<CompactionInputFiles>& inputs =
       *(compact_->compaction->inputs());
 
+  // [relink] Compactions whose INPUTS are in-place external references
+  // (external_path) or carry a read-time GSN override run LOCALLY: the GSN
+  // lives only in the primary's in-memory FileMetaData (not persisted in the
+  // MANIFEST), so a remote CSA would read these files with their original
+  // sequence numbers and could merge stale src versions over newer dst writes.
+  // This covers only the one-time absorption pass of a relinked group; its
+  // outputs are normal files and offload as usual. Baselines never set either
+  // field => this gate is inert and the remote path is byte-identical.
+  for (const auto& files_per_level : inputs) {
+    for (const auto& file : files_per_level.files) {
+      if (!file->fd.external_path.empty() ||
+          file->fd.global_seqno_override != kDisableGlobalSequenceNumber) {
+        ROCKS_LOG_INFO(db_options_.info_log,
+                       "[%s] [JOB %d] relinked inputs (external_path/GSN) -> "
+                       "local compaction (GSN is not remotable)",
+                       compact_->compaction->column_family_data()
+                           ->GetName()
+                           .c_str(),
+                       job_id_);
+        return CompactionServiceJobStatus::kUseLocal;
+      }
+    }
+  }
+
   uint64_t num_entries = 0;
   uint64_t num_deletions = 0;
   uint64_t compensated_file_size = 0;
