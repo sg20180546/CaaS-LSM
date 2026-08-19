@@ -101,10 +101,14 @@ class HdfsReadableFile : virtual public FSSequentialFile,
   ~HdfsReadableFile() override {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile closing file %s\n",
                     filename_.c_str());
-    hdfsCloseFile(fileSys_, hfile_);
+    // guard: hdfsOpenFile can fail (hfile_ == nullptr, callers check isValid() before use
+    // but still destroy the object) — closing a null handle dereferences it inside libhdfs.
+    if (hfile_ != nullptr) {
+      hdfsCloseFile(fileSys_, hfile_);
+      hfile_ = nullptr;
+    }
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile closed file %s\n",
                     filename_.c_str());
-    hfile_ = nullptr;
   }
 
   bool isValid() { return hfile_ != nullptr; }
@@ -300,12 +304,24 @@ class HdfsWritableFile : public FSWritableFile {
                  IODebugContext* /*dbg*/) override {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closing %s\n",
                     filename_.c_str());
-    if (hdfsCloseFile(fileSys_, hfile_) != 0) {
+    // ★ The handle is CONSUMED by hdfsCloseFile even when it returns -1: libhdfs invokes
+    // stream.close() and then DeleteGlobalRef()+free()s the hdfsFile struct REGARDLESS of
+    // whether close() threw (hdfs.c). Leaving hfile_ set on failure made the destructor
+    // close the freed handle a second time — a use-after-free whose garbage jobject went
+    // into CallVoidMethod and died in the G1 access barrier. That is the recurring node54
+    // SIGSEGV (hs_err 749493 / 988791 / the June ones): a failing close (DataStreamer/DN
+    // exception under load) followed by the double close. Null the handle FIRST.
+    int rc = 0;
+    if (hfile_ != nullptr) {
+      hdfsFile h = hfile_;
+      hfile_ = nullptr;
+      rc = hdfsCloseFile(fileSys_, h);
+    }
+    if (rc != 0) {
       return IOError(filename_, errno);
     }
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closed %s\n",
                     filename_.c_str());
-    hfile_ = nullptr;
     return IOStatus::OK();
   }
 };
