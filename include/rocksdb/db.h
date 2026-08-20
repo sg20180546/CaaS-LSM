@@ -860,6 +860,15 @@ class DB {
   // not support snapshot (eg: inplace_update_support enabled).
   virtual const Snapshot* GetSnapshot() = 0;
 
+  // [relink] Same as GetSnapshot(), except that releasing this snapshot never
+  // arms the bottommost-files seqno-zeroing sweep. For short-lived internal
+  // snapshots (migration export) whose release must not schedule a bulk
+  // rewrite of the bottom level. Default falls back to a plain GetSnapshot()
+  // for DB implementations that don't distinguish.
+  virtual const Snapshot* GetSnapshotNoBottommostTrigger() {
+    return GetSnapshot();
+  }
+
   // Release a previously acquired snapshot.  The caller must not
   // use "snapshot" after this call.
   virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;

@@ -3457,6 +3457,14 @@ Status DBImpl::NewIterators(
 
 const Snapshot* DBImpl::GetSnapshot() { return GetSnapshotImpl(false); }
 
+const Snapshot* DBImpl::GetSnapshotNoBottommostTrigger() {
+  SnapshotImpl* s = GetSnapshotImpl(false);
+  if (s != nullptr) {
+    s->no_bottommost_trigger_ = true;
+  }
+  return s;
+}
+
 #ifndef ROCKSDB_LITE
 const Snapshot* DBImpl::GetSnapshotForWriteConflictBoundary() {
   return GetSnapshotImpl(true);
@@ -3674,7 +3682,11 @@ void DBImpl::ReleaseSnapshot(const Snapshot* s) {
     }
     // Avoid to go through every column family by checking a global threshold
     // first.
-    if (oldest_snapshot > bottommost_files_mark_threshold_) {
+    // [relink] A no-bottommost-trigger snapshot must not be the release that
+    // raises the threshold (its whole point). If another, normal snapshot is
+    // still alive or is released later, the sweep arms then as usual.
+    if (!casted_s->no_bottommost_trigger_ &&
+        oldest_snapshot > bottommost_files_mark_threshold_) {
       CfdList cf_scheduled;
       for (auto* cfd : *versions_->GetColumnFamilySet()) {
         if (!cfd->ioptions()->allow_ingest_behind) {

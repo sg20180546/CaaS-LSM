@@ -28,6 +28,15 @@ class SnapshotImpl : public Snapshot {
   // scope of queries to IsInSnapshot.
   SequenceNumber min_uncommitted_ = kMinUnCommittedSeq;
 
+  // [relink] Set by DB::GetSnapshotNoBottommostTrigger(). When this snapshot's
+  // release would raise oldest_snapshot past bottommost_files_mark_threshold_,
+  // ReleaseSnapshot skips that update entirely: a short-lived migration-export
+  // snapshot must not arm the bottommost seqno-zeroing sweep (on a large static
+  // DB the first-ever release marks the whole bottom level for rewrite). The
+  // sweep is an optimization, not a correctness requirement; a later normal
+  // snapshot release re-arms it as usual.
+  bool no_bottommost_trigger_ = false;
+
   SequenceNumber GetSequenceNumber() const override { return number_; }
 
   int64_t GetUnixTime() const override { return unix_time_; }

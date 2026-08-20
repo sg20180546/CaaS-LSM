@@ -340,6 +340,7 @@ class DBImpl : public DB {
       std::vector<Iterator*>* iterators) override;
 
   virtual const Snapshot* GetSnapshot() override;
+  virtual const Snapshot* GetSnapshotNoBottommostTrigger() override;
   virtual void ReleaseSnapshot(const Snapshot* snapshot) override;
   // Create a timestamped snapshot. This snapshot can be shared by multiple
   // readers. If any of them uses it for write conflict checking, then
