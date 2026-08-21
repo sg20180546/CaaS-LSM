@@ -25,6 +25,11 @@ class StorageService;
 namespace ROCKSDB_NAMESPACE {
 class ObjectLibrary;
 
+// [hdfs-io-stats] Process-global totals of bytes actually transferred over HDFS by this
+// process (successful read/pread payload; successful write payload; metadata excluded).
+// Defined in env_hdfs_impl.cc; callers (StatsDumper) diff successive samples for MB/s.
+void GetHdfsIoBytes(uint64_t* rd, uint64_t* wr);
+
 class HdfsFileSystem : public FileSystemWrapper {
  public:
   static const char* kClassName() { return "HdfsFileSystem"; }

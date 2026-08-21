@@ -48,6 +48,18 @@ namespace ROCKSDB_NAMESPACE {
 namespace {
 // Thrown during execution when there is an issue with the supplied
 // arguments.
+// [hdfs-io-stats] Process-global counters of bytes ACTUALLY moved over HDFS by this
+// process (payload bytes of successful hdfsRead/hdfsPread/hdfsWrite; metadata ops not
+// counted). Purpose: direct per-CN HDFS bandwidth over time — miss-count reconstructions
+// break under mixed workloads (iterator readahead, WAL, compaction readahead). Read via
+// GetHdfsIoBytes(); StatsDumper diffs it per tick. Relaxed atomics: counters only.
+std::atomic<uint64_t> g_hdfs_io_bytes_read{0};
+std::atomic<uint64_t> g_hdfs_io_bytes_written{0};
+void GetHdfsIoBytes(uint64_t* rd, uint64_t* wr) {
+  if (rd) *rd = g_hdfs_io_bytes_read.load(std::memory_order_relaxed);
+  if (wr) *wr = g_hdfs_io_bytes_written.load(std::memory_order_relaxed);
+}
+
 class HdfsUsageException : public std::exception {};
 
 // A simple exception that indicates something went wrong that is not
@@ -138,6 +150,7 @@ class HdfsReadableFile : virtual public FSSequentialFile,
       buffer += bytes_read;
     }
     assert(total_bytes_read <= n);
+    g_hdfs_io_bytes_read.fetch_add(total_bytes_read, std::memory_order_relaxed);
 
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile read %s\n",
                     filename_.c_str());
@@ -163,6 +176,8 @@ class HdfsReadableFile : virtual public FSSequentialFile,
                   static_cast<tSize>(n));
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsReadableFile pread %s\n",
                     filename_.c_str());
+    if (bytes_read > 0)
+      g_hdfs_io_bytes_read.fetch_add(bytes_read, std::memory_order_relaxed);
     *result = Slice(scratch, (bytes_read < 0) ? 0 : bytes_read);
     if (bytes_read < 0) {
       // An error: return a non-ok status
@@ -268,6 +283,7 @@ class HdfsWritableFile : public FSWritableFile {
     if (ret != left) {
       return IOError(filename_, errno);
     }
+    g_hdfs_io_bytes_written.fetch_add(left, std::memory_order_relaxed);
     return IOStatus::OK();
   }
 
@@ -277,6 +293,7 @@ class HdfsWritableFile : public FSWritableFile {
         static_cast<tSize>(size)) {
       return IOError(filename_, errno);
     }
+    g_hdfs_io_bytes_written.fetch_add(size, std::memory_order_relaxed);
     return IOStatus::OK();
   }
 
