@@ -14,6 +14,7 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/table.h"
+#include "rocksdb/table_properties.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -97,6 +98,16 @@ class CacheDumper {
   virtual Status SetDumpFilterFiles(DB* db,
                                     const std::vector<std::string>& sst_paths) {
     (void)db;
+    (void)sst_paths;
+    return Status::NotSupported("SetDumpFilterFiles is not supported");
+  }
+  // [relink cache handoff] Variant taking a PRE-CAPTURED properties collection.
+  // Needed when the files have already been dropped from the dumper DB's version
+  // by the time the dump runs (relink: the src unregisters the moved files at
+  // cutover) — capture GetPropertiesOfAllTables BEFORE the drop, filter later.
+  virtual Status SetDumpFilterFiles(const TablePropertiesCollection& ptc,
+                                    const std::vector<std::string>& sst_paths) {
+    (void)ptc;
     (void)sst_paths;
     return Status::NotSupported("SetDumpFilterFiles is not supported");
   }

@@ -102,6 +102,8 @@ class CacheDumperImpl : public CacheDumper {
   Status SetDumpFilter(std::vector<DB*> db_list) override;
   Status SetDumpFilterFiles(DB* db,
                             const std::vector<std::string>& sst_paths) override;
+  Status SetDumpFilterFiles(const TablePropertiesCollection& ptc,
+                            const std::vector<std::string>& sst_paths) override;
   IOStatus DumpCacheEntriesToWriter() override;
 
  private:

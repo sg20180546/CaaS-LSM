@@ -59,6 +59,17 @@ Status CacheDumperImpl::SetDumpFilterFiles(
   if (db == nullptr) {
     return Status::InvalidArgument("db is null");
   }
+  TablePropertiesCollection ptc;
+  Status s = db->GetPropertiesOfAllTables(&ptc);
+  if (!s.ok()) {
+    return s;
+  }
+  return SetDumpFilterFiles(ptc, sst_paths);
+}
+
+Status CacheDumperImpl::SetDumpFilterFiles(
+    const TablePropertiesCollection& ptc,
+    const std::vector<std::string>& sst_paths) {
   auto base_name = [](const std::string& p) {
     size_t q = p.find_last_of('/');
     return q == std::string::npos ? p : p.substr(q + 1);
@@ -67,11 +78,6 @@ Status CacheDumperImpl::SetDumpFilterFiles(
   std::set<std::string> want_base;
   for (const auto& p : sst_paths) {
     want_base.insert(base_name(p));
-  }
-  TablePropertiesCollection ptc;
-  Status s = db->GetPropertiesOfAllTables(&ptc);
-  if (!s.ok()) {
-    return s;
   }
   size_t matched = 0;
   for (auto id = ptc.begin(); id != ptc.end(); id++) {
