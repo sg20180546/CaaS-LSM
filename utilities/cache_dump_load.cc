@@ -65,5 +65,16 @@ Status NewDefaultCacheDumpedLoader(
   return Status::OK();
 }
 
+// [relink cache handoff]
+Status NewDefaultCacheDumpedLoaderToPrimary(
+    const CacheDumpOptions& dump_options, const BlockBasedTableOptions& toptions,
+    const std::shared_ptr<Cache>& primary_cache,
+    std::unique_ptr<CacheDumpReader>&& reader,
+    std::unique_ptr<CacheDumpedLoader>* cache_dump_loader) {
+  cache_dump_loader->reset(new CacheDumpedLoaderImpl(
+      dump_options, toptions, primary_cache, std::move(reader)));
+  return Status::OK();
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 #endif  // ROCKSDB_LITE

@@ -51,6 +51,48 @@ Status CacheDumperImpl::SetDumpFilter(std::vector<DB*> db_list) {
   return s;
 }
 
+// [relink cache handoff] Restrict the dump to specific SST files of one DB.
+// Matching is by full path first, then basename — relink external paths can
+// carry a different directory prefix than the properties-collection keys.
+Status CacheDumperImpl::SetDumpFilterFiles(
+    DB* db, const std::vector<std::string>& sst_paths) {
+  if (db == nullptr) {
+    return Status::InvalidArgument("db is null");
+  }
+  auto base_name = [](const std::string& p) {
+    size_t q = p.find_last_of('/');
+    return q == std::string::npos ? p : p.substr(q + 1);
+  };
+  std::set<std::string> want_full(sst_paths.begin(), sst_paths.end());
+  std::set<std::string> want_base;
+  for (const auto& p : sst_paths) {
+    want_base.insert(base_name(p));
+  }
+  TablePropertiesCollection ptc;
+  Status s = db->GetPropertiesOfAllTables(&ptc);
+  if (!s.ok()) {
+    return s;
+  }
+  size_t matched = 0;
+  for (auto id = ptc.begin(); id != ptc.end(); id++) {
+    if (want_full.find(id->first) == want_full.end() &&
+        want_base.find(base_name(id->first)) == want_base.end()) {
+      continue;
+    }
+    OffsetableCacheKey base;
+    bool is_stable;
+    BlockBasedTable::SetupBaseCacheKey(id->second.get(),
+                                       /*cur_db_session_id*/ "",
+                                       /*cur_file_num*/ 0, &base, &is_stable);
+    if (is_stable) {
+      prefix_filter_.insert(base.CommonPrefixSlice().ToString());
+      matched++;
+    }
+  }
+  return matched > 0 ? Status::OK()
+                     : Status::NotFound("no matching tables for dump filter");
+}
+
 // This is the main function to dump out the cache block entries to the writer.
 // The writer may create a file or write to other systems. Currently, we will
 // iterate the whole block cache, get the blocks, and write them to the writer
@@ -365,6 +407,63 @@ IOStatus CacheDumpedLoaderImpl::RestoreCacheEntriesToSecondaryCache() {
   } else {
     return io_s;
   }
+}
+
+// [relink cache handoff] Same read loop as the secondary-cache variant, but the
+// blocks are installed straight into a primary block cache under the dumped keys.
+// Correct only when this DB reads the SAME physical files the dumper's DB did
+// (cache keys are derived from ids embedded in the file at creation) — i.e. the
+// relinked-external-file situation. Only data blocks are installed: with
+// cache_index_and_filter_blocks=false the receiver never looks index/filter
+// blocks up in the block cache, so installing them would only waste capacity.
+IOStatus CacheDumpedLoaderImpl::RestoreCacheEntriesToPrimaryCache() {
+  if (primary_cache_ == nullptr) {
+    return IOStatus::InvalidArgument("Primary cache is null");
+  }
+  if (reader_ == nullptr) {
+    return IOStatus::InvalidArgument("CacheDumpReader is null");
+  }
+  IOStatus io_s;
+  DumpUnit dump_unit;
+  std::string data;
+  io_s = ReadHeader(&data, &dump_unit);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  Cache::CacheItemHelper* helper =
+      BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData);
+  while (io_s.ok() && dump_unit.type != CacheDumpUnitType::kFooter) {
+    dump_unit.reset();
+    data.clear();
+    io_s = ReadCacheBlock(&data, &dump_unit);
+    if (!io_s.ok()) {
+      break;
+    }
+    if (dump_unit.type != CacheDumpUnitType::kData || helper == nullptr) {
+      continue;
+    }
+    CacheAllocationPtr buf = AllocateBlock(dump_unit.value_len, nullptr);
+    memcpy(buf.get(), dump_unit.value, dump_unit.value_len);
+    BlockContents contents(std::move(buf), dump_unit.value_len);
+    std::unique_ptr<Block> block_holder;
+    block_holder.reset(BlocklikeTraits<Block>::Create(
+        std::move(contents), toptions_.read_amp_bytes_per_bit,
+        /*statistics*/ nullptr, /*using_zstd*/ false,
+        toptions_.filter_policy.get()));
+    if (block_holder == nullptr) {
+      continue;
+    }
+    size_t charge = block_holder->ApproximateMemoryUsage();
+    Status s = primary_cache_->Insert(dump_unit.key, block_holder.get(), charge,
+                                      helper->del_cb);
+    if (s.ok()) {
+      block_holder.release();  // owned by the cache now
+    }
+  }
+  if (dump_unit.type == CacheDumpUnitType::kFooter) {
+    return IOStatus::OK();
+  }
+  return io_s;
 }
 
 // Read and copy the dump unit metadata to std::string data, decode and create

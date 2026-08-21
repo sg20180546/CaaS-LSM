@@ -91,6 +91,15 @@ class CacheDumper {
     (void)db_list;
     return Status::NotSupported("SetDumpFilter is not supported");
   }
+  // [relink cache handoff] Like SetDumpFilter, but restrict the dump to the given
+  // SST files of one DB (matched against GetPropertiesOfAllTables paths, full path
+  // or basename). Lets a key-group migration ship ONLY the moved files' hot blocks.
+  virtual Status SetDumpFilterFiles(DB* db,
+                                    const std::vector<std::string>& sst_paths) {
+    (void)db;
+    (void)sst_paths;
+    return Status::NotSupported("SetDumpFilterFiles is not supported");
+  }
   // The main function to dump out all the blocks that satisfy the filter
   // condition from block cache to a certain CacheDumpWriter in one shot. This
   // process may take some time.
@@ -109,6 +118,14 @@ class CacheDumpedLoader {
   virtual IOStatus RestoreCacheEntriesToSecondaryCache() {
     return IOStatus::NotSupported(
         "RestoreCacheEntriesToSecondaryCache is not supported");
+  }
+  // [relink cache handoff] Insert the dumped blocks directly into a PRIMARY block
+  // cache. Valid when the receiving DB reads the SAME physical files as the dumper
+  // (cache keys are derived from file-embedded ids, so they match across processes)
+  // — exactly the relink situation. The stock loader only targets SecondaryCache.
+  virtual IOStatus RestoreCacheEntriesToPrimaryCache() {
+    return IOStatus::NotSupported(
+        "RestoreCacheEntriesToPrimaryCache is not supported");
   }
 };
 
@@ -129,6 +146,15 @@ Status NewDefaultCacheDumper(const CacheDumpOptions& dump_options,
                              const std::shared_ptr<Cache>& cache,
                              std::unique_ptr<CacheDumpWriter>&& writer,
                              std::unique_ptr<CacheDumper>* cache_dumper);
+
+// [relink cache handoff] loader variant that installs into a primary block cache
+// (see CacheDumpedLoader::RestoreCacheEntriesToPrimaryCache). toptions must outlive
+// the loader (it is held by reference).
+Status NewDefaultCacheDumpedLoaderToPrimary(
+    const CacheDumpOptions& dump_options, const BlockBasedTableOptions& toptions,
+    const std::shared_ptr<Cache>& primary_cache,
+    std::unique_ptr<CacheDumpReader>&& reader,
+    std::unique_ptr<CacheDumpedLoader>* cache_dump_loader);
 
 // Get the default cache dump loader
 Status NewDefaultCacheDumpedLoader(

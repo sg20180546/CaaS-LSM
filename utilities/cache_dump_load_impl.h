@@ -100,6 +100,8 @@ class CacheDumperImpl : public CacheDumper {
       : options_(dump_options), cache_(cache), writer_(std::move(writer)) {}
   ~CacheDumperImpl() { writer_.reset(); }
   Status SetDumpFilter(std::vector<DB*> db_list) override;
+  Status SetDumpFilterFiles(DB* db,
+                            const std::vector<std::string>& sst_paths) override;
   IOStatus DumpCacheEntriesToWriter() override;
 
  private:
@@ -135,8 +137,18 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
         toptions_(toptions),
         secondary_cache_(secondary_cache),
         reader_(std::move(reader)) {}
+  // [relink cache handoff] primary-cache variant (secondary_cache_ left null)
+  CacheDumpedLoaderImpl(const CacheDumpOptions& dump_options,
+                        const BlockBasedTableOptions& toptions,
+                        const std::shared_ptr<Cache>& primary_cache,
+                        std::unique_ptr<CacheDumpReader>&& reader)
+      : options_(dump_options),
+        toptions_(toptions),
+        primary_cache_(primary_cache),
+        reader_(std::move(reader)) {}
   ~CacheDumpedLoaderImpl() {}
   IOStatus RestoreCacheEntriesToSecondaryCache() override;
+  IOStatus RestoreCacheEntriesToPrimaryCache() override;
 
  private:
   IOStatus ReadDumpUnitMeta(std::string* data, DumpUnitMeta* unit_meta);
@@ -147,6 +159,7 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   CacheDumpOptions options_;
   const BlockBasedTableOptions& toptions_;
   std::shared_ptr<SecondaryCache> secondary_cache_;
+  std::shared_ptr<Cache> primary_cache_;  // [relink cache handoff]
   std::unique_ptr<CacheDumpReader> reader_;
   UnorderedMap<Cache::DeleterFn, CacheEntryRole> role_map_;
 };
