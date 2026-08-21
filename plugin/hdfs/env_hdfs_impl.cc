@@ -45,20 +45,23 @@
 // will reside on the same HDFS cluster.
 //
 namespace ROCKSDB_NAMESPACE {
-namespace {
-// Thrown during execution when there is an issue with the supplied
-// arguments.
 // [hdfs-io-stats] Process-global counters of bytes ACTUALLY moved over HDFS by this
 // process (payload bytes of successful hdfsRead/hdfsPread/hdfsWrite; metadata ops not
 // counted). Purpose: direct per-CN HDFS bandwidth over time — miss-count reconstructions
 // break under mixed workloads (iterator readahead, WAL, compaction readahead). Read via
 // GetHdfsIoBytes(); StatsDumper diffs it per tick. Relaxed atomics: counters only.
+// MUST stay OUTSIDE the anonymous namespace below — external linkage (callers link this
+// symbol from librocksdb.so).
 std::atomic<uint64_t> g_hdfs_io_bytes_read{0};
 std::atomic<uint64_t> g_hdfs_io_bytes_written{0};
 void GetHdfsIoBytes(uint64_t* rd, uint64_t* wr) {
   if (rd) *rd = g_hdfs_io_bytes_read.load(std::memory_order_relaxed);
   if (wr) *wr = g_hdfs_io_bytes_written.load(std::memory_order_relaxed);
 }
+
+namespace {
+// Thrown during execution when there is an issue with the supplied
+// arguments.
 
 class HdfsUsageException : public std::exception {};
 
