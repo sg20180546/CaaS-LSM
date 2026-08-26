@@ -79,6 +79,9 @@ std::mutex scheduler_latch_;
 struct RefEntry {
   int count = 0;
   std::set<uint32_t> owners;
+  // [multi-mig 2026-08-25] shards whose RequestDelete already decremented this entry.
+  // Guards against the same shard double-decrementing (see RequestDelete).
+  std::set<uint32_t> deleted_by;
 };
 std::unordered_map<std::string, RefEntry> storage_refcount_map_;
 std::vector<std::string> storage_pending_delete_;  // refcount-0 paths awaiting the CP's batch hdfsDelete
@@ -232,6 +235,7 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     auto& e = storage_refcount_map_[request->path()];
     e.count++;
     e.owners.insert(request->shard_id());  // debug only
+    e.deleted_by.erase(request->shard_id());  // [multi-mig] re-create resets the dup-delete guard
     std::cout << GetTime() << "[storage] NotifyCreate path=" << request->path()
               << " shard=" << request->shard_id() << " refcount=" << e.count
               << std::endl;
@@ -292,6 +296,22 @@ class StorageImpl final : public compactionservice::StorageService::Service {
       }
     } else {
       auto& e = it->second;
+      // [multi-mig 2026-08-25] Idempotent per (path, shard). A later migration's src-drop
+      // re-purges files an earlier drop already unregistered (the obsolete-file pass sees the
+      // still-shared bytes on HDFS outside the live version), sending a SECOND RequestDelete
+      // from the same shard. The double decrement zeroed a still-referenced file and the GC
+      // deleted it under the dst (0825_chsmk_2: /kg/s0/000032|46|49 -> 11k dst read failures).
+      // Same philosophy as the UNTRACKED fail-safe: swallowing a dup risks a recoverable
+      // leak; honoring it deletes a file another shard still reads. The CSA-create/CN-delete
+      // cross flow stays legal — only a REPEAT from the same shard is ignored.
+      if (!e.deleted_by.insert(request->shard_id()).second) {
+        reply->set_deleted(false);
+        reply->set_refcount(e.count);
+        std::cout << GetTime() << "[storage] ★DUP RequestDelete IGNORED path="
+                  << request->path() << " shard=" << request->shard_id()
+                  << " refcount stays " << e.count << std::endl;
+        return grpc::Status::OK;
+      }
       e.count--;  // unconditional: the deleter need not be the creator (CSA vs CN)
       e.owners.erase(request->shard_id());  // debug only
       if (e.count <= 0) {
