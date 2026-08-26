@@ -1508,6 +1508,20 @@ class DB {
   // threads call EnableFileDeletions()
   virtual Status EnableFileDeletions(bool force = true) = 0;
 
+  // [relink/Storage-CP fork 2026-08-26] Same counter semantics as
+  // EnableFileDeletions, but when the counter reaches 0 the deletion pass
+  // NEVER does the GetChildren() full directory scan — only version-set-
+  // accounted obsolete files are purged. Required where shared (refcounted)
+  // SSTs legitimately remain in this DB's directory after being unregistered
+  // from its MANIFEST (relink migration src-drop): a full scan re-collects the
+  // still-present bytes as garbage and burns another shard's refcount at the
+  // Storage-CP (the 0825_chsmk_2 double-RequestDelete dangling-ref bug).
+  // Default forwards to the full-scan variant so non-DBImpl wrappers keep the
+  // legacy behavior.
+  virtual Status EnableFileDeletionsNoFullScan(bool force = true) {
+    return EnableFileDeletions(force);
+  }
+
 #ifndef ROCKSDB_LITE
   // Retrieves the creation time of the oldest file in the DB.
   // This API only works if max_open_files = -1, if it is not then

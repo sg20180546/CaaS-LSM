@@ -462,6 +462,10 @@ class DBImpl : public DB {
   virtual Status DisableFileDeletions() override;
 
   virtual Status EnableFileDeletions(bool force) override;
+  // [relink/Storage-CP] no-GetChildren variant (see include/rocksdb/db.h).
+  // Deliberately a separate body (not a refactor of EnableFileDeletions) so
+  // the legacy path stays byte-identical for baselines.
+  virtual Status EnableFileDeletionsNoFullScan(bool force) override;
 
   virtual bool IsFileDeletionsEnabled() const;
 

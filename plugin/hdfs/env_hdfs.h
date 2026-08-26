@@ -9,6 +9,8 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_set>
 
 #include "hdfs.h"
 #include "rocksdb/env.h"
@@ -131,6 +133,18 @@ class HdfsFileSystem : public FileSystemWrapper {
   mutable std::unique_ptr<StorageCpClient> storage_cp_client_;
   // Shard id from getenv("STORAGE_CP_SHARD") (default 0); cached at init.
   mutable uint32_t storage_cp_shard_ = 0;
+
+  // [multi-mig 2026-08-26] SST paths whose delete the Storage-CP proxied as
+  // "OK but keep the bytes" (another shard still references them). A later
+  // forced full scan can re-collect such still-present files as garbage and
+  // would burn another shard's refcount with a second RequestDelete — repeats
+  // from this process are short-circuited to OK instead. In-process only; the
+  // CP's (path, shard) dup guard remains the authoritative layer. Entries are
+  // erased if the same path is ever re-created (NewWritableFile / rename
+  // target), though MANIFEST-monotonic file numbers make that near-impossible
+  // within one DB lifetime.
+  mutable std::mutex released_paths_mu_;
+  mutable std::unordered_set<std::string> released_paths_;
 
   // Returns the opaque client iff Storage-CP is enabled, else nullptr.
   // Performs the one-time lazy init (reads STORAGE_CP_ADDR / STORAGE_CP_SHARD,

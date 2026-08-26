@@ -635,6 +635,10 @@ IOStatus HdfsFileSystem::NewWritableFile(
       grpc::ClientContext ctx;
       grpc::Status s = client->stub->NotifyCreate(&ctx, req, &reply);
       LogStorageRpc("NotifyCreate", fname, s.ok(), s.error_message());
+      // [multi-mig] a re-created path is a fresh reference — reset the
+      // released-guard so its eventual legitimate delete goes through.
+      std::lock_guard<std::mutex> lg(released_paths_mu_);
+      released_paths_.erase(fname);
     }
   }
   return IOStatus::OK();
@@ -718,6 +722,17 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
   // loss. Set STORAGE_CP_UNSAFE_DELETE_ON_RPC_FAIL=1 for the old behavior.
   if (StorageCpClient* client = GetStorageCpClient()) {
     if (IsSstFile(fname)) {
+      // [multi-mig 2026-08-26] This process already released its reference and
+      // the CP kept the bytes for another shard — a repeat delete (forced
+      // full scan re-collecting the still-present file) must NOT burn another
+      // refcount. Short-circuit to OK, exactly what the caller saw last time.
+      {
+        std::lock_guard<std::mutex> lg(released_paths_mu_);
+        if (released_paths_.count(fname)) {
+          LogStorageRpc("RequestDelete(SKIP already-released)", fname, true, "");
+          return IOStatus::OK();
+        }
+      }
       compactionservice::FileRef req;
       req.set_path(fname);
       req.set_shard_id(storage_cp_shard_);
@@ -728,7 +743,9 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
       if (s.ok()) {
         if (!reply.deleted()) {
           // Still referenced by another shard (or the CP owns the delete):
-          // keep the physical file.
+          // keep the physical file, and remember we released our reference.
+          std::lock_guard<std::mutex> lg(released_paths_mu_);
+          released_paths_.insert(fname);
           return IOStatus::OK();
         }
         // refcount reached 0: fall through to physically delete.
@@ -826,6 +843,10 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
             client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
         LogStorageRpc("NotifyCreate(rename)", target, cs.ok(),
                       cs.error_message());
+        {  // [multi-mig] rename target is a fresh reference — reset the guard
+          std::lock_guard<std::mutex> lg(released_paths_mu_);
+          released_paths_.erase(target);
+        }
         compactionservice::FileRef dr;
         dr.set_path(src);
         dr.set_shard_id(storage_cp_shard_);

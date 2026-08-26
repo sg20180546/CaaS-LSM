@@ -95,6 +95,47 @@ Status DBImpl::EnableFileDeletions(bool force) {
   return Status::OK();
 }
 
+// [relink/Storage-CP 2026-08-26] EnableFileDeletions minus the forced
+// GetChildren() full scan. After a relink src-drop, shared refcounted SSTs
+// legitimately remain in this DB's directory while no longer being in its
+// MANIFEST; the full scan re-collects them as garbage and issues a second
+// RequestDelete that burns the dst shard's refcount (0825_chsmk_2 dangling-ref
+// bug). FindObsoleteFiles(..., no_full_scan=true) still drains the
+// version-set-accounted obsolete list, so legitimate pending deletes are
+// delivered exactly once. Kept as a separate body so the legacy path above is
+// untouched.
+Status DBImpl::EnableFileDeletionsNoFullScan(bool force) {
+  JobContext job_context(0);
+  int saved_counter;  // initialize on all paths
+  {
+    InstrumentedMutexLock l(&mutex_);
+    if (force) {
+      disable_delete_obsolete_files_ = 0;
+    } else if (disable_delete_obsolete_files_ > 0) {
+      --disable_delete_obsolete_files_;
+    }
+    saved_counter = disable_delete_obsolete_files_;
+    if (saved_counter == 0) {
+      FindObsoleteFiles(&job_context, /*force=*/true, /*no_full_scan=*/true);
+      bg_cv_.SignalAll();
+    }
+  }
+  if (saved_counter == 0) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "File Deletions Enabled (no full scan)");
+    if (job_context.HaveSomethingToDelete()) {
+      PurgeObsoleteFiles(job_context);
+    }
+  } else {
+    ROCKS_LOG_WARN(immutable_db_options_.info_log,
+                   "File Deletions Enable, but not really enabled. Counter: %d",
+                   saved_counter);
+  }
+  job_context.Clean();
+  LogFlush(immutable_db_options_.info_log);
+  return Status::OK();
+}
+
 bool DBImpl::IsFileDeletionsEnabled() const {
   return 0 == disable_delete_obsolete_files_;
 }
