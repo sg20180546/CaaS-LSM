@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "rocksdb/customizable.h"
 #include "rocksdb/rocksdb_namespace.h"
@@ -152,6 +153,15 @@ class KeyGroupAlignedPartitioner : public SstPartitioner {
  public:
   KeyGroupAlignedPartitioner(uint64_t key_space, uint64_t num_groups)
       : ks_(key_space ? key_space : 1), groups_(num_groups ? num_groups : 1) {}
+  // [relink §26 — non-uniform groups] Explicit boundary list (big-endian-8 key values, strictly
+  // increasing exclusive upper bounds, same convention as BucketBoundaries). Non-empty => group id
+  // is the upper_bound index and the uniform (key * num_groups / key_space) arithmetic is ignored.
+  // Lets a small hot range be cut finely for relink while cold spans stay uncut (no file tax there).
+  KeyGroupAlignedPartitioner(uint64_t key_space, uint64_t num_groups,
+                             std::vector<uint64_t> boundaries)
+      : ks_(key_space ? key_space : 1),
+        groups_(num_groups ? num_groups : 1),
+        bnd_(std::move(boundaries)) {}
   ~KeyGroupAlignedPartitioner() override {}
   const char* Name() const override { return "KeyGroupAlignedPartitioner"; }
   PartitionerResult ShouldPartition(const PartitionerRequest& request) override;
@@ -161,6 +171,7 @@ class KeyGroupAlignedPartitioner : public SstPartitioner {
  private:
   uint64_t GroupOf(const Slice& k) const;
   uint64_t ks_, groups_;
+  std::vector<uint64_t> bnd_;  // non-empty => explicit-boundary mode
 };
 
 class KeyGroupAlignedPartitionerFactory : public SstPartitionerFactory {
@@ -173,9 +184,16 @@ class KeyGroupAlignedPartitionerFactory : public SstPartitionerFactory {
   std::unique_ptr<SstPartitioner> CreatePartitioner(
       const SstPartitioner::Context& context) const override;
 
-  // public for OptionTypeInfo offsetof serialization (key_space, num_groups).
+  // public for OptionTypeInfo offsetof serialization (key_space, num_groups, boundaries).
   uint64_t key_space_;
   uint64_t num_groups_;
+  // [relink §26] Optional non-uniform boundary list, '_'-separated decimal big-endian-8 key
+  // values, strictly increasing ('_' keeps the value safe inside the nested serialized options
+  // block). "" (default) => legacy uniform num_groups grid, bit-identical behavior. Registered
+  // in kg_aligned_type_info so it rides the serialized CF options to the remote CSA exactly
+  // like key_space/num_groups (stale CSA binaries silently drop it — redeploy librocksdb
+  // everywhere before use).
+  std::string boundaries_encoded_;
 };
 
 extern std::shared_ptr<SstPartitionerFactory>

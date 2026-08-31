@@ -8,6 +8,8 @@
 
 #include <algorithm>
 
+#include "db/bucket_util.h"  // [relink §26] DecodeBoundaries for non-uniform group boundaries
+
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
@@ -69,6 +71,10 @@ static std::unordered_map<std::string, OptionTypeInfo> kg_aligned_type_info = {
      {offsetof(struct KeyGroupAlignedPartitionerFactory, num_groups_),
       OptionType::kUInt64T, OptionVerificationType::kNormal,
       OptionTypeFlags::kNone}},
+    {"boundaries",  // [relink §26] non-uniform boundary list, "" = uniform (legacy)
+     {offsetof(struct KeyGroupAlignedPartitionerFactory, boundaries_encoded_),
+      OptionType::kString, OptionVerificationType::kNormal,
+      OptionTypeFlags::kNone}},
 #endif  // ROCKSDB_LITE
 };
 
@@ -82,6 +88,10 @@ uint64_t KeyGroupAlignedPartitioner::GroupOf(const Slice& k) const {
   uint64_t v = 0;
   size_t n = k.size() < 8 ? k.size() : 8;  // big-endian fixed-width unsigned key
   for (size_t i = 0; i < n; i++) v = (v << 8) | (uint8_t)k.data()[i];
+  if (!bnd_.empty()) {  // [relink §26] explicit-boundary mode: id = upper_bound index
+    return (uint64_t)(std::upper_bound(bnd_.begin(), bnd_.end(), v) -
+                      bnd_.begin());
+  }
   return (uint64_t)((unsigned __int128)v * groups_ / ks_);
 }
 
@@ -101,6 +111,14 @@ std::unique_ptr<SstPartitioner>
 KeyGroupAlignedPartitionerFactory::CreatePartitioner(
     const SstPartitioner::Context& context) const {
   if (context.output_level <= 0) return nullptr;  // L0 excluded (flush/intra-L0 not aligned)
+  if (!boundaries_encoded_.empty()) {  // [relink §26] non-uniform boundary mode
+    // stored '_'-separated so the value is safe inside the nested serialized options
+    // block (no comma to confuse the options parser); normalize before decoding.
+    std::string s = boundaries_encoded_;
+    std::replace(s.begin(), s.end(), '_', ',');
+    return std::unique_ptr<SstPartitioner>(new KeyGroupAlignedPartitioner(
+        key_space_, num_groups_, DecodeBoundaries(s)));
+  }
   return std::unique_ptr<SstPartitioner>(
       new KeyGroupAlignedPartitioner(key_space_, num_groups_));
 }
