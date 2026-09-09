@@ -8,6 +8,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 #include "rocksdb/rocksdb_namespace.h"
 
@@ -29,5 +30,12 @@ class FileSystem;
 // No-op when the Storage-CP client is disabled (STORAGE_CP_ADDR unset) or when
 // `fs` is not backed by the HDFS FileSystem => baseline bit-identical.
 void StorageCpNotifyLink(FileSystem* fs, const std::string& path);
+
+// [batch 2026-09-09] Same claim for every path of ONE register
+// (RegisterExternalFilesInPlace): one NotifyLinkBatch RPC instead of N serial
+// NotifyLink round trips — the last O(#files) term in relink's stop window.
+// Same no-op conditions as StorageCpNotifyLink; empty `paths` is a no-op.
+void StorageCpNotifyLinkBatch(FileSystem* fs,
+                              const std::vector<std::string>& paths);
 
 }  // namespace ROCKSDB_NAMESPACE

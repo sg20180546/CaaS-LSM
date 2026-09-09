@@ -558,6 +558,48 @@ void StorageCpNotifyLink(FileSystem* fs, const std::string& path) {
   if (hfs != nullptr) hfs->NotifyRelinkLink(path);
 }
 
+// [relink/Storage-CP batch 2026-09-09] refcount++ for N paths in ONE unary RPC.
+// The per-file loop in RegisterExternalFilesInPlace was serial: ~3.7 ms/file
+// unloaded, ~13 ms/file under load (CP latch contention + a flushed log line +
+// a round trip each) = the only O(#files) term left in relink's stop window
+// (374 files -> 1.37 s of a 2.6 s window; 1000+ files at 64 GB -> 4-20 s).
+// Non-SST paths are skipped exactly like the single call. A CP that predates
+// the RPC answers UNIMPLEMENTED -> per-file fallback, so a mixed deployment
+// (new engine, old procp) still counts every reference.
+void HdfsFileSystem::NotifyRelinkLinkBatch(
+    const std::vector<std::string>& paths) const {
+  StorageCpClient* client = GetStorageCpClient();
+  if (client == nullptr) return;
+  compactionservice::FileRefBatch req;
+  for (const auto& p : paths) {
+    if (IsSstFile(p)) req.add_path(p);
+  }
+  if (req.path_size() == 0) return;
+  req.set_shard_id(storage_cp_shard_);
+  google::protobuf::Empty reply;
+  grpc::ClientContext ctx;
+  grpc::Status s = client->stub->NotifyLinkBatch(&ctx, req, &reply);
+  if (!s.ok() && s.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
+    fprintf(stderr,
+            "[storage-cp] NotifyLinkBatch UNIMPLEMENTED at the CP (old procp) -> "
+            "falling back to per-file NotifyLink x%d\n",
+            req.path_size());
+    for (const auto& p : paths) NotifyRelinkLink(p);
+    return;
+  }
+  LogStorageRpc("NotifyLinkBatch",
+                "n=" + std::to_string(req.path_size()) + " first=" + req.path(0),
+                s.ok(), s.error_message());
+}
+
+// Engine-facing batch entry point (declared in storage_cp_hook.h).
+void StorageCpNotifyLinkBatch(FileSystem* fs,
+                              const std::vector<std::string>& paths) {
+  if (fs == nullptr || paths.empty()) return;
+  const HdfsFileSystem* hfs = fs->CheckedCast<HdfsFileSystem>();
+  if (hfs != nullptr) hfs->NotifyRelinkLinkBatch(paths);
+}
+
 std::string HdfsFileSystem::GetId() const {
   if (fsname_.empty()) {
     return kProto;

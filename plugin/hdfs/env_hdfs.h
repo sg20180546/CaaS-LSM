@@ -11,6 +11,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "hdfs.h"
 #include "rocksdb/env.h"
@@ -109,6 +110,11 @@ class HdfsFileSystem : public FileSystemWrapper {
   // increment cannot be lost by building the migration driver without gRPC
   // (the 2026-08-08 dangling-reference bug). No-op when Storage-CP is disabled.
   void NotifyRelinkLink(const std::string& path) const;
+  // [batch 2026-09-09] Same claim for N paths in ONE RPC (NotifyLinkBatch) —
+  // the per-file loop was the last O(#files) term in relink's stop window.
+  // Falls back to N NotifyRelinkLink calls when the CP predates the RPC
+  // (UNIMPLEMENTED). No-op when Storage-CP is disabled.
+  void NotifyRelinkLinkBatch(const std::vector<std::string>& paths) const;
 
   IOStatus IsDirectory(const std::string& /*path*/,
                        const IOOptions& /*options*/, bool* /*is_dir*/,

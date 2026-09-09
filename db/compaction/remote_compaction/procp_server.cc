@@ -257,6 +257,30 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     return grpc::Status::OK;
   }
 
+  // [relink/Storage-CP batch 2026-09-09] N links in ONE RPC under ONE latch acquisition
+  // (all-or-nothing). Per-path effect identical to NotifyLink. The per-path log lines are
+  // kept — one "NotifyLink   path=" line per path, which is what run_group's
+  // "NotifyLink xN (refcount armed)" gate counts — but the stream is flushed ONCE at the
+  // end: the per-call std::endl flush plus the latch round trip was most of the old
+  // ~3.7 ms/file. The summary line deliberately avoids the substring "NotifyLink".
+  grpc::Status NotifyLinkBatch(grpc::ServerContext* context,
+                               const compactionservice::FileRefBatch* request,
+                               google::protobuf::Empty* response) override {
+    std::lock_guard<std::mutex> lock(storage_latch_);
+    const int n = request->path_size();
+    for (int i = 0; i < n; i++) {
+      auto& e = storage_refcount_map_[request->path(i)];
+      e.count++;
+      e.owners.insert(request->shard_id());  // debug only
+      std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path(i)
+                << " shard=" << request->shard_id() << " refcount=" << e.count
+                << " (batch " << (i + 1) << "/" << n << ")\n";
+    }
+    std::cout << GetTime() << "[storage] link-batch n=" << n
+              << " shard=" << request->shard_id() << std::endl;
+    return grpc::Status::OK;
+  }
+
   // Drop a shard's reference. For a TRACKED file the CP owns deletion: when the
   // refcount hits 0 the path is queued for the CP's batch GC (RunStorageGC) and the
   // reply is deleted=false (the CN must NOT delete it).

@@ -5664,8 +5664,14 @@ Status DBImpl::RegisterExternalFilesInPlace(
   // [relink/Storage-CP] Batch variant of the same claim: every file in this
   // edit is now referenced by this shard as well as by its owner, so each needs
   // its refcount bumped or the owner's next compaction will delete it.
+  // [batch 2026-09-09] ONE RPC for the whole edit. The per-file loop here was
+  // serial (~3.7 ms/file unloaded, ~13 ms under load) and, after the single
+  // LogAndApply above, the last O(#files) term in relink's stop window.
   if (s.ok()) {
-    for (const auto& fr : files) StorageCpNotifyLink(fs_.get(), fr.external_file);
+    std::vector<std::string> paths;
+    paths.reserve(files.size());
+    for (const auto& fr : files) paths.push_back(fr.external_file);
+    StorageCpNotifyLinkBatch(fs_.get(), paths);
   }
 #endif
   return s;

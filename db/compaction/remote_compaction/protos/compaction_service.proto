@@ -98,8 +98,21 @@ message DeleteReply {
   uint32 refcount = 2;   // remaining refcount after this op (debug)
 }
 
+// [relink/Storage-CP batch 2026-09-09] Every file of ONE relink register in ONE RPC. The
+// per-file NotifyLink loop inside RegisterExternalFilesInPlace was serial and cost ~3.7 ms/file
+// unloaded (~13 ms under load: global latch + a flushed log line + a unary round trip each) —
+// the only O(#files) term left in relink's stop window (374 files -> 1.37 s of 2.6 s).
+// Semantics = N NotifyLink calls applied under ONE latch acquisition (all-or-nothing).
+// Additive change: old engines keep using NotifyLink; an engine that gets UNIMPLEMENTED from
+// an old CP falls back to the per-file loop.
+message FileRefBatch {
+  repeated string path = 1;  // full HDFS URIs of the .sst files
+  uint32 shard_id = 2;       // adopting shard index
+}
+
 service StorageService {
   rpc NotifyCreate(FileRef) returns (google.protobuf.Empty) {}  // refcount[path]=1, owners={shard}
   rpc NotifyLink(FileRef) returns (google.protobuf.Empty) {}    // refcount[path]++, owners+={shard}
+  rpc NotifyLinkBatch(FileRefBatch) returns (google.protobuf.Empty) {}  // NotifyLink x N, one latch
   rpc RequestDelete(FileRef) returns (DeleteReply) {}           // refcount--; hdfsDelete at 0
 }
