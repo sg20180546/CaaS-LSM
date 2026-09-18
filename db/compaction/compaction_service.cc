@@ -1,5 +1,9 @@
 #include "compaction_service.h"
 
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+
 #include <grpc/grpc.h>
 #include <grpcpp/channel.h>
 #include <grpcpp/client_context.h>
@@ -81,6 +85,28 @@ class ProCPClient {
 };
 
 namespace ROCKSDB_NAMESPACE {
+namespace {
+// ProCP address is env-overridable (PRO_CP_ADDR="host:port") so the CN can
+// follow the CP to another node without recompiling. Read ONCE at library load
+// (namespace-scope static, not a function-local one) so the effective address
+// is logged to the host process's stderr at startup — i.e. it appears in
+// srv_s*.log BEFORE the first compaction, where run_group.sh can verify it
+// before LOAD. A binary without this line ignores PRO_CP_ADDR and dials the
+// compiled default. Unset/empty keeps the compiled default (empty string here)
+// and prints NOTHING: every process that loads librocksdb (serverclient,
+// procp_server, csa_server, db_bench, tests) must stay byte-identical to a
+// build without this override when the env is not set.
+const std::string kProCpAddrEnv = [] {
+  const char* e = getenv("PRO_CP_ADDR");
+  std::string v = (e && *e) ? std::string(e) : std::string();
+  if (!v.empty()) {
+    fprintf(stderr, "[procp-client] pro_cp_address=%s (from PRO_CP_ADDR)\n",
+            v.c_str());
+  }
+  return v;
+}();
+}  // namespace
+
 CompactionServiceJobStatus MyTestCompactionService::StartV2(
     const CompactionServiceJobInfo& info,
     const std::string& compaction_service_input) {
@@ -144,8 +170,11 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
   //  Status s = DB::OpenAndCompact(
   //      options, db_path_, db_path_ + "/" + std::to_string(info.job_id),
   //      compaction_input, compaction_service_result, options_override);
+  // kProCpAddrEnv (PRO_CP_ADDR, read once at library load, see top of file);
+  // empty => compiled default in options.pro_cp_address.
   ProCPClient proCp_client(grpc::CreateChannel(
-      options.pro_cp_address, grpc::InsecureChannelCredentials()));
+      kProCpAddrEnv.empty() ? options.pro_cp_address : kProCpAddrEnv,
+      grpc::InsecureChannelCredentials()));
   compactionservice::CompactionAdditionInfo addition_info;
 
   addition_info.set_score(compaction_addition_info->score);

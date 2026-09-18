@@ -176,6 +176,21 @@ int main(int argc, char** argv) {
                 << std::endl;
     }
   }
+  // CP (procp) address — env-overridable (PRO_CP_ADDR="host:port") so the CSA can
+  // register with a CP on a different node. Unset/empty keeps the compiled default.
+  bool pro_cp_addr_from_env = false;
+  if (const char* s = getenv("PRO_CP_ADDR")) {
+    if (*s) {
+      compaction_service_options.pro_cp_address = s;
+      pro_cp_addr_from_env = true;
+    }
+  }
+  // 'CSA knobs:' prefix is the anchor run_group.sh greps: librocksdb.so (linked here) prints its
+  // own '[procp-client] pro_cp_address=...' line, which must not satisfy the csa_server check.
+  std::cout << GetTime() << "CSA knobs: pro_cp_address="
+            << compaction_service_options.pro_cp_address
+            << (pro_cp_addr_from_env ? " (from PRO_CP_ADDR)" : " (compiled default)")
+            << std::endl;
   std::string server_address(compaction_service_options.csa_address);
   CSAImpl service;
   service.stub_ = compactionservice::ProCPService::NewStub(

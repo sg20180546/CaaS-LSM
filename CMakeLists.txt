@@ -1560,7 +1560,12 @@ if(WITH_TESTS)
             ${_REFLECTION}
             ${_GRPC_GRPCPP}
             ${_PROTOBUF_LIBPROTOBUF}
-            ${ROCKSDB_LIB})
+            ${ROCKSDB_LIB}
+            # procp_server calls hdfs* directly (Storage-CP GC: hdfsDelete). The hdfs plugin
+            # libs only reach librocksdb's own link line, so without this the procp link
+            # fails with undefined hdfs* refs (was hand-patched in link.txt on node 53).
+            # -L comes from CMAKE_*_LINKER_FLAGS (hadoop lib/native) per CSA_SETUP_SCRIPT.md.
+            hdfs)
   endforeach()
 
   if(MSVC)

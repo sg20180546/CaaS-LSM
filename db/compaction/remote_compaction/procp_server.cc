@@ -584,9 +584,20 @@ int main() {
     unsigned long long v = strtoull(s, nullptr, 10);
     if (v > 0) compaction_service_options.max_reschedule = v;
   }
+  // Listen address — env-overridable (PRO_CP_ADDR="host:port") so procp can run on a
+  // node other than the compiled default. Unset/empty keeps the default.
+  bool pro_cp_addr_from_env = false;
+  if (const char* s = getenv("PRO_CP_ADDR")) {
+    if (*s) {
+      compaction_service_options.pro_cp_address = s;
+      pro_cp_addr_from_env = true;
+    }
+  }
   std::cout << GetTime() << "ProCP knobs: max_accumulation_in_procp="
             << compaction_service_options.max_accumulation_in_procp
             << " max_reschedule=" << compaction_service_options.max_reschedule
+            << " pro_cp_address=" << compaction_service_options.pro_cp_address
+            << (pro_cp_addr_from_env ? " (from PRO_CP_ADDR)" : " (compiled default)")
             << std::endl;
   std::string server_address(compaction_service_options.pro_cp_address);
   ProCPImpl service;
