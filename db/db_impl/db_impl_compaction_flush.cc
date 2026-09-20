@@ -1709,6 +1709,18 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
           f->file_checksum_func_name, f->unique_id);
       moved.fd.external_path = f->fd.external_path;
       moved.fd.global_seqno_override = f->fd.global_seqno_override;
+      // [relink fast-register 2026-09-19] and the stats the source shipped with it. Without this
+      // the moved file looks unsupplied, and MaybeInitializeFileMetaData would fall into the stock
+      // properties read, which resolves the name from cf_paths and cannot find an external file.
+      // Guarded on external_path so a normal trivial move builds its meta exactly as before.
+      if (!f->fd.external_path.empty()) {
+        moved.relink_stats_supplied = f->relink_stats_supplied;
+        moved.init_stats_from_file = f->init_stats_from_file;
+        moved.num_entries = f->num_entries;
+        moved.num_deletions = f->num_deletions;
+        moved.raw_key_size = f->raw_key_size;
+        moved.raw_value_size = f->raw_value_size;
+      }
       edit.AddFile(to_level, moved);
     }
     ROCKS_LOG_DEBUG(immutable_db_options_.info_log,
@@ -3371,6 +3383,18 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
             f->file_checksum_func_name, f->unique_id);
         moved.fd.external_path = f->fd.external_path;
         moved.fd.global_seqno_override = f->fd.global_seqno_override;
+        // [relink fast-register 2026-09-19] and the stats the source shipped with it. Without this
+        // the moved file looks unsupplied, and MaybeInitializeFileMetaData would fall into the stock
+        // properties read, which resolves the name from cf_paths and cannot find an external file.
+        // Guarded on external_path so a normal trivial move builds its meta exactly as before.
+        if (!f->fd.external_path.empty()) {
+          moved.relink_stats_supplied = f->relink_stats_supplied;
+          moved.init_stats_from_file = f->init_stats_from_file;
+          moved.num_entries = f->num_entries;
+          moved.num_deletions = f->num_deletions;
+          moved.raw_key_size = f->raw_key_size;
+          moved.raw_value_size = f->raw_value_size;
+        }
         c->edit()->AddFile(c->output_level(), moved);
 
         ROCKS_LOG_BUFFER(

@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cinttypes>
 #include <functional>
 #include <map>
@@ -36,6 +37,31 @@
 #include "util/string_util.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// [relink fast-register 2026-09-19] Env opt-ins for the two costs a relink register pays inside
+// its single LogAndApply. Env rather than a DBOptions field to match how this fork already gates
+// the relink/Storage-CP machinery (plugin/hdfs/env_hdfs_impl.cc reads STORAGE_CP_ADDR the same
+// way), and read once so the hot path stays a load of a static int.
+//   RELINK_PRELOAD_THREADS=N  open the registered files N-at-a-time instead of serially.
+//                             Unset/<=1 keeps the stock serial loop.
+//   RELINK_DEFER_PRELOAD=1    do not open them at all when the source shipped their stats; the
+//                             first read opens them lazily.
+// Both apply ONLY to files carrying fd.external_path, i.e. only to relink registers.
+static int RelinkPreloadThreads() {
+  static const int v = [] {
+    const char* s = std::getenv("RELINK_PRELOAD_THREADS");
+    int n = (s && *s) ? atoi(s) : 1;
+    return n > 1 ? n : 1;
+  }();
+  return v;
+}
+static bool RelinkDeferPreload() {
+  static const bool v = [] {
+    const char* s = std::getenv("RELINK_DEFER_PRELOAD");
+    return s && *s && atoi(s) != 0;
+  }();
+  return v;
+}
 
 class VersionBuilder::Rep {
   class NewestFirstBySeqNo {
@@ -1260,11 +1286,30 @@ class VersionBuilder::Rep {
     // <file metadata, level>
     std::vector<std::pair<FileMetaData*, int>> files_meta;
     std::vector<Status> statuses;
+    // [relink fast-register 2026-09-19] Count relinked references among the files we are about to
+    // open. A file registered by DBImpl::RegisterExternalFilesInPlace carries fd.external_path;
+    // nothing a flush or compaction installs ever does. Both opt-ins below are therefore inert on
+    // every non-relink edit no matter how the env is set, which is what keeps baseline runs
+    // bit-identical (see migration_mechansim_exp/CLAUDE.md, relink option-gated isolation).
+    size_t n_external = 0;
     for (int level = 0; level < num_levels_; level++) {
       for (auto& file_meta_pair : levels_[level].added_files) {
         auto* file_meta = file_meta_pair.second;
         // If the file has been opened before, just skip it.
         if (!file_meta->table_reader_handle) {
+          // [relink fast-register] RELINK_DEFER_PRELOAD=1: do not eagerly open a relinked file
+          // whose table stats the source already shipped. Nothing in this LogAndApply needs its
+          // index/filter — that is a read-path warm-up — and MaybeInitializeFileMetaData is
+          // satisfied by the supplied stats. The first real read opens it through
+          // TableCache::FindTable, which resolves fd.external_path correctly. Files WITHOUT
+          // supplied stats are still opened here, because the stock properties read cannot find
+          // them (it ignores external_path).
+          if (RelinkDeferPreload() && !file_meta->fd.external_path.empty() &&
+              file_meta->relink_stats_supplied) {
+            ++n_external;
+            continue;
+          }
+          if (!file_meta->fd.external_path.empty()) ++n_external;
           files_meta.emplace_back(file_meta, level);
           statuses.emplace_back(Status::OK());
         }
@@ -1275,6 +1320,14 @@ class VersionBuilder::Rep {
       if (files_meta.size() >= max_load) {
         break;
       }
+    }
+    // [relink fast-register] Fan the opens out ONLY for a relink edit, and never spawn more
+    // threads than there are files (the loop below starts max_threads-1 threads unconditionally,
+    // so an unclamped value would add idle threads). Every other caller — notably DB recovery at
+    // db/version_edit_handler.cc:565, which passes max_file_opening_threads on purpose — keeps the
+    // value it was given, because n_external is 0 for files that are not relinked references.
+    if (n_external > 0 && !files_meta.empty() && RelinkPreloadThreads() > 1) {
+      max_threads = std::min(RelinkPreloadThreads(), static_cast<int>(files_meta.size()));
     }
 
     std::atomic<size_t> next_file_meta_idx(0);

@@ -2952,6 +2952,16 @@ bool Version::MaybeInitializeFileMetaData(FileMetaData* file_meta) {
   if (file_meta->init_stats_from_file || file_meta->compensated_file_size > 0) {
     return false;
   }
+  // [relink fast-register 2026-09-19] A relinked file's stats came over the wire from the shard
+  // that owned it, so there is nothing to read. This must return TRUE, not just set the flag:
+  // the caller only calls UpdateAccumulatedStats() when we return true, and those accumulators
+  // are inherited by every later Version, so an early `return false` here would under-count this
+  // column family's stats permanently. Also note the stock read path below CANNOT serve these
+  // files: it derives the file name from cf_paths + file number and ignores fd.external_path.
+  if (file_meta->relink_stats_supplied) {
+    file_meta->init_stats_from_file = true;
+    return true;
+  }
   std::shared_ptr<const TableProperties> tp;
   Status s = GetTableProperties(&tp, file_meta);
   file_meta->init_stats_from_file = true;
@@ -5086,6 +5096,14 @@ Status VersionSet::ProcessManifestWrites(
         assert(!mutable_cf_options_ptrs.empty() &&
                builder_guards.size() == versions.size());
         ColumnFamilyData* cfd = versions[i]->cfd_;
+        // [relink fast-register 2026-09-19] Still 1 here: for a normal flush/compaction install
+        // this loop opens a handful of files and the stock serial path must stay byte-identical.
+        // LoadTableHandlers raises it BY ITSELF, and only when the files it is about to open are
+        // relinked references (fd.external_path set) and RELINK_PRELOAD_THREADS is armed — for a
+        // relink register this loop is N serial HDFS opens, 2.19 ms/file measured at 321/552/858
+        // files. Overriding inside the callee (rather than here) also leaves the recovery caller
+        // at db/version_edit_handler.cc:565, which legitimately passes max_file_opening_threads,
+        // completely untouched.
         s = builder_guards[i]->version_builder()->LoadTableHandlers(
             cfd->internal_stats(), 1 /* max_threads */,
             true /* prefetch_index_and_filter_in_cache */,

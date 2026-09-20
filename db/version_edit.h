@@ -207,6 +207,12 @@ struct FileMetaData {
   bool being_compacted = false;       // Is this file undergoing compaction?
   bool init_stats_from_file = false;  // true if the data-entry stats of this
                                       // file has initialized from file.
+  // [relink fast-register 2026-09-19] In-memory only (never serialized into the MANIFEST): the
+  // relink source shipped num_entries/num_deletions/raw_* for this file, so
+  // Version::MaybeInitializeFileMetaData must NOT read the properties block. Only
+  // DBImpl::RegisterExternalFilesInPlace sets it, so every flush/compaction-installed file leaves
+  // it false and takes the stock read path unchanged.
+  bool relink_stats_supplied = false;
 
   bool marked_for_compaction = false;  // True if client asked us nicely to
                                        // compact this file.

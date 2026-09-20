@@ -5630,11 +5630,22 @@ Status DBImpl::RegisterExternalFilesInPlace(
                         largest_ikey, fr.global_seqno /* smallest_seqno */,
                         fr.global_seqno /* largest_seqno */,
                         false /* marked_for_compaction */, Temperature::kUnknown,
-                        kInvalidBlobFileNumber, 0 /* oldest_ancester_time */,
-                        0 /* file_creation_time */, /*file_checksum=*/"",
+                        kInvalidBlobFileNumber, fr.oldest_ancester_time,
+                        fr.file_creation_time, /*file_checksum=*/"",
                         /*file_checksum_func_name=*/"", unique_id);
     f_meta.fd.global_seqno_override = fr.global_seqno;  // [relink] per-file GSN
     f_meta.fd.external_path = fr.external_file;  // [relink] reference in place
+    // [relink fast-register 2026-09-19] Adopt the source's table stats when it supplied them.
+    // Without this the destination reads the properties block off HDFS per file, first eagerly
+    // inside LogAndApply and again in MaybeInitializeFileMetaData. num_entries == 0 means the
+    // caller sent nothing (old sender / memtable SST) => leave the flag false and read as before.
+    if (fr.num_entries > 0) {
+      f_meta.num_entries = fr.num_entries;
+      f_meta.num_deletions = fr.num_deletions;
+      f_meta.raw_key_size = fr.raw_key_size;
+      f_meta.raw_value_size = fr.raw_value_size;
+      f_meta.relink_stats_supplied = true;
+    }
     edit.AddFile(fr.level, f_meta);
     if (fr.global_seqno != kDisableGlobalSequenceNumber &&
         fr.global_seqno > max_gsn) {

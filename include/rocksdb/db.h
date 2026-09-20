@@ -158,6 +158,19 @@ struct ExternalFileForRegister {
   std::string smallest_user;        // [opt] smallest user key (skip open if set + size>0)
   std::string largest_user;         // [opt] largest user key
   uint64_t file_size = 0;           // [opt] file size in bytes
+  // [relink fast-register 2026-09-19] Bounds+size above let the dst skip the open done BY THIS
+  // CALL; the table stats below let it skip the SECOND per-file read, the one RocksDB itself does
+  // later inside LogAndApply (LoadTableHandlers -> properties block) and in
+  // Version::MaybeInitializeFileMetaData. The relink src already holds all six (four from
+  // GetColumnFamilyMetaData, the raw_* pair from GetPropertiesOfAllTables over its open readers),
+  // so shipping them costs 48 B/file on the wire and saves a HDFS round trip per file.
+  // num_entries == 0 => not supplied => dst reads them from the file exactly as before.
+  uint64_t num_entries = 0;
+  uint64_t num_deletions = 0;
+  uint64_t raw_key_size = 0;
+  uint64_t raw_value_size = 0;
+  uint64_t oldest_ancester_time = 0;
+  uint64_t file_creation_time = 0;
 };
 
 // A DB is a persistent, versioned ordered map from keys to values.
