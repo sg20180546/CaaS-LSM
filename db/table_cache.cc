@@ -185,6 +185,28 @@ Status TableCache::GetTableReader(
   return s;
 }
 
+// [relink tail-preload 2026-09-20]
+void TableCache::AddPendingTail(uint64_t file_number, uint64_t tail_offset,
+                                std::string&& tail) {
+  if (tail.empty()) return;
+  MutexLock l(&pending_tails_mu_);
+  pending_tails_[file_number] = std::make_pair(tail_offset, std::move(tail));
+  has_pending_tails_.store(true, std::memory_order_relaxed);
+}
+
+void TableCache::DropPendingTails() {
+  MutexLock l(&pending_tails_mu_);
+  pending_tails_.clear();
+  has_pending_tails_.store(false, std::memory_order_relaxed);
+}
+
+size_t TableCache::PendingTailBytes() const {
+  MutexLock l(&pending_tails_mu_);
+  size_t n = 0;
+  for (const auto& e : pending_tails_) n += e.second.second.size();
+  return n;
+}
+
 void TableCache::EraseHandle(const FileDescriptor& fd, Cache::Handle* handle) {
   ReleaseHandle(handle);
   uint64_t number = fd.GetNumber();
@@ -231,8 +253,22 @@ Status TableCache::FindTable(
       // We do not cache error results so that if the error is transient,
       // or somebody repairs the file, we recover automatically.
     } else {
-      s = cache_->Insert(key, table_reader.get(), 1, &DeleteEntry<TableReader>,
-                         handle);
+      // [relink tail-preload 2026-09-20] Level-derived admission priority. A point
+      // read probes EVERY L0 file (they overlap) but only one file per deeper
+      // level, so per-file probe rate drops by roughly the level fanout; under a
+      // finite max_open_files the shallow files are worth far more per slot.
+      // Only two tiers are used on purpose: the table cache is built with
+      // LRUCacheOptions defaults (db_impl.cc), where low_pri_pool_ratio is 0.0, so
+      // LOW and BOTTOM are indistinguishable -- a three-tier mapping would be a
+      // no-op without also setting that ratio. Gated off by default, in which case
+      // this is the stock 4-argument Insert (priority LOW for everything).
+      s = level_priority_
+              ? cache_->Insert(key, table_reader.get(), 1,
+                               &DeleteEntry<TableReader>, handle,
+                               level == 0 ? Cache::Priority::HIGH
+                                          : Cache::Priority::LOW)
+              : cache_->Insert(key, table_reader.get(), 1,
+                               &DeleteEntry<TableReader>, handle);
       if (s.ok()) {
         // Release ownership of table reader.
         table_reader.release();

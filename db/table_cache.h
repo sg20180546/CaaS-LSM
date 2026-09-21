@@ -10,8 +10,11 @@
 // Thread-safe (provides internal synchronization)
 
 #pragma once
+#include <atomic>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "db/dbformat.h"
@@ -229,6 +232,30 @@ class TableCache {
     }
   }
 
+  // [relink tail-preload 2026-09-20] Hand this cache the tail bytes of a file the
+  // migration source already sent over the network, so the NEXT open of that file
+  // (whether this is a deliberate warm-up or an ordinary read that got there
+  // first) builds its TableReader with zero storage I/O. See
+  // file/tail_backed_random_access_file.h for what a "tail" is and why serving it
+  // at the file layer is enough to cover every metadata read Open issues.
+  //
+  // The entry is consumed by the first open of that file number and is dropped
+  // even if the open fails, so a stale tail can never outlive the file identity
+  // it was captured for. Unclaimed entries are freed by DropPendingTails().
+  void AddPendingTail(uint64_t file_number, uint64_t tail_offset,
+                      std::string&& tail);
+  void DropPendingTails();
+  size_t PendingTailBytes() const;
+
+  // [relink tail-preload 2026-09-20] When on, a table cache entry is inserted with
+  // a priority derived from the file's LSM level: level 0 -> HIGH, everything else
+  // -> LOW. Rationale: a point read probes every L0 file (they overlap) but only
+  // one file per deeper level, so per-file probe rate falls by roughly the level
+  // fanout -- keeping the shallow files resident is worth far more per cache slot.
+  // Off (default) keeps the stock 4-argument Insert, i.e. LOW for everything, so a
+  // baseline run is byte-identical.
+  void SetLevelPriority(bool on) { level_priority_ = on; }
+
  private:
   // Build a table reader
   Status GetTableReader(
@@ -270,6 +297,16 @@ class TableCache {
   Striped<port::Mutex, Slice> loader_mutex_;
   std::shared_ptr<IOTracer> io_tracer_;
   std::string db_session_id_;
+
+  // [relink tail-preload 2026-09-20] file number -> (tail offset, tail bytes)
+  // shipped by the migration source and not yet consumed by an open. Guarded by
+  // its own mutex rather than loader_mutex_ because entries are produced in bulk
+  // by the install path and consumed one at a time from GetTableReader; the map
+  // is empty on every non-relink DB, so the hot path pays one relaxed load.
+  mutable port::Mutex pending_tails_mu_;
+  std::unordered_map<uint64_t, std::pair<uint64_t, std::string>> pending_tails_;
+  std::atomic<bool> has_pending_tails_{false};
+  bool level_priority_ = false;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

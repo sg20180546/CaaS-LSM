@@ -1552,6 +1552,17 @@ Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
   std::string file_name;
   if (fname != nullptr) {
     file_name = *fname;
+  } else if (!file_meta->fd.external_path.empty()) {
+    // [relink 2026-09-20] An in-place external reference lives at its own absolute path.
+    // Deriving the name from cf_paths + file number (the else branch) resolves to a file
+    // that does not exist for a relinked file, so this fallback failed for EVERY relinked
+    // file that was not already in the table cache -- silently: the caller
+    // Version::MaybeInitializeFileMetaData just logs and leaves the stats unset, which
+    // under-counts VersionStorageInfo's accumulators and therefore distorts
+    // compensated_file_size and compaction picking. It went unnoticed because
+    // max_open_files was -1, so every file was already open and step 1 above always hit.
+    // Same branch as TableCache::GetTableReader (db/table_cache.cc).
+    file_name = file_meta->fd.external_path;
   } else {
     file_name = TableFileName(ioptions->cf_paths, file_meta->fd.GetNumber(),
                               file_meta->fd.GetPathId());
@@ -1591,6 +1602,38 @@ Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props) {
     }
   }
 
+  return Status::OK();
+}
+
+// [src-memory pull 2026-09-21] Properties for ONLY the files this DB currently has open in its
+// table cache, with no_io set so nothing is read from shared storage. This is the "residency as
+// selection" primitive: a migration source answers from memory or does not answer at all.
+//
+// It exists because GetPropertiesOfAllTables cannot be used for that. That one passes an explicit
+// file name down to Version::GetTableProperties, which makes it skip the no-io table cache lookup
+// and open the file directly -- and it fails hard on the first file it cannot read, so one
+// non-resident file loses the whole collection. Here a non-resident file is simply absent from the
+// result and the caller treats it as "source does not have it".
+//
+// Keyed by file number rather than path: the caller matches against files it already knows, and
+// the destination will assign its own numbers anyway.
+Status Version::GetPropertiesOfResidentTables(
+    std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>* props) {
+  assert(props != nullptr);
+  auto* table_cache = cfd_->table_cache();
+  for (int level = 0; level < storage_info_.num_levels_; level++) {
+    for (const auto& file_meta : storage_info_.files_[level]) {
+      std::shared_ptr<const TableProperties> tp;
+      Status s = table_cache->GetTableProperties(
+          file_options_, cfd_->internal_comparator(), *file_meta, &tp,
+          mutable_cf_options_.prefix_extractor, true /* no_io */);
+      // Incomplete == not in the table cache. Anything else is also just "cannot answer from
+      // memory"; neither is an error for this call.
+      if (s.ok() && tp != nullptr) {
+        (*props)[file_meta->fd.GetNumber()] = std::move(tp);
+      }
+    }
+  }
   return Status::OK();
 }
 

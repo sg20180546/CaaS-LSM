@@ -540,6 +540,21 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family,
       const std::vector<ExternalFileForRegister>& files) override;
 
+  // [relink tail-preload 2026-09-20] install shipped metadata tails + warm the
+  // readers in the caller's order (deepest level first). See rocksdb/db.h.
+  // ★ 2026-09-21: the bulk-push shape is being replaced by demand-pull (see
+  // migration_mechansim_exp/SRC_MEMORY_PULL_DESIGN.md); this entry point is kept
+  // only until the pull path lands and has never had a caller.
+  virtual Status InstallExternalTableTails(
+      ColumnFamilyHandle* column_family,
+      std::vector<ExternalTableTail>&& tails) override;
+
+  // [src-memory pull 2026-09-21] table properties from the table cache only (no_io).
+  virtual Status GetPropertiesOfResidentTables(
+      ColumnFamilyHandle* column_family,
+      std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+          props) override;
+
   // [relink] remove a relinked file from the MANIFEST (no physical delete).
   virtual Status UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
                                        uint64_t file_number) override;

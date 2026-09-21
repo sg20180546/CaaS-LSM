@@ -38,30 +38,14 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-// [relink fast-register 2026-09-19] Env opt-ins for the two costs a relink register pays inside
-// its single LogAndApply. Env rather than a DBOptions field to match how this fork already gates
-// the relink/Storage-CP machinery (plugin/hdfs/env_hdfs_impl.cc reads STORAGE_CP_ADDR the same
-// way), and read once so the hot path stays a load of a static int.
-//   RELINK_PRELOAD_THREADS=N  open the registered files N-at-a-time instead of serially.
-//                             Unset/<=1 keeps the stock serial loop.
-//   RELINK_DEFER_PRELOAD=1    do not open them at all when the source shipped their stats; the
-//                             first read opens them lazily.
-// Both apply ONLY to files carrying fd.external_path, i.e. only to relink registers.
-static int RelinkPreloadThreads() {
-  static const int v = [] {
-    const char* s = std::getenv("RELINK_PRELOAD_THREADS");
-    int n = (s && *s) ? atoi(s) : 1;
-    return n > 1 ? n : 1;
-  }();
-  return v;
-}
-static bool RelinkDeferPreload() {
-  static const bool v = [] {
-    const char* s = std::getenv("RELINK_DEFER_PRELOAD");
-    return s && *s && atoi(s) != 0;
-  }();
-  return v;
-}
+// [relink no-preload 2026-09-20] The two env opt-ins that used to live here
+// (RELINK_PRELOAD_THREADS, RELINK_DEFER_PRELOAD, added 2026-09-19) are removed. A relinked
+// reference is now NEVER opened inside the register's LogAndApply — see the unconditional skip
+// in LoadTableHandlers below — so there is neither anything to parallelise nor a reason to make
+// the deferral optional. The project rule that makes this unconditional: the relink path
+// requires a finite max_open_files (DBImpl::RegisterExternalFilesInPlace refuses a table cache
+// with kInfiniteCapacity), so the table cache is bounded and evictable and admission is a
+// policy decision, not something to pre-fill in the cutover.
 
 class VersionBuilder::Rep {
   class NewestFirstBySeqNo {
@@ -1286,30 +1270,35 @@ class VersionBuilder::Rep {
     // <file metadata, level>
     std::vector<std::pair<FileMetaData*, int>> files_meta;
     std::vector<Status> statuses;
-    // [relink fast-register 2026-09-19] Count relinked references among the files we are about to
-    // open. A file registered by DBImpl::RegisterExternalFilesInPlace carries fd.external_path;
-    // nothing a flush or compaction installs ever does. Both opt-ins below are therefore inert on
-    // every non-relink edit no matter how the env is set, which is what keeps baseline runs
+    // [relink no-preload 2026-09-20] A file registered by DBImpl::RegisterExternalFilesInPlace
+    // carries fd.external_path; nothing a flush or compaction installs ever does. The skip below
+    // is therefore inert on every non-relink edit, which is what keeps baseline runs
     // bit-identical (see migration_mechansim_exp/CLAUDE.md, relink option-gated isolation).
-    size_t n_external = 0;
     for (int level = 0; level < num_levels_; level++) {
       for (auto& file_meta_pair : levels_[level].added_files) {
         auto* file_meta = file_meta_pair.second;
         // If the file has been opened before, just skip it.
         if (!file_meta->table_reader_handle) {
-          // [relink fast-register] RELINK_DEFER_PRELOAD=1: do not eagerly open a relinked file
-          // whose table stats the source already shipped. Nothing in this LogAndApply needs its
-          // index/filter — that is a read-path warm-up — and MaybeInitializeFileMetaData is
-          // satisfied by the supplied stats. The first real read opens it through
-          // TableCache::FindTable, which resolves fd.external_path correctly. Files WITHOUT
-          // supplied stats are still opened here, because the stock properties read cannot find
-          // them (it ignores external_path).
-          if (RelinkDeferPreload() && !file_meta->fd.external_path.empty() &&
-              file_meta->relink_stats_supplied) {
-            ++n_external;
+          // [relink no-preload 2026-09-20] A relinked reference is NEVER eagerly opened here.
+          // This is unconditional now (it used to be the RELINK_DEFER_PRELOAD opt-in, which
+          // additionally required relink_stats_supplied). Rationale:
+          //   - This fork requires a FINITE max_open_files on the relink path
+          //     (DBImpl::RegisterExternalFilesInPlace refuses kInfiniteCapacity), so the table
+          //     cache is a bounded, evictable resource. Eagerly filling it with the whole
+          //     migrated file set inside the cutover is exactly the wrong admission decision,
+          //     and it put N serial HDFS opens in the stop window.
+          //   - Nothing in this LogAndApply needs the index/filter; that is a read-path warm-up.
+          //     The first real read opens the file lazily through TableCache::FindTable, which
+          //     resolves fd.external_path.
+          //   - Version::MaybeInitializeFileMetaData is satisfied either by the stats the source
+          //     shipped (relink_stats_supplied) or, since 2026-09-20, by the external_path-aware
+          //     fallback in Version::GetTableProperties. The old stats precondition is therefore
+          //     gone.
+          // Files a flush or compaction installs never carry fd.external_path, so every
+          // non-relink edit keeps the stock serial path byte-for-byte.
+          if (!file_meta->fd.external_path.empty()) {
             continue;
           }
-          if (!file_meta->fd.external_path.empty()) ++n_external;
           files_meta.emplace_back(file_meta, level);
           statuses.emplace_back(Status::OK());
         }
@@ -1321,14 +1310,11 @@ class VersionBuilder::Rep {
         break;
       }
     }
-    // [relink fast-register] Fan the opens out ONLY for a relink edit, and never spawn more
-    // threads than there are files (the loop below starts max_threads-1 threads unconditionally,
-    // so an unclamped value would add idle threads). Every other caller — notably DB recovery at
-    // db/version_edit_handler.cc:565, which passes max_file_opening_threads on purpose — keeps the
-    // value it was given, because n_external is 0 for files that are not relinked references.
-    if (n_external > 0 && !files_meta.empty() && RelinkPreloadThreads() > 1) {
-      max_threads = std::min(RelinkPreloadThreads(), static_cast<int>(files_meta.size()));
-    }
+    // [relink no-preload 2026-09-20] The RELINK_PRELOAD_THREADS fan-out that used to sit here is
+    // gone: relinked references are skipped above, so files_meta never contains one and there is
+    // nothing for a relink-specific thread count to parallelise. Callers keep the max_threads they
+    // passed — notably DB recovery at db/version_edit_handler.cc, which passes
+    // max_file_opening_threads on purpose.
 
     std::atomic<size_t> next_file_meta_idx(0);
     std::function<void()> load_handlers_func([&]() {

@@ -173,6 +173,19 @@ struct ExternalFileForRegister {
   uint64_t file_creation_time = 0;
 };
 
+// [relink tail-preload 2026-09-20] One already-registered file's metadata tail,
+// shipped CN-to-CN by the migration source so the destination can build the
+// file's TableReader without touching shared storage. `tail` is the raw bytes of
+// [tail_offset, file_size) exactly as they sit in the SST -- every metadata block
+// of a block-based table (filter, index, compression dict, range-del, properties,
+// metaindex, footer) lives in that suffix, so it is all Open needs.
+struct ExternalTableTail {
+  uint64_t file_number = 0;
+  int level = 0;          // only used to order the warm-up, deepest level first
+  uint64_t tail_offset = 0;
+  std::string tail;
+};
+
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
 // any external synchronization.
@@ -1728,6 +1741,31 @@ class DB {
         "RegisterExternalFilesInPlace is not supported in this DB implementation");
   }
 
+  // [relink tail-preload 2026-09-20] Install metadata tails the migration source
+  // shipped for files this DB has just registered, and warm their TableReaders in
+  // the order given. Call AFTER RegisterExternalFilesInPlace and AFTER the shard
+  // has resumed serving -- this does real work (parsing every index block) and
+  // deliberately does not belong in the cutover.
+  //
+  // Ordering is the whole point and the caller owns it: pass DEEPEST level first
+  // and level 0 last. A table cache entry joins the LRU list when its handle is
+  // released, so finishing in that order leaves the shallow files -- the ones a
+  // point read probes on every lookup -- at the young end. If more files are
+  // installed than max_open_files allows, stock LRU eviction then drops the
+  // deepest levels first, which is exactly the desired admission outcome and
+  // needs no budget arithmetic. Readers are NOT pinned into FileMetaData, so they
+  // stay evictable.
+  //
+  // Files whose tail is missing or which are no longer in the current version are
+  // skipped, not an error. Turns on level-derived table cache admission priority
+  // for this column family.
+  virtual Status InstallExternalTableTails(
+      ColumnFamilyHandle* /*column_family*/,
+      std::vector<ExternalTableTail>&& /*tails*/) {
+    return Status::NotSupported(
+        "InstallExternalTableTails is not supported in this DB implementation");
+  }
+
   // [relink] Remove a (relinked) file from this column family's MANIFEST WITHOUT
   // physically deleting it — the file has been renamed away into another DB by
   // RegisterExternalFileInPlace, so the obsolete-file deletion this triggers is a
@@ -1820,6 +1858,26 @@ class DB {
                                           TablePropertiesCollection* props) = 0;
   virtual Status GetPropertiesOfAllTables(TablePropertiesCollection* props) {
     return GetPropertiesOfAllTables(DefaultColumnFamily(), props);
+  }
+
+  // [src-memory pull 2026-09-21] Table properties for ONLY the files this DB currently has open
+  // in its table cache, keyed by file number. Sets no_io, so it never reads shared storage: a
+  // file that is not resident is simply absent from the result, and that absence is the answer
+  // ("this DB does not have it in memory"), not an error.
+  //
+  // This is the "residency as selection" primitive for key-group migration. The source of a
+  // migration must be able to hand over what it already holds WITHOUT going to storage on the
+  // destination's behalf; GetPropertiesOfAllTables cannot be used for that, because it passes an
+  // explicit file name down to Version::GetTableProperties (which then bypasses the no-io table
+  // cache lookup and opens the file) and because it aborts the whole collection on the first
+  // unreadable file.
+  virtual Status GetPropertiesOfResidentTables(
+      ColumnFamilyHandle* /*column_family*/,
+      std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+      /*props*/) {
+    return Status::NotSupported(
+        "GetPropertiesOfResidentTables is not supported in this DB "
+        "implementation");
   }
   virtual Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,

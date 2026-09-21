@@ -3722,6 +3722,31 @@ void DBImpl::ReleaseSnapshot(const Snapshot* s) {
 }
 
 #ifndef ROCKSDB_LITE
+// [src-memory pull 2026-09-21] See rocksdb/db.h. Answers from the table cache only.
+Status DBImpl::GetPropertiesOfResidentTables(
+    ColumnFamilyHandle* column_family,
+    std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+        props) {
+  if (column_family == nullptr || props == nullptr) {
+    return Status::InvalidArgument("column_family and props must not be null");
+  }
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  mutex_.Lock();
+  auto version = cfd->current();
+  version->Ref();
+  mutex_.Unlock();
+
+  auto s = version->GetPropertiesOfResidentTables(props);
+
+  mutex_.Lock();
+  version->Unref();
+  mutex_.Unlock();
+
+  return s;
+}
+
 Status DBImpl::GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                         TablePropertiesCollection* props) {
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
@@ -5572,6 +5597,23 @@ Status DBImpl::RegisterExternalFilesInPlace(
     return Status::InvalidArgument("column_family must not be null");
   }
   if (files.empty()) return Status::OK();
+  // [relink no-preload 2026-09-20] The relink path requires a FINITE max_open_files. With
+  // max_open_files == -1 the table cache is created with TableCache::kInfiniteCapacity
+  // (see the DBImpl constructor), which means (a) nothing is ever evicted, so the table
+  // cache is an unbounded pile of pinned per-file index blocks outside the block cache
+  // budget, and (b) VersionBuilder::LoadTableHandlers takes its always_load branch.
+  // Neither is compatible with a table-cache admission policy, and carrying both regimes
+  // was a standing source of confusion. Refuse loudly instead of silently degrading.
+  // Scope: this check is deliberately ONLY on the relink registration entry point. Plain
+  // DB::Open, db_bench and the remote-compaction agent (which default-constructs Options,
+  // where max_open_files is -1) are untouched.
+  if (table_cache_ != nullptr &&
+      table_cache_->GetCapacity() >= TableCache::kInfiniteCapacity) {
+    return Status::InvalidArgument(
+        "RegisterExternalFilesInPlace requires a finite max_open_files: "
+        "max_open_files == -1 gives the table cache infinite capacity, which "
+        "disables eviction and forces eager preload of every registered file");
+  }
   auto* cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
 
@@ -5686,6 +5728,93 @@ Status DBImpl::RegisterExternalFilesInPlace(
   }
 #endif
   return s;
+}
+
+// [relink tail-preload 2026-09-20] See rocksdb/db.h for the contract. Two things
+// happen here and they are deliberately separate:
+//   1. every shipped tail is handed to the table cache, so that ANY later open of
+//      that file -- this warm-up, or an ordinary read that races ahead of it --
+//      is served from memory instead of shared storage;
+//   2. the readers are materialised in the caller's order, which is what turns
+//      "deepest level first" into the LRU eviction ladder.
+// Step 1 alone is already worth it; step 2 is what makes the level policy real.
+Status DBImpl::InstallExternalTableTails(ColumnFamilyHandle* column_family,
+                                         std::vector<ExternalTableTail>&& tails) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  if (tails.empty()) return Status::OK();
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  TableCache* table_cache = cfd->table_cache();
+
+  table_cache->SetLevelPriority(true);
+  std::vector<std::pair<uint64_t, int>> order;  // (file number, level)
+  order.reserve(tails.size());
+  size_t tail_bytes = 0;
+  for (auto& t : tails) {
+    tail_bytes += t.tail.size();
+    order.emplace_back(t.file_number, t.level);
+    table_cache->AddPendingTail(t.file_number, t.tail_offset, std::move(t.tail));
+  }
+
+  // Hold a SuperVersion reference so the FileMetaData pointers stay alive for the
+  // whole walk. Opening happens outside the DB mutex on purpose: this is real
+  // parsing work and it runs after the shard has resumed serving.
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  const VersionStorageInfo* vstorage = sv->current->storage_info();
+  std::unordered_map<uint64_t, std::pair<FileMetaData*, int>> by_number;
+  for (int level = 0; level < vstorage->num_levels(); level++) {
+    for (FileMetaData* f : vstorage->LevelFiles(level)) {
+      by_number[f->fd.GetNumber()] = std::make_pair(f, level);
+    }
+  }
+
+  size_t warmed = 0, skipped = 0;
+  for (const auto& entry : order) {
+    auto it = by_number.find(entry.first);
+    if (it == by_number.end()) {
+      // Compacted away or never registered. Not an error.
+      ++skipped;
+      continue;
+    }
+    FileMetaData* fmeta = it->second.first;
+    const int level = it->second.second;
+    if (fmeta->table_reader_handle != nullptr) {
+      ++skipped;  // already open and pinned; nothing to do and nothing to unpin
+      continue;
+    }
+    Cache::Handle* handle = nullptr;
+    Status s = table_cache->FindTable(
+        ReadOptions(), file_options_, cfd->internal_comparator(), *fmeta,
+        &handle, sv->mutable_cf_options.prefix_extractor, false /* no_io */,
+        true /* record_read_stats */,
+        cfd->internal_stats()->GetFileReadHist(level), false /* skip_filters */,
+        level, true /* prefetch_index_and_filter_in_cache */,
+        MaxFileSizeForL0MetaPin(sv->mutable_cf_options), fmeta->temperature);
+    if (s.ok() && handle != nullptr) {
+      // Release immediately. The entry joins the LRU list at THIS instant, which
+      // is what makes the caller's deepest-first order the eviction ladder. Do
+      // NOT stash it in FileMetaData::table_reader_handle: that would pin the
+      // entry out of the LRU list entirely and defeat the whole policy (and
+      // un-pinning it later is the one operation that is genuinely unsafe, since
+      // FileDescriptor::table_reader is copied by value into every Version's
+      // level-files brief).
+      table_cache->ReleaseHandle(handle);
+      ++warmed;
+    } else {
+      ++skipped;
+    }
+  }
+  ReturnAndCleanupSuperVersion(cfd, sv);
+
+  // Anything never claimed above (file already gone, open failed) would otherwise
+  // sit in the pending map for the lifetime of the DB.
+  table_cache->DropPendingTails();
+  ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                 "[relink] installed %zu table tails (%.1f MB), %zu skipped",
+                 warmed, tail_bytes / 1048576.0, skipped);
+  return Status::OK();
 }
 
 // [relink] Remove a relinked file from this CF's MANIFEST. The physical file has been

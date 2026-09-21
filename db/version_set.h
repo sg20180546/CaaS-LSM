@@ -924,6 +924,13 @@ class Version {
   // The keys of `props` are the sst file name, the values of `props` are the
   // tables' properties, represented as std::shared_ptr.
   Status GetPropertiesOfAllTables(TablePropertiesCollection* props);
+
+  // [src-memory pull 2026-09-21] Properties for only the files already open in this DB's table
+  // cache (no_io), keyed by file number. Non-resident files are absent, not an error. See the
+  // definition in version_set.cc for why GetPropertiesOfAllTables cannot serve this.
+  Status GetPropertiesOfResidentTables(
+      std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+          props);
   Status GetPropertiesOfAllTables(TablePropertiesCollection* props, int level);
   Status GetPropertiesOfTablesInRange(const Range* range, std::size_t n,
                                       TablePropertiesCollection* props) const;
