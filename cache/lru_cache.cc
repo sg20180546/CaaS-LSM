@@ -1034,16 +1034,29 @@ Status LRUCacheShard::InsertForCacheWarmup(
         required = usage_ - usage_limit;
       }
 
-      // Preflight the exact evictable set. Warmup leases stay linked to retain
-      // recency, so pool byte counters alone also include temporarily pinned
-      // entries and cannot establish atomic admission.
+      // Preflight the exact evictable set, but ONLY when eviction is actually
+      // needed. Warmup leases stay linked to retain recency, so pool byte
+      // counters alone also include temporarily pinned entries and cannot
+      // establish atomic admission -- hence the walk -- but with free capacity
+      // (the common case while a destination is still filling) the insert is
+      // admitted directly, exactly as stock Insert does. Measured 2026-09-22
+      // (1 KiB values, 8 GiB destination cache <25% full): the unconditional
+      // whole-shard walk under mutex_ cost ~200 us per admitted block and
+      // held the warmup stream to ~7k blocks/s, a third of the destination's
+      // own HDFS refill rate, while stalling foreground lookups on the shard.
+      // The walk also starts at the LRU end and stops as soon as enough
+      // eligible charge is found: that is all the all-or-nothing decision
+      // needs, and the victim loop below re-walks the same prefix.
       size_t eligible = 0;
-      for (LRUHandle* candidate = lru_.next; candidate != &lru_;
-           candidate = candidate->next) {
-        if (!candidate->HasRefs() &&
-            IsStrictlyLowerPriority(GetEffectivePriority(candidate),
-                                    priority)) {
-          eligible += candidate->total_charge;
+      if (required > 0) {
+        for (LRUHandle* candidate = lru_.next;
+             candidate != &lru_ && eligible < required;
+             candidate = candidate->next) {
+          if (!candidate->HasRefs() &&
+              IsStrictlyLowerPriority(GetEffectivePriority(candidate),
+                                      priority)) {
+            eligible += candidate->total_charge;
+          }
         }
       }
 
