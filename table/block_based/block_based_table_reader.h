@@ -573,6 +573,7 @@ struct BlockBasedTable::Rep {
         whole_key_filtering(_table_opt.whole_key_filtering),
         prefix_filtering(true),
         global_seqno(kDisableGlobalSequenceNumber),
+        global_seqno_is_relink_override(false),
         file_size(_file_size),
         level(_level),
         immortal_table(_immortal_table) {}
@@ -630,6 +631,10 @@ struct BlockBasedTable::Rep {
   // A value of kDisableGlobalSequenceNumber means that this feature is disabled
   // and every key have it's own seqno.
   SequenceNumber global_seqno;
+
+  // Unlike an external SST's global sequence number, a relink override is
+  // applied to an ordinary SST whose encoded keys can have nonzero seqnos.
+  bool global_seqno_is_relink_override;
 
   // Size of the table file on disk
   uint64_t file_size;

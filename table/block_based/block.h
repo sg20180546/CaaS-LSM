@@ -193,7 +193,8 @@ class Block {
                                  SequenceNumber global_seqno,
                                  DataBlockIter* iter = nullptr,
                                  Statistics* stats = nullptr,
-                                 bool block_contents_pinned = false);
+                                 bool block_contents_pinned = false,
+                                 bool allow_nonzero_encoded_seqno = false);
 
   // Returns an MetaBlockIter for iterating over blocks containing metadata
   // (like Properties blocks).  Unlike data blocks, the keys for these blocks
@@ -489,27 +490,34 @@ class BlockIter : public InternalIteratorBase<TValue> {
 class DataBlockIter final : public BlockIter<Slice> {
  public:
   DataBlockIter()
-      : BlockIter(), read_amp_bitmap_(nullptr), last_bitmap_offset_(0) {}
+      : BlockIter(),
+        read_amp_bitmap_(nullptr),
+        last_bitmap_offset_(0),
+        allow_nonzero_encoded_seqno_(false) {}
   DataBlockIter(const Comparator* raw_ucmp, const char* data, uint32_t restarts,
                 uint32_t num_restarts, SequenceNumber global_seqno,
                 BlockReadAmpBitmap* read_amp_bitmap, bool block_contents_pinned,
-                DataBlockHashIndex* data_block_hash_index)
+                DataBlockHashIndex* data_block_hash_index,
+                bool allow_nonzero_encoded_seqno = false)
       : DataBlockIter() {
     Initialize(raw_ucmp, data, restarts, num_restarts, global_seqno,
-               read_amp_bitmap, block_contents_pinned, data_block_hash_index);
+               read_amp_bitmap, block_contents_pinned, data_block_hash_index,
+               allow_nonzero_encoded_seqno);
   }
   void Initialize(const Comparator* raw_ucmp, const char* data,
                   uint32_t restarts, uint32_t num_restarts,
                   SequenceNumber global_seqno,
                   BlockReadAmpBitmap* read_amp_bitmap,
                   bool block_contents_pinned,
-                  DataBlockHashIndex* data_block_hash_index) {
+                  DataBlockHashIndex* data_block_hash_index,
+                  bool allow_nonzero_encoded_seqno = false) {
     InitializeBase(raw_ucmp, data, restarts, num_restarts, global_seqno,
                    block_contents_pinned);
     raw_key_.SetIsUserKey(false);
     read_amp_bitmap_ = read_amp_bitmap;
     last_bitmap_offset_ = current_ + 1;
     data_block_hash_index_ = data_block_hash_index;
+    allow_nonzero_encoded_seqno_ = allow_nonzero_encoded_seqno;
   }
 
   Slice value() const override {
@@ -582,6 +590,10 @@ class DataBlockIter final : public BlockIter<Slice> {
   int32_t prev_entries_idx_ = -1;
 
   DataBlockHashIndex* data_block_hash_index_;
+  // External SST global sequence numbers require zero in the encoded key.
+  // Relink can instead override sequence numbers in an ordinary SST, whose
+  // encoded keys legitimately retain their original nonzero sequence numbers.
+  bool allow_nonzero_encoded_seqno_;
 
   bool SeekForGetImpl(const Slice& target);
 };

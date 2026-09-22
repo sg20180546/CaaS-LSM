@@ -627,20 +627,26 @@ bool DataBlockIter::ParseNextDataKey(bool* is_shared) {
   if (ParseNextKey<DecodeEntry>(is_shared)) {
 #ifndef NDEBUG
     if (global_seqno_ != kDisableGlobalSequenceNumber) {
-      // If we are reading a file with a global sequence number we should
-      // expect that all encoded sequence numbers are zeros and any value
-      // type is kTypeValue, kTypeMerge, kTypeDeletion,
-      // kTypeDeletionWithTimestamp, or kTypeRangeDeletion.
+      // External SST global sequence numbers require zero encoded sequence
+      // numbers and their restricted set of value types. A relink override
+      // instead applies to an ordinary SST, whose original sequence numbers
+      // and full set of SST value types remain encoded in the block.
       uint64_t packed = ExtractInternalKeyFooter(raw_key_.GetKey());
       SequenceNumber seqno;
       ValueType value_type;
       UnPackSequenceAndType(packed, &seqno, &value_type);
-      assert(value_type == ValueType::kTypeValue ||
-             value_type == ValueType::kTypeMerge ||
-             value_type == ValueType::kTypeDeletion ||
-             value_type == ValueType::kTypeDeletionWithTimestamp ||
-             value_type == ValueType::kTypeRangeDeletion);
-      assert(seqno == 0);
+      if (allow_nonzero_encoded_seqno_) {
+        // Relink overrides an ordinary SST, so accept every key type that is
+        // valid in an SST while still rejecting corrupt/WAL-only types.
+        assert(IsExtendedValueType(value_type));
+      } else {
+        assert(value_type == ValueType::kTypeValue ||
+               value_type == ValueType::kTypeMerge ||
+               value_type == ValueType::kTypeDeletion ||
+               value_type == ValueType::kTypeDeletionWithTimestamp ||
+               value_type == ValueType::kTypeRangeDeletion);
+        assert(seqno == 0);
+      }
     }
 #endif  // NDEBUG
     return true;
@@ -1053,7 +1059,8 @@ MetaBlockIter* Block::NewMetaIterator(bool block_contents_pinned) {
 DataBlockIter* Block::NewDataIterator(const Comparator* raw_ucmp,
                                       SequenceNumber global_seqno,
                                       DataBlockIter* iter, Statistics* stats,
-                                      bool block_contents_pinned) {
+                                      bool block_contents_pinned,
+                                      bool allow_nonzero_encoded_seqno) {
   DataBlockIter* ret_iter;
   if (iter != nullptr) {
     ret_iter = iter;
@@ -1072,7 +1079,8 @@ DataBlockIter* Block::NewDataIterator(const Comparator* raw_ucmp,
     ret_iter->Initialize(
         raw_ucmp, data_, restart_offset_, num_restarts_, global_seqno,
         read_amp_bitmap_.get(), block_contents_pinned,
-        data_block_hash_index_.Valid() ? &data_block_hash_index_ : nullptr);
+        data_block_hash_index_.Valid() ? &data_block_hash_index_ : nullptr,
+        allow_nonzero_encoded_seqno);
     if (read_amp_bitmap_) {
       if (read_amp_bitmap_->GetStatistics() != stats) {
         // DB changed the Statistics pointer, we need to notify read_amp_bitmap_

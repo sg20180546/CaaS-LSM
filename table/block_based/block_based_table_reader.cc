@@ -976,6 +976,7 @@ Status BlockBasedTable::ReadPropertiesBlock(
     // Inert when kDisable (all baseline SSTs) -> global_seqno path unchanged.
     if (global_seqno_override != kDisableGlobalSequenceNumber) {
       rep_->global_seqno = global_seqno_override;
+      rep_->global_seqno_is_relink_override = true;
     }
   }
   return s;
@@ -1636,7 +1637,8 @@ DataBlockIter* BlockBasedTable::InitBlockIterator<DataBlockIter>(
     DataBlockIter* input_iter, bool block_contents_pinned) {
   return block->NewDataIterator(rep->internal_comparator.user_comparator(),
                                 rep->get_global_seqno(block_type), input_iter,
-                                rep->ioptions.stats, block_contents_pinned);
+                                rep->ioptions.stats, block_contents_pinned,
+                                rep->global_seqno_is_relink_override);
 }
 
 template <>
