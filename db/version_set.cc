@@ -20,14 +20,15 @@
 #include <unordered_map>
 #include <vector>
 
+#include "cache/cache_key.h"
 #include "db/blob/blob_fetcher.h"
 #include "db/blob/blob_file_cache.h"
 #include "db/blob/blob_file_reader.h"
 #include "db/blob/blob_index.h"
-#include "db/bucket_util.h"
-#include "db/bucket_util_io.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_source.h"
+#include "db/bucket_util.h"
+#include "db/bucket_util_io.h"
 #include "db/compaction/compaction.h"
 #include "db/compaction/file_pri.h"
 #include "db/dbformat.h"
@@ -1605,33 +1606,34 @@ Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props) {
   return Status::OK();
 }
 
-// [src-memory pull 2026-09-21] Properties for ONLY the files this DB currently has open in its
-// table cache, with no_io set so nothing is read from shared storage. This is the "residency as
-// selection" primitive: a migration source answers from memory or does not answer at all.
-//
-// It exists because GetPropertiesOfAllTables cannot be used for that. That one passes an explicit
-// file name down to Version::GetTableProperties, which makes it skip the no-io table cache lookup
-// and open the file directly -- and it fails hard on the first file it cannot read, so one
-// non-resident file loses the whole collection. Here a non-resident file is simply absent from the
-// result and the caller treats it as "source does not have it".
-//
-// Keyed by file number rather than path: the caller matches against files it already knows, and
-// the destination will assign its own numbers anyway.
+// [src-memory pull 2026-09-21] Properties for ONLY the files this DB currently
+// has open in its table cache. Enumerating the backing cache directly is
+// O(resident entries), performs no storage I/O, and does not turn the snapshot
+// into a sequence of cache hits. Keyed by file number so the caller can match
+// this resident view against the Version metadata it already owns.
 Status Version::GetPropertiesOfResidentTables(
     std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>* props) {
   assert(props != nullptr);
-  auto* table_cache = cfd_->table_cache();
-  for (int level = 0; level < storage_info_.num_levels_; level++) {
-    for (const auto& file_meta : storage_info_.files_[level]) {
-      std::shared_ptr<const TableProperties> tp;
-      Status s = table_cache->GetTableProperties(
-          file_options_, cfd_->internal_comparator(), *file_meta, &tp,
-          mutable_cf_options_.prefix_extractor, true /* no_io */);
-      // Incomplete == not in the table cache. Anything else is also just "cannot answer from
-      // memory"; neither is an error for this call.
-      if (s.ok() && tp != nullptr) {
-        (*props)[file_meta->fd.GetNumber()] = std::move(tp);
-      }
+  return cfd_->table_cache()->GetPropertiesOfResidentTables(props);
+}
+
+Status Version::GetBlockCacheKeyPrefixes(
+    const std::vector<uint64_t>& file_numbers,
+    std::unordered_map<uint64_t, std::string>* prefixes) const {
+  assert(prefixes != nullptr);
+  prefixes->clear();
+  prefixes->reserve(file_numbers.size());
+  for (uint64_t file_number : file_numbers) {
+    const FileMetaData* file_meta =
+        storage_info_.GetFileMetaDataByNumber(file_number);
+    if (file_meta == nullptr || file_meta->unique_id == kNullUniqueId64x2) {
+      continue;
+    }
+    UniqueId64x2 unique_id = file_meta->unique_id;
+    OffsetableCacheKey base =
+        OffsetableCacheKey::FromInternalUniqueId(&unique_id);
+    if (!base.IsEmpty()) {
+      (*prefixes)[file_number] = base.CommonPrefixSlice().ToString();
     }
   }
   return Status::OK();
@@ -1820,6 +1822,12 @@ void Version::GetColumnFamilyMetaData(ColumnFamilyMetaData* cf_meta) {
           file->file_checksum_func_name);
       files.back().num_entries = file->num_entries;
       files.back().num_deletions = file->num_deletions;
+      files.back().external_path = file->fd.external_path;
+      if (file->unique_id != kNullUniqueId64x2) {
+        UniqueId64x2 public_unique_id = file->unique_id;
+        InternalUniqueIdToExternal(&public_unique_id);
+        files.back().unique_id = EncodeUniqueIdBytes(&public_unique_id);
+      }
       level_size += file->fd.GetFileSize();
     }
     cf_meta->levels.emplace_back(level, level_size, std::move(files));
@@ -6214,14 +6222,10 @@ Status VersionSet::WriteCurrentStateToManifest(
 
         for (const auto& f : level_files) {
           assert(f);
-
-          edit.AddFile(level, f->fd.GetNumber(), f->fd.GetPathId(),
-                       f->fd.GetFileSize(), f->smallest, f->largest,
-                       f->fd.smallest_seqno, f->fd.largest_seqno,
-                       f->marked_for_compaction, f->temperature,
-                       f->oldest_blob_file_number, f->oldest_ancester_time,
-                       f->file_creation_time, f->file_checksum,
-                       f->file_checksum_func_name, f->unique_id);
+          // Preserve descriptor extensions (notably relink external_path) when
+          // rolling the MANIFEST. Reconstructing FileMetaData field-by-field
+          // silently turns an external SST into a nonexistent local SST.
+          edit.AddFile(level, *f);
         }
       }
 
@@ -6711,6 +6715,12 @@ void VersionSet::GetLiveFilesMetaData(std::vector<LiveFileMetaData>* metadata) {
         filemetadata.temperature = file->temperature;
         filemetadata.oldest_ancester_time = file->TryGetOldestAncesterTime();
         filemetadata.file_creation_time = file->TryGetFileCreationTime();
+        filemetadata.external_path = file->fd.external_path;
+        if (file->unique_id != kNullUniqueId64x2) {
+          UniqueId64x2 public_unique_id = file->unique_id;
+          InternalUniqueIdToExternal(&public_unique_id);
+          filemetadata.unique_id = EncodeUniqueIdBytes(&public_unique_id);
+        }
         metadata->push_back(filemetadata);
       }
     }

@@ -7,7 +7,9 @@
 #ifndef ROCKSDB_LITE
 
 #include <unordered_map>
+#include <vector>
 
+#include "cache/cache_key.h"
 #include "file/random_access_file_reader.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/utilities/cache_dump_load.h"
@@ -91,6 +93,28 @@ struct DumpUnit {
   }
 };
 
+// The warmup stream intentionally has a wire format distinct from the stock
+// cache dump. A receiver that expects this format rejects an old stock stream,
+// and every unit carries the version so a truncated/misaligned stream cannot
+// silently turn a priority byte into some other field. The fixed DumpUnitMeta
+// checksum covers the whole encoded warmup record, including its payload.
+static constexpr uint32_t kCacheWarmupDumpMagic = 0x43575550;  // "CWUP"
+static constexpr uint32_t kCacheWarmupDumpFormatVersion = 1;
+
+enum class CacheWarmupDumpUnitType : unsigned char {
+  kHeader = 1,
+  kData = 2,
+  kFooter = 3,
+};
+
+struct CacheWarmupDumpUnit {
+  CacheWarmupDumpUnitType type = CacheWarmupDumpUnitType::kHeader;
+  Cache::Priority priority = Cache::Priority::LOW;
+  Slice key;
+  size_t value_len = 0;
+  void* value = nullptr;
+};
+
 // The default implementation of the Cache Dumper
 class CacheDumperImpl : public CacheDumper {
  public:
@@ -104,13 +128,27 @@ class CacheDumperImpl : public CacheDumper {
                             const std::vector<std::string>& sst_paths) override;
   Status SetDumpFilterFiles(const TablePropertiesCollection& ptc,
                             const std::vector<std::string>& sst_paths) override;
+  Status SetDumpFilterPrefixes(
+      const std::vector<std::string>& prefixes) override;
   IOStatus DumpCacheEntriesToWriter() override;
+  IOStatus DumpWarmupCacheEntriesToWriter(
+      const CacheWarmupOptions& warmup_options,
+      CacheWarmupTransferStats* warmup_stats) override;
+  const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const override {
+    return warmup_stats_;
+  }
 
  private:
   IOStatus WriteBlock(CacheDumpUnitType type, const Slice& key,
                       const Slice& value);
   IOStatus WriteHeader();
   IOStatus WriteFooter();
+  IOStatus WriteWarmupUnit(CacheWarmupDumpUnitType type,
+                           Cache::Priority priority, const Slice& key,
+                           const Slice& value);
+  IOStatus WriteWarmupEncodedUnit();
+  IOStatus WriteWarmupHeader();
+  IOStatus WriteWarmupFooter();
   bool ShouldFilterOut(const Slice& key);
   std::function<void(const Slice&, void*, size_t, Cache::DeleterFn)>
   DumpOneBlockCallBack();
@@ -121,6 +159,11 @@ class CacheDumperImpl : public CacheDumper {
   UnorderedMap<Cache::DeleterFn, CacheEntryRole> role_map_;
   SystemClock* clock_;
   uint32_t sequence_num_;
+  CacheWarmupTransferStats warmup_stats_;
+  // The warmup stream's reusable owned staging slab. A data record is encoded
+  // here while its source handle is pinned, then the handle is released before
+  // CRC/framing/writer I/O. CacheDumpWriter consumes its Slice synchronously.
+  std::string warmup_encoded_data_;
   // The cache key prefix filter. Currently, we use db_session_id as the prefix,
   // so using std::set to store the prefixes as filter is enough. Further
   // improvement can be applied like BloomFilter or others to speedup the
@@ -151,12 +194,22 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   ~CacheDumpedLoaderImpl() {}
   IOStatus RestoreCacheEntriesToSecondaryCache() override;
   IOStatus RestoreCacheEntriesToPrimaryCache() override;
+  IOStatus RestoreWarmupCacheEntriesToPrimaryCache(
+      const CacheWarmupOptions& warmup_options,
+      CacheWarmupTransferStats* warmup_stats) override;
+  const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const override {
+    return warmup_stats_;
+  }
 
  private:
   IOStatus ReadDumpUnitMeta(std::string* data, DumpUnitMeta* unit_meta);
   IOStatus ReadDumpUnit(size_t len, std::string* data, DumpUnit* unit);
   IOStatus ReadHeader(std::string* data, DumpUnit* dump_unit);
   IOStatus ReadCacheBlock(std::string* data, DumpUnit* dump_unit);
+  IOStatus ReadWarmupUnit(size_t len, std::string* data,
+                          CacheWarmupDumpUnit* unit);
+  IOStatus ReadWarmupHeader(std::string* data, CacheWarmupDumpUnit* unit);
+  IOStatus ReadWarmupCacheBlock(std::string* data, CacheWarmupDumpUnit* unit);
 
   CacheDumpOptions options_;
   const BlockBasedTableOptions& toptions_;
@@ -164,6 +217,7 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   std::shared_ptr<Cache> primary_cache_;  // [relink cache handoff]
   std::unique_ptr<CacheDumpReader> reader_;
   UnorderedMap<Cache::DeleterFn, CacheEntryRole> role_map_;
+  CacheWarmupTransferStats warmup_stats_;
 };
 
 // The default implementation of CacheDumpWriter. We write the blocks to a file
@@ -368,6 +422,131 @@ class CacheDumperHelper {
     }
     dump_unit->value = (void*)block.data();
     assert(block.size() == dump_unit->value_len);
+    return Status::OK();
+  }
+
+  // The explicit on-wire encoding is deliberately independent of the enum's
+  // implementation values. That keeps HIGH/LOW/BOTTOM stable if Cache::Priority
+  // is extended or reordered later.
+  static Status EncodeWarmupPriority(Cache::Priority priority,
+                                     unsigned char* encoded_priority) {
+    assert(encoded_priority != nullptr);
+    switch (priority) {
+      case Cache::Priority::HIGH:
+        *encoded_priority = 1;
+        return Status::OK();
+      case Cache::Priority::LOW:
+        *encoded_priority = 2;
+        return Status::OK();
+      case Cache::Priority::BOTTOM:
+        *encoded_priority = 3;
+        return Status::OK();
+    }
+    return Status::InvalidArgument("unknown cache warmup priority");
+  }
+
+  static Status DecodeWarmupPriority(unsigned char encoded_priority,
+                                     Cache::Priority* priority) {
+    assert(priority != nullptr);
+    switch (encoded_priority) {
+      case 1:
+        *priority = Cache::Priority::HIGH;
+        return Status::OK();
+      case 2:
+        *priority = Cache::Priority::LOW;
+        return Status::OK();
+      case 3:
+        *priority = Cache::Priority::BOTTOM;
+        return Status::OK();
+      default:
+        return Status::Corruption("unknown cache warmup priority");
+    }
+  }
+
+  static Status EncodeWarmupDumpUnit(const CacheWarmupDumpUnit& unit,
+                                     std::string* data) {
+    assert(data != nullptr);
+    if (unit.value_len > UINT32_MAX) {
+      return Status::InvalidArgument("cache warmup entry exceeds wire limit");
+    }
+    unsigned char encoded_priority = 0;
+    Status s = EncodeWarmupPriority(unit.priority, &encoded_priority);
+    if (!s.ok()) {
+      return s;
+    }
+    PutFixed32(data, kCacheWarmupDumpMagic);
+    PutFixed32(data, kCacheWarmupDumpFormatVersion);
+    data->push_back(static_cast<char>(unit.type));
+    data->push_back(static_cast<char>(encoded_priority));
+    PutLengthPrefixedSlice(data, unit.key);
+    PutFixed32(data, static_cast<uint32_t>(unit.value_len));
+    PutLengthPrefixedSlice(
+        data, Slice(static_cast<const char*>(unit.value), unit.value_len));
+    return Status::OK();
+  }
+
+  static Status DecodeWarmupDumpUnit(const std::string& encoded_data,
+                                     CacheWarmupDumpUnit* unit) {
+    assert(unit != nullptr);
+    Slice encoded_slice(encoded_data);
+    uint32_t magic = 0;
+    uint32_t version = 0;
+    if (!GetFixed32(&encoded_slice, &magic) ||
+        !GetFixed32(&encoded_slice, &version)) {
+      return Status::Incomplete("cache warmup unit missing format header");
+    }
+    if (magic != kCacheWarmupDumpMagic) {
+      return Status::Corruption("not a cache warmup stream");
+    }
+    if (version != kCacheWarmupDumpFormatVersion) {
+      return Status::NotSupported("unsupported cache warmup format version");
+    }
+    if (encoded_slice.size() < 2) {
+      return Status::Incomplete("cache warmup unit missing type or priority");
+    }
+    const unsigned char encoded_type =
+        static_cast<unsigned char>(encoded_slice[0]);
+    const unsigned char encoded_priority =
+        static_cast<unsigned char>(encoded_slice[1]);
+    encoded_slice.remove_prefix(2);
+    switch (encoded_type) {
+      case static_cast<unsigned char>(CacheWarmupDumpUnitType::kHeader):
+        unit->type = CacheWarmupDumpUnitType::kHeader;
+        break;
+      case static_cast<unsigned char>(CacheWarmupDumpUnitType::kData):
+        unit->type = CacheWarmupDumpUnitType::kData;
+        break;
+      case static_cast<unsigned char>(CacheWarmupDumpUnitType::kFooter):
+        unit->type = CacheWarmupDumpUnitType::kFooter;
+        break;
+      default:
+        return Status::Corruption("unknown cache warmup unit type");
+    }
+    Status s = DecodeWarmupPriority(encoded_priority, &unit->priority);
+    if (!s.ok()) {
+      return s;
+    }
+    if (!GetLengthPrefixedSlice(&encoded_slice, &unit->key)) {
+      return Status::Incomplete("cache warmup unit missing key");
+    }
+    if (unit->type == CacheWarmupDumpUnitType::kData &&
+        unit->key.size() != kCacheKeySize) {
+      return Status::Corruption(
+          "cache warmup data unit has non-standard cache key size");
+    }
+    uint32_t value_len = 0;
+    if (!GetFixed32(&encoded_slice, &value_len)) {
+      return Status::Incomplete("cache warmup unit missing value metadata");
+    }
+    Slice value;
+    if (!GetLengthPrefixedSlice(&encoded_slice, &value)) {
+      return Status::Incomplete("cache warmup unit missing value");
+    }
+    if (value.size() != value_len || !encoded_slice.empty()) {
+      return Status::Corruption("cache warmup unit has invalid value length");
+    }
+    unit->value_len = value_len;
+    unit->value = const_cast<char*>(value.data());
     return Status::OK();
   }
 };

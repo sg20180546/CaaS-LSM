@@ -76,6 +76,13 @@ class BlockBasedTableFactory : public TableFactory {
 
   bool IsDeleteRangeSupported() const override { return true; }
 
+  bool ShouldCaptureTableCacheWarmup() const override {
+    return table_options_.cache_warmup_metadata_transfer;
+  }
+  size_t TableCacheWarmupMaxBytes() const override {
+    return table_options_.cache_warmup_metadata_max_bytes;
+  }
+
   TailPrefetchStats* tail_prefetch_stats() { return &tail_prefetch_stats_; }
 
  protected:

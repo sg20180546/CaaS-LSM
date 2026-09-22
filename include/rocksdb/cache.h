@@ -305,6 +305,15 @@ class Cache {
   // not set. The "bottom" priority level is for BlobDB's blob values.
   enum class Priority { HIGH, LOW, BOTTOM };
 
+  // Result of an experimental cache-warmup insertion. Policy outcomes are
+  // reported separately from Status so duplicate keys and admission rejection
+  // can be treated as normal, best-effort warmup skips.
+  enum class CacheWarmupInsertResult {
+    kInserted,
+    kDuplicate,
+    kRejectedNoSpace,
+  };
+
   // A set of callbacks to allow objects in the primary block cache to be
   // be persisted in a secondary cache. The purpose of the secondary cache
   // is to support other ways of caching the object, such as persistent or
@@ -345,6 +354,13 @@ class Cache {
   // value. The Cache is responsible for copying and reclaiming space
   // for the key, but values are managed by the caller.
   using DeleterFn = void (*)(const Slice& key, void* value);
+
+  // Metadata exposed by the experimental cache-warmup iterator. The priority
+  // is the entry's effective, current LRU pool rather than merely its priority
+  // at insertion time.
+  using CacheWarmupMetadataCallback =
+      std::function<void(const Slice& key, size_t charge, DeleterFn deleter,
+                         Priority effective_priority)>;
 
   // A struct with pointers to helper functions for spilling items from the
   // cache into the secondary cache. May be extended in the future. An
@@ -537,6 +553,109 @@ class Cache {
       const std::function<void(const Slice& key, void* value, size_t charge,
                                DeleterFn deleter)>& callback,
       const ApplyToAllEntriesOptions& opts) = 0;
+
+  // EXPERIMENTAL cache-warmup APIs. Implementations that do not explicitly
+  // support priority-aware warmup return NotSupported.
+  //
+  // Calls `callback` while holding at most one cache-shard lock. The key is
+  // valid only for the duration of the callback. The callback must be quick
+  // and must not re-enter the cache.
+  virtual Status ApplyToAllEntriesForCacheWarmup(
+      const CacheWarmupMetadataCallback& /*callback*/,
+      const ApplyToAllEntriesOptions& /*opts*/) {
+    return Status::NotSupported(
+        "cache-warmup metadata iteration is not supported");
+  }
+
+  // Looks up and briefly leases a resident primary-cache entry without
+  // recording a hit or changing its recency. A resident entry already pinned
+  // by an ordinary caller can also be leased; a second concurrent warmup lease
+  // is treated as a transient miss. On a miss, returns OK with `*handle ==
+  // nullptr`. On a hit, the caller must promptly call ReleaseForCacheWarmup();
+  // `effective_priority` reports the entry's current/future LRU class. This
+  // call never consults a secondary cache.
+  virtual Status LookupForCacheWarmup(const Slice& /*key*/, Handle** handle,
+                                      Priority* /*effective_priority*/) {
+    if (handle != nullptr) {
+      *handle = nullptr;
+    }
+    return Status::NotSupported("cache-warmup lookup is not supported");
+  }
+
+  // Releases a handle returned by LookupForCacheWarmup(). The priority must be
+  // the value returned by that lookup. Implementations may use it to avoid
+  // promoting an entry merely because warmup briefly pinned it. The default is
+  // safe for implementations without priority pools.
+  virtual bool ReleaseForCacheWarmup(Handle* handle,
+                                     Priority /*effective_priority*/) {
+    return Release(handle);
+  }
+
+  // Attempts an atomic, priority-aware warmup insertion. A duplicate keeps
+  // destination value ownership, but promotes its policy priority when the
+  // normalized incoming priority is higher. Priorities for disabled pools are
+  // first mapped down to the highest configured destination pool. HIGH may
+  // evict only LOW/BOTTOM entries, LOW may evict only BOTTOM entries, and
+  // BOTTOM may use only already-free capacity. If enough unpinned eligible
+  // capacity is unavailable, no entry is evicted.
+  //
+  // The cache takes ownership of `value` only for kInserted. For kDuplicate,
+  // kRejectedNoSpace, or a non-OK Status, the caller retains ownership.
+  virtual Status InsertForCacheWarmup(const Slice& /*key*/, void* /*value*/,
+                                      size_t /*charge*/, DeleterFn /*deleter*/,
+                                      Priority /*priority*/,
+                                      CacheWarmupInsertResult* /*result*/) {
+    return Status::NotSupported("cache-warmup insertion is not supported");
+  }
+
+  // Attempts an atomic warmup insertion without evicting any resident entry.
+  // A new entry is inserted only when its physical shard has enough unused
+  // capacity. Duplicate handling and ownership are the same as for
+  // InsertForCacheWarmup().
+  virtual Status InsertForCacheWarmupNoEvict(
+      const Slice& /*key*/, void* /*value*/, size_t /*charge*/,
+      DeleterFn /*deleter*/, Priority /*priority*/,
+      CacheWarmupInsertResult* /*result*/) {
+    return Status::NotSupported(
+        "non-evicting cache-warmup insertion is not supported");
+  }
+
+  // Atomically replaces one explicit resident victim with an incoming warmup
+  // entry. Both keys must map to the same cache shard. Implementations must
+  // leave the victim untouched unless the incoming key is absent, the victim
+  // is resident and unpinned, and the replacement fits. A duplicate preserves
+  // destination ownership, as with InsertForCacheWarmup().
+  virtual Status ReplaceForCacheWarmup(const Slice& /*victim_key*/,
+                                       const Slice& /*key*/, void* /*value*/,
+                                       size_t /*charge*/, DeleterFn /*deleter*/,
+                                       Priority /*priority*/,
+                                       CacheWarmupInsertResult* /*result*/) {
+    return Status::NotSupported("cache-warmup replacement is not supported");
+  }
+
+  // Promotes an existing resident entry to the requested policy priority
+  // without replacing its value or transferring ownership. Implementations
+  // normalize the requested priority to their configured pools. Promotion of
+  // a pinned entry may be deferred until it becomes evictable.
+  virtual Status PromoteForCacheWarmup(const Slice& /*key*/,
+                                       Priority /*priority*/) {
+    return Status::NotSupported("cache-warmup promotion is not supported");
+  }
+
+  // Read-only physical-shard information for planning warmup admission. The
+  // capacity and usage values use the same charge units as GetCapacity() and
+  // GetUsage(). The defaults model an unsharded cache. An out-of-range shard
+  // index reports zero capacity and usage.
+  virtual size_t GetCacheWarmupShardCount() const { return 1; }
+  virtual size_t GetCacheWarmupShardIndex(const Slice& /*key*/) const {
+    return 0;
+  }
+  virtual size_t GetCacheWarmupShardCapacity(size_t shard_index) const {
+    return shard_index == 0 ? GetCapacity() : 0;
+  }
+  virtual size_t GetCacheWarmupShardUsage(size_t shard_index) const {
+    return shard_index == 0 ? GetUsage() : 0;
+  }
 
   // DEPRECATED version of above. (Default implementation uses above.)
   virtual void ApplyToAllCacheEntries(void (*callback)(void* value,

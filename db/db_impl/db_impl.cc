@@ -22,10 +22,12 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "db/arena_wrapped_db_iter.h"
+#include "db/bucket_util.h"  // [BucketLSM] BucketOf / BucketBoundaries (SetBucketBoundaries)
 #include "db/builder.h"
 #include "db/compaction/compaction_job.h"
 #include "db/db_info_dumper.h"
@@ -50,7 +52,6 @@
 #include "db/table_cache.h"
 #include "db/table_properties_collector.h"
 #include "db/transaction_log_impl.h"
-#include "db/bucket_util.h"  // [BucketLSM] BucketOf / BucketBoundaries (SetBucketBoundaries)
 #include "db/version_set.h"
 #include "db/write_batch_internal.h"
 #include "db/write_callback.h"
@@ -79,9 +80,9 @@
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/merge_operator.h"
+#include "rocksdb/sst_file_reader.h"  // [relink] RegisterExternalFileInPlace
 #include "rocksdb/statistics.h"
 #include "rocksdb/stats_history.h"
-#include "rocksdb/sst_file_reader.h"  // [relink] RegisterExternalFileInPlace
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"
 #include "rocksdb/version.h"
@@ -3747,6 +3748,30 @@ Status DBImpl::GetPropertiesOfResidentTables(
   return s;
 }
 
+Status DBImpl::GetBlockCacheKeyPrefixes(
+    ColumnFamilyHandle* column_family,
+    const std::vector<uint64_t>& file_numbers,
+    std::unordered_map<uint64_t, std::string>* prefixes) {
+  if (column_family == nullptr || prefixes == nullptr) {
+    return Status::InvalidArgument(
+        "column_family and prefixes must not be null");
+  }
+  auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
+  auto cfd = cfh->cfd();
+
+  mutex_.Lock();
+  auto version = cfd->current();
+  version->Ref();
+  mutex_.Unlock();
+
+  auto s = version->GetBlockCacheKeyPrefixes(file_numbers, prefixes);
+
+  mutex_.Lock();
+  version->Unref();
+  mutex_.Unlock();
+  return s;
+}
+
 Status DBImpl::GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                         TablePropertiesCollection* props) {
   auto cfh = static_cast_with_check<ColumnFamilyHandleImpl>(column_family);
@@ -5472,12 +5497,39 @@ Status DBImpl::IngestExternalFiles(
   return status;
 }
 
-// [relink] Register an existing SST into this CF's MANIFEST at `level`, applying a
-// per-file GSN (global_seqno) that overrides ALL of the file's keys' seqno at read
-// time. NO data copy: the file is moved into the DB dir via FileSystem::RenameFile
-// (metadata-only on HDFS). Additive/opt-in for key-group migration (relink); stock
-// ingest/flush/compaction are untouched. NOTE: the GSN is applied in-memory only here
-// (not yet persisted in the MANIFEST -> lost on restart; recovery is future work).
+namespace {
+
+// Converts the public SST ID carried by the relink API to the private format
+// stored in FileMetaData/VersionEdit. Empty is the legacy "ID unavailable"
+// value. The all-zero ID is reserved as RocksDB's internal null sentinel and
+// must never be accepted as a real file identity.
+Status DecodeExternalFileUniqueId(const std::string& public_unique_id,
+                                  UniqueId64x2* internal_unique_id) {
+  assert(internal_unique_id != nullptr);
+  *internal_unique_id = kNullUniqueId64x2;
+  if (public_unique_id.empty()) {
+    return Status::OK();
+  }
+  Status s = DecodeUniqueIdBytes(public_unique_id, internal_unique_id);
+  if (!s.ok()) {
+    return Status::InvalidArgument(
+        "SST unique_id must be empty or exactly 16 binary bytes");
+  }
+  ExternalUniqueIdToInternal(internal_unique_id);
+  if (*internal_unique_id == kNullUniqueId64x2) {
+    return Status::InvalidArgument("SST unique_id must not be all zero");
+  }
+  return Status::OK();
+}
+
+}  // namespace
+
+// [relink] Register an existing SST into this CF's MANIFEST at `level`,
+// applying a per-file GSN (global_seqno) that overrides ALL of the file's keys'
+// seqno at read time. NO data copy: the file is moved into the DB dir via
+// FileSystem::RenameFile (metadata-only on HDFS). Additive/opt-in for key-group
+// migration (relink); stock ingest/flush/compaction are untouched. The GSN and
+// external path are persisted as NewFile4 custom fields in the MANIFEST.
 Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
                                            const std::string& external_file,
                                            int level,
@@ -5497,6 +5549,20 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
   Status s = reader.Open(external_file);
   if (!s.ok()) {
     return s;
+  }
+
+  // This path already opens the table, so preserve its stable identity too.
+  // Older SSTs legitimately lack the properties needed for a unique ID; those
+  // retain the null MANIFEST ID and the historical cache-key behavior.
+  UniqueId64x2 unique_id{};
+  std::shared_ptr<const TableProperties> table_properties =
+      reader.GetTableProperties();
+  if (table_properties != nullptr &&
+      !GetSstInternalUniqueId(table_properties->db_id,
+                              table_properties->db_session_id,
+                              table_properties->orig_file_number, &unique_id)
+           .ok()) {
+    unique_id = kNullUniqueId64x2;
   }
 
   uint64_t file_size = 0;
@@ -5522,26 +5588,29 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
     smallest_user.assign(it->key().data(), it->key().size());
     it->SeekToLast();
     if (!it->Valid()) {
-      return it->status().ok()
-                 ? Status::Corruption("RegisterExternalFileInPlace: no last key")
-                 : it->status();
+      return it->status().ok() ? Status::Corruption(
+                                     "RegisterExternalFileInPlace: no last key")
+                               : it->status();
     }
     largest_user.assign(it->key().data(), it->key().size());
   }
 
-  // ---- 2. Allocate a file number; reference the file IN PLACE (no rename). ----
-  // [relink] The SST physically stays at `external_file` (a possibly cross-dir
-  // absolute HDFS path). We record that path on the FileDescriptor below so the
-  // table cache opens it directly. The allocated file_number is still used for
-  // MANIFEST identity / metadata only; no file is created at the in-DB path.
+  // ---- 2. Allocate a file number; reference the file IN PLACE (no rename).
+  // ---- [relink] The SST physically stays at `external_file` (a possibly
+  // cross-dir absolute HDFS path). We record that path on the FileDescriptor
+  // below so the table cache opens it directly. The allocated file_number is
+  // still used for MANIFEST identity / metadata only; no file is created at the
+  // in-DB path.
   uint64_t file_number = versions_->NewFileNumber();
 
-  // ---- 3. Build FileMetaData with the per-file GSN; commit to the MANIFEST. ----
-  // All keys are overridden to `global_seqno` at read time, so the bounds use it too.
-  InternalKey smallest_ikey(Slice(smallest_user), global_seqno, kValueTypeForSeek);
-  InternalKey largest_ikey(Slice(largest_user), global_seqno, kValueTypeForSeek);
+  // ---- 3. Build FileMetaData with the per-file GSN; commit to the MANIFEST.
+  // ---- All keys are overridden to `global_seqno` at read time, so the bounds
+  // use it too.
+  InternalKey smallest_ikey(Slice(smallest_user), global_seqno,
+                            kValueTypeForSeek);
+  InternalKey largest_ikey(Slice(largest_user), global_seqno,
+                           kValueTypeForSeek);
 
-  UniqueId64x2 unique_id{};
   FileMetaData f_meta(file_number, 0 /* path_id */, file_size, smallest_ikey,
                       largest_ikey, global_seqno /* smallest_seqno */,
                       global_seqno /* largest_seqno */,
@@ -5550,7 +5619,8 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
                       0 /* file_creation_time */, /*file_checksum=*/"",
                       /*file_checksum_func_name=*/"", unique_id);
   f_meta.fd.global_seqno_override = global_seqno;  // [relink] per-file GSN
-  f_meta.fd.external_path = external_file;  // [relink] reference in place (no rename)
+  f_meta.fd.external_path =
+      external_file;  // [relink] reference in place (no rename)
 
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
@@ -5561,10 +5631,11 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
     s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                &mutex_, directories_.GetDbDir());
     if (s.ok()) {
-      // The registered keys exist at seqno `global_seqno`; ensure the DB's sequence
-      // covers it so reads can observe them (mirrors ingestion consuming seqnos). In
-      // the real relink protocol the GSN is preallocated <= last_sequence, so this is
-      // usually a no-op; we only ever advance, never rewind, the sequence.
+      // The registered keys exist at seqno `global_seqno`; ensure the DB's
+      // sequence covers it so reads can observe them (mirrors ingestion
+      // consuming seqnos). In the real relink protocol the GSN is preallocated
+      // <= last_sequence, so this is usually a no-op; we only ever advance,
+      // never rewind, the sequence.
       if (global_seqno != kDisableGlobalSequenceNumber &&
           global_seqno > versions_->LastSequence()) {
         versions_->SetLastAllocatedSequence(global_seqno);
@@ -5586,10 +5657,11 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
   return s;
 }
 
-// [relink §21] BATCH register: N files in ONE VersionEdit + ONE LogAndApply (1 fsync for
-// all, vs 1 per file). When a file supplies user-key bounds + size, its HDFS open is
-// skipped (the relink src already knows them). Builds each FileMetaData exactly like the
-// single RegisterExternalFileInPlace above, then commits them together.
+// [relink §21] BATCH register: N files in ONE VersionEdit + ONE LogAndApply (1
+// fsync for all, vs 1 per file). When a file supplies user-key bounds + size,
+// its HDFS open is skipped (the relink src already knows them). Builds each
+// FileMetaData exactly like the single RegisterExternalFileInPlace above, then
+// commits them together.
 Status DBImpl::RegisterExternalFilesInPlace(
     ColumnFamilyHandle* column_family,
     const std::vector<ExternalFileForRegister>& files) {
@@ -5597,16 +5669,18 @@ Status DBImpl::RegisterExternalFilesInPlace(
     return Status::InvalidArgument("column_family must not be null");
   }
   if (files.empty()) return Status::OK();
-  // [relink no-preload 2026-09-20] The relink path requires a FINITE max_open_files. With
-  // max_open_files == -1 the table cache is created with TableCache::kInfiniteCapacity
-  // (see the DBImpl constructor), which means (a) nothing is ever evicted, so the table
-  // cache is an unbounded pile of pinned per-file index blocks outside the block cache
-  // budget, and (b) VersionBuilder::LoadTableHandlers takes its always_load branch.
-  // Neither is compatible with a table-cache admission policy, and carrying both regimes
-  // was a standing source of confusion. Refuse loudly instead of silently degrading.
-  // Scope: this check is deliberately ONLY on the relink registration entry point. Plain
-  // DB::Open, db_bench and the remote-compaction agent (which default-constructs Options,
-  // where max_open_files is -1) are untouched.
+  // [relink no-preload 2026-09-20] The relink path requires a FINITE
+  // max_open_files. With max_open_files == -1 the table cache is created with
+  // TableCache::kInfiniteCapacity (see the DBImpl constructor), which means (a)
+  // nothing is ever evicted, so the table cache is an unbounded pile of pinned
+  // per-file index blocks outside the block cache budget, and (b)
+  // VersionBuilder::LoadTableHandlers takes its always_load branch. Neither is
+  // compatible with a table-cache admission policy, and carrying both regimes
+  // was a standing source of confusion. Refuse loudly instead of silently
+  // degrading. Scope: this check is deliberately ONLY on the relink
+  // registration entry point. Plain DB::Open, db_bench and the
+  // remote-compaction agent (which default-constructs Options, where
+  // max_open_files is -1) are untouched.
   if (table_cache_ != nullptr &&
       table_cache_->GetCapacity() >= TableCache::kInfiniteCapacity) {
     return Status::InvalidArgument(
@@ -5625,9 +5699,16 @@ Status DBImpl::RegisterExternalFilesInPlace(
     std::string smallest_user = fr.smallest_user;
     std::string largest_user = fr.largest_user;
     uint64_t file_size = fr.file_size;
+    UniqueId64x2 unique_id{};
+    Status unique_id_status =
+        DecodeExternalFileUniqueId(fr.unique_id, &unique_id);
+    if (!unique_id_status.ok()) {
+      return unique_id_status;
+    }
 
-    // [§21 opt3] Skip the per-file HDFS open iff the caller supplied bounds + size;
-    // otherwise read them from the file (fallback, identical to the single API).
+    // [§21 opt3] Skip the per-file HDFS open iff the caller supplied bounds +
+    // size; otherwise read them from the file (fallback, identical to the
+    // single API).
     if (smallest_user.empty() || largest_user.empty() || file_size == 0) {
       Options ropts;
       ropts.env = env_;
@@ -5636,6 +5717,27 @@ Status DBImpl::RegisterExternalFilesInPlace(
       SstFileReader reader(ropts);
       Status os = reader.Open(fr.external_file);
       if (!os.ok()) return os;
+
+      // When the fallback has already paid to open the file, derive a missing
+      // ID from its properties or validate a supplied ID against them. The
+      // metadata-complete fast path intentionally performs no such file I/O.
+      std::shared_ptr<const TableProperties> table_properties =
+          reader.GetTableProperties();
+      if (table_properties != nullptr) {
+        UniqueId64x2 actual_unique_id{};
+        Status actual_id_status = GetSstInternalUniqueId(
+            table_properties->db_id, table_properties->db_session_id,
+            table_properties->orig_file_number, &actual_unique_id);
+        if (actual_id_status.ok()) {
+          if (!fr.unique_id.empty() && unique_id != actual_unique_id) {
+            return Status::Corruption(
+                "RegisterExternalFilesInPlace: supplied SST unique_id does "
+                "not match table properties for ",
+                fr.external_file);
+          }
+          unique_id = actual_unique_id;
+        }
+      }
       if (file_size == 0) {
         IOOptions io_opts;
         os = fs_->GetFileSize(fr.external_file, io_opts, &file_size, nullptr);
@@ -5648,14 +5750,16 @@ Status DBImpl::RegisterExternalFilesInPlace(
         it->SeekToFirst();
         if (!it->Valid()) {
           return it->status().ok()
-                     ? Status::Corruption("RegisterExternalFilesInPlace: empty SST")
+                     ? Status::Corruption(
+                           "RegisterExternalFilesInPlace: empty SST")
                      : it->status();
         }
         smallest_user.assign(it->key().data(), it->key().size());
         it->SeekToLast();
         if (!it->Valid()) {
           return it->status().ok()
-                     ? Status::Corruption("RegisterExternalFilesInPlace: no last key")
+                     ? Status::Corruption(
+                           "RegisterExternalFilesInPlace: no last key")
                      : it->status();
         }
         largest_user.assign(it->key().data(), it->key().size());
@@ -5667,20 +5771,21 @@ Status DBImpl::RegisterExternalFilesInPlace(
                               kValueTypeForSeek);
     InternalKey largest_ikey(Slice(largest_user), fr.global_seqno,
                              kValueTypeForSeek);
-    UniqueId64x2 unique_id{};
-    FileMetaData f_meta(file_number, 0 /* path_id */, file_size, smallest_ikey,
-                        largest_ikey, fr.global_seqno /* smallest_seqno */,
-                        fr.global_seqno /* largest_seqno */,
-                        false /* marked_for_compaction */, Temperature::kUnknown,
-                        kInvalidBlobFileNumber, fr.oldest_ancester_time,
-                        fr.file_creation_time, /*file_checksum=*/"",
-                        /*file_checksum_func_name=*/"", unique_id);
+    FileMetaData f_meta(
+        file_number, 0 /* path_id */, file_size, smallest_ikey, largest_ikey,
+        fr.global_seqno /* smallest_seqno */,
+        fr.global_seqno /* largest_seqno */, false /* marked_for_compaction */,
+        Temperature::kUnknown, kInvalidBlobFileNumber, fr.oldest_ancester_time,
+        fr.file_creation_time, /*file_checksum=*/"",
+        /*file_checksum_func_name=*/"", unique_id);
     f_meta.fd.global_seqno_override = fr.global_seqno;  // [relink] per-file GSN
     f_meta.fd.external_path = fr.external_file;  // [relink] reference in place
-    // [relink fast-register 2026-09-19] Adopt the source's table stats when it supplied them.
-    // Without this the destination reads the properties block off HDFS per file, first eagerly
-    // inside LogAndApply and again in MaybeInitializeFileMetaData. num_entries == 0 means the
-    // caller sent nothing (old sender / memtable SST) => leave the flag false and read as before.
+    // [relink fast-register 2026-09-19] Adopt the source's table stats when it
+    // supplied them. Without this the destination reads the properties block
+    // off HDFS per file, first eagerly inside LogAndApply and again in
+    // MaybeInitializeFileMetaData. num_entries == 0 means the caller sent
+    // nothing (old sender / memtable SST) => leave the flag false and read as
+    // before.
     if (fr.num_entries > 0) {
       f_meta.num_entries = fr.num_entries;
       f_meta.num_deletions = fr.num_deletions;
@@ -5730,91 +5835,667 @@ Status DBImpl::RegisterExternalFilesInPlace(
   return s;
 }
 
-// [relink tail-preload 2026-09-20] See rocksdb/db.h for the contract. Two things
-// happen here and they are deliberately separate:
-//   1. every shipped tail is handed to the table cache, so that ANY later open of
-//      that file -- this warm-up, or an ordinary read that races ahead of it --
-//      is served from memory instead of shared storage;
-//   2. the readers are materialised in the caller's order, which is what turns
-//      "deepest level first" into the LRU eviction ladder.
-// Step 1 alone is already worth it; step 2 is what makes the level policy real.
-Status DBImpl::InstallExternalTableTails(ColumnFamilyHandle* column_family,
-                                         std::vector<ExternalTableTail>&& tails) {
+Status DBImpl::StreamTableCacheWarmupEntries(
+    ColumnFamilyHandle* column_family,
+    const std::vector<TableCacheWarmupRequest>& files, size_t max_entry_bytes,
+    const TableCacheWarmupEntryCallback& callback,
+    TableCacheWarmupTransferStats* stats) {
+  if (!callback) {
+    return Status::InvalidArgument(
+        "table-cache warmup callback must be provided");
+  }
+  std::vector<TableCacheWarmupSnapshotEntry> snapshots;
+  TableCacheWarmupTransferStats local_stats;
+  Status s = SnapshotTableCacheWarmupEntries(
+      column_family, files, max_entry_bytes, &snapshots, &local_stats);
+  if (!s.ok()) {
+    if (stats != nullptr) {
+      *stats = local_stats;
+    }
+    return s;
+  }
+
+  local_stats.copied = 0;
+  local_stats.payload_bytes = 0;
+  for (const auto& snapshot : snapshots) {
+    ExternalTableCacheEntry entry;
+    entry.external_file = snapshot.external_file;
+    entry.file_size = snapshot.file_size;
+    entry.unique_id = snapshot.unique_id;
+    entry.ranges.reserve(snapshot.ranges.size());
+    size_t entry_bytes = 0;
+    for (const auto& range : snapshot.ranges) {
+      if (range.data == nullptr) {
+        s = Status::Corruption("table-cache warmup snapshot lost its payload");
+        break;
+      }
+      ExternalTableCacheRange copied;
+      copied.offset = range.offset;
+      copied.data = *range.data;
+      entry_bytes += copied.data.size();
+      entry.ranges.emplace_back(std::move(copied));
+    }
+    if (!s.ok()) {
+      break;
+    }
+    s = callback(std::move(entry));
+    if (!s.ok()) {
+      break;
+    }
+    ++local_stats.copied;
+    local_stats.payload_bytes += entry_bytes;
+  }
+  if (stats != nullptr) {
+    *stats = local_stats;
+  }
+  return s;
+}
+
+Status DBImpl::SnapshotTableCacheWarmupEntries(
+    ColumnFamilyHandle* column_family,
+    const std::vector<TableCacheWarmupRequest>& files, size_t max_entry_bytes,
+    std::vector<TableCacheWarmupSnapshotEntry>* entries,
+    TableCacheWarmupTransferStats* stats) {
+  TableCacheWarmupTransferStats local_stats;
+  local_stats.requested = files.size();
+  if (stats != nullptr) {
+    *stats = local_stats;
+  }
   if (column_family == nullptr) {
     return Status::InvalidArgument("column_family must not be null");
   }
-  if (tails.empty()) return Status::OK();
+  if (entries == nullptr) {
+    return Status::InvalidArgument(
+        "table-cache warmup snapshot output must not be null");
+  }
+  entries->clear();
+  if (max_entry_bytes == 0) {
+    return Status::InvalidArgument(
+        "table-cache warmup max entry bytes must be nonzero");
+  }
+
+  auto* cfd =
+      static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
+  TableCache* table_cache = cfd->table_cache();
+  SuperVersion* sv = GetAndRefSuperVersion(cfd);
+  const VersionStorageInfo* vstorage = sv->current->storage_info();
+  std::unordered_map<uint64_t, std::string> current_paths;
+  std::unordered_map<uint64_t, std::string> current_unique_ids;
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    for (FileMetaData* file : vstorage->LevelFiles(level)) {
+      std::string path =
+          file->fd.external_path.empty()
+              ? TableFileName(cfd->ioptions()->cf_paths, file->fd.GetNumber(),
+                              file->fd.GetPathId())
+              : file->fd.external_path;
+      current_paths.emplace(file->fd.GetNumber(), path);
+      std::string public_unique_id;
+      if (file->unique_id != kNullUniqueId64x2) {
+        UniqueId64x2 converted = file->unique_id;
+        InternalUniqueIdToExternal(&converted);
+        public_unique_id = EncodeUniqueIdBytes(&converted);
+      }
+      current_unique_ids.emplace(file->fd.GetNumber(),
+                                 std::move(public_unique_id));
+    }
+  }
+
+  std::vector<std::pair<uint64_t, std::string>> internal_files;
+  internal_files.reserve(files.size());
+  for (const auto& file : files) {
+    auto current = current_paths.find(file.file_number);
+    if (current == current_paths.end()) {
+      continue;
+    }
+    if (!file.external_file.empty() && file.external_file != current->second) {
+      ReturnAndCleanupSuperVersion(cfd, sv);
+      return Status::InvalidArgument(
+          "table-cache warmup source file number/path mismatch");
+    }
+    internal_files.emplace_back(file.file_number, current->second);
+  }
+
+  std::vector<TableCacheWarmupSnapshotInternal> internal_entries;
+  TableCacheWarmupSourceStats source_stats;
+  Status s = table_cache->SnapshotTableCacheWarmupEntries(
+      internal_files, max_entry_bytes, &internal_entries, &source_stats);
+  ReturnAndCleanupSuperVersion(cfd, sv);
+  if (s.ok()) {
+    entries->reserve(internal_entries.size());
+    for (const auto& internal : internal_entries) {
+      TableCacheWarmupSnapshotEntry entry;
+      entry.external_file = internal.external_file;
+      entry.file_size = internal.bundle->file_size;
+      auto unique_id = current_unique_ids.find(internal.file_number);
+      assert(unique_id != current_unique_ids.end());
+      entry.unique_id = unique_id->second;
+      entry.ranges.reserve(internal.bundle->ranges.size());
+      for (const auto& range : internal.bundle->ranges) {
+        TableCacheWarmupSnapshotRange external_range;
+        external_range.offset = range.offset;
+        external_range.data = std::shared_ptr<const std::string>(
+            internal.bundle, &range.data);
+        entry.ranges.emplace_back(std::move(external_range));
+      }
+      entries->emplace_back(std::move(entry));
+    }
+  }
+
+  local_stats.resident = source_stats.resident;
+  local_stats.copied = source_stats.copied;
+  local_stats.payload_bytes = source_stats.bytes;
+  local_stats.skipped_busy = source_stats.skipped_busy;
+  local_stats.skipped_unavailable = source_stats.skipped_unavailable;
+  local_stats.skipped_too_large = source_stats.skipped_too_large;
+  local_stats.skipped_not_current = files.size() - internal_files.size();
+  if (stats != nullptr) {
+    *stats = local_stats;
+  }
+  return s;
+}
+
+Status DBImpl::InstallExternalTableCacheEntries(
+    ColumnFamilyHandle* column_family,
+    std::vector<ExternalTableCacheEntry>&& entries, size_t max_entry_bytes,
+    TableCacheWarmupTransferStats* stats) {
+  if (column_family == nullptr) {
+    return Status::InvalidArgument("column_family must not be null");
+  }
+  if (max_entry_bytes == 0) {
+    return Status::InvalidArgument(
+        "table-cache warmup max entry bytes must be nonzero");
+  }
+  TableCacheWarmupTransferStats local_stats;
+  local_stats.received = entries.size();
+  if (stats != nullptr) {
+    *stats = local_stats;
+  }
+  if (entries.empty()) {
+    return Status::OK();
+  }
+
   auto* cfd =
       static_cast_with_check<ColumnFamilyHandleImpl>(column_family)->cfd();
   TableCache* table_cache = cfd->table_cache();
 
-  table_cache->SetLevelPriority(true);
-  std::vector<std::pair<uint64_t, int>> order;  // (file number, level)
-  order.reserve(tails.size());
-  size_t tail_bytes = 0;
-  for (auto& t : tails) {
-    tail_bytes += t.tail.size();
-    order.emplace_back(t.file_number, t.level);
-    table_cache->AddPendingTail(t.file_number, t.tail_offset, std::move(t.tail));
-  }
-
-  // Hold a SuperVersion reference so the FileMetaData pointers stay alive for the
-  // whole walk. Opening happens outside the DB mutex on purpose: this is real
-  // parsing work and it runs after the shard has resumed serving.
+  // Hold the Version while ranking and materialising readers. Parsing and
+  // reader construction do not hold the DB mutex; only the short final
+  // CURRENT revalidation + cache mutation does.
   SuperVersion* sv = GetAndRefSuperVersion(cfd);
   const VersionStorageInfo* vstorage = sv->current->storage_info();
-  std::unordered_map<uint64_t, std::pair<FileMetaData*, int>> by_number;
-  for (int level = 0; level < vstorage->num_levels(); level++) {
-    for (FileMetaData* f : vstorage->LevelFiles(level)) {
-      by_number[f->fd.GetNumber()] = std::make_pair(f, level);
+  struct CurrentFile {
+    FileMetaData* metadata;
+    int level;
+  };
+  std::unordered_map<std::string, CurrentFile> by_external_file;
+  std::unordered_set<std::string> ambiguous_external_files;
+  std::unordered_map<uint64_t, CurrentFile> by_number;
+  for (int level = 0; level < vstorage->num_levels(); ++level) {
+    for (FileMetaData* file : vstorage->LevelFiles(level)) {
+      CurrentFile current{file, level};
+      by_number.emplace(file->fd.GetNumber(), current);
+      if (!file->fd.external_path.empty()) {
+        if (ambiguous_external_files.find(file->fd.external_path) !=
+            ambiguous_external_files.end()) {
+          continue;
+        }
+        auto inserted =
+            by_external_file.emplace(file->fd.external_path, current);
+        if (!inserted.second) {
+          // A path alone cannot identify which CURRENT SST the received
+          // metadata belongs to. Do not silently pick the first file.
+          by_external_file.erase(inserted.first);
+          ambiguous_external_files.insert(file->fd.external_path);
+        }
+      }
     }
   }
 
-  size_t warmed = 0, skipped = 0;
-  for (const auto& entry : order) {
-    auto it = by_number.find(entry.first);
-    if (it == by_number.end()) {
-      // Compacted away or never registered. Not an error.
-      ++skipped;
+  std::vector<uint64_t> resident_numbers;
+  table_cache->GetResidentFileNumbers(&resident_numbers);
+  std::unordered_set<uint64_t> resident_set(resident_numbers.begin(),
+                                            resident_numbers.end());
+
+  struct Candidate {
+    uint64_t file_number;
+    int level;
+    bool existing;
+    size_t incoming_index;
+    size_t shard;
+  };
+  const size_t shard_count = table_cache->GetCacheWarmupShardCount();
+  if (shard_count == 0) {
+    ReturnAndCleanupSuperVersion(cfd, sv);
+    return Status::Corruption("table cache reports zero shards");
+  }
+  std::vector<std::vector<Candidate>> candidates_by_shard(shard_count);
+  std::vector<size_t> known_resident_by_shard(shard_count, 0);
+  for (uint64_t file_number : resident_numbers) {
+    auto current = by_number.find(file_number);
+    if (current == by_number.end()) {
       continue;
     }
-    FileMetaData* fmeta = it->second.first;
-    const int level = it->second.second;
-    if (fmeta->table_reader_handle != nullptr) {
-      ++skipped;  // already open and pinned; nothing to do and nothing to unpin
+    const size_t shard = table_cache->GetCacheWarmupShardIndex(file_number);
+    if (shard >= shard_count) {
       continue;
     }
-    Cache::Handle* handle = nullptr;
-    Status s = table_cache->FindTable(
-        ReadOptions(), file_options_, cfd->internal_comparator(), *fmeta,
-        &handle, sv->mutable_cf_options.prefix_extractor, false /* no_io */,
-        true /* record_read_stats */,
-        cfd->internal_stats()->GetFileReadHist(level), false /* skip_filters */,
-        level, true /* prefetch_index_and_filter_in_cache */,
-        MaxFileSizeForL0MetaPin(sv->mutable_cf_options), fmeta->temperature);
-    if (s.ok() && handle != nullptr) {
-      // Release immediately. The entry joins the LRU list at THIS instant, which
-      // is what makes the caller's deepest-first order the eviction ladder. Do
-      // NOT stash it in FileMetaData::table_reader_handle: that would pin the
-      // entry out of the LRU list entirely and defeat the whole policy (and
-      // un-pinning it later is the one operation that is genuinely unsafe, since
-      // FileDescriptor::table_reader is copied by value into every Version's
-      // level-files brief).
-      table_cache->ReleaseHandle(handle);
-      ++warmed;
-    } else {
-      ++skipped;
+    ++known_resident_by_shard[shard];
+    candidates_by_shard[shard].push_back(
+        {file_number, current->second.level, true, entries.size(), shard});
+  }
+
+  Status first_error;
+  std::unordered_set<uint64_t> seen_incoming;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    auto& entry = entries[i];
+    if (ambiguous_external_files.find(entry.external_file) !=
+        ambiguous_external_files.end()) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error = Status::Corruption(
+            "table-cache warmup path matches multiple CURRENT SSTs");
+      }
+      continue;
+    }
+    auto current = by_external_file.find(entry.external_file);
+    if (current == by_external_file.end()) {
+      ++local_stats.skipped_not_current;
+      continue;
+    }
+    FileMetaData* file = current->second.metadata;
+    const uint64_t file_number = file->fd.GetNumber();
+    if (resident_set.find(file_number) != resident_set.end() ||
+        file->table_reader_handle != nullptr) {
+      ++local_stats.duplicate;
+      continue;
+    }
+
+    UniqueId64x2 incoming_unique_id{};
+    Status unique_id_status =
+        DecodeExternalFileUniqueId(entry.unique_id, &incoming_unique_id);
+    if (!unique_id_status.ok() || incoming_unique_id != file->unique_id) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error = !unique_id_status.ok()
+                          ? unique_id_status
+                          : Status::Corruption(
+                                "table-cache warmup SST identity mismatch");
+      }
+      continue;
+    }
+
+    bool valid =
+        entry.file_size == file->fd.GetFileSize() && !entry.ranges.empty();
+    size_t entry_bytes = 0;
+    std::sort(entry.ranges.begin(), entry.ranges.end(),
+              [](const ExternalTableCacheRange& lhs,
+                 const ExternalTableCacheRange& rhs) {
+                return lhs.offset < rhs.offset;
+              });
+    uint64_t previous_end = 0;
+    bool have_previous = false;
+    for (const auto& range : entry.ranges) {
+      if (range.data.empty() || range.offset > entry.file_size ||
+          range.data.size() > entry.file_size - range.offset ||
+          range.data.size() > max_entry_bytes - entry_bytes ||
+          (have_previous && range.offset < previous_end)) {
+        valid = false;
+        break;
+      }
+      entry_bytes += range.data.size();
+      previous_end = range.offset + range.data.size();
+      have_previous = true;
+    }
+    if (!valid) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error = Status::InvalidArgument(
+            "invalid table-cache warmup entry for current SST");
+      }
+      continue;
+    }
+    local_stats.payload_bytes += entry_bytes;
+    if (!seen_incoming.insert(file_number).second) {
+      ++local_stats.duplicate;
+      continue;
+    }
+    const size_t shard = table_cache->GetCacheWarmupShardIndex(file_number);
+    if (shard >= shard_count) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error =
+            Status::Corruption("table cache returned an invalid shard index");
+      }
+      continue;
+    }
+    candidates_by_shard[shard].push_back(
+        {file_number, current->second.level, false, i, shard});
+  }
+
+  // Destination CURRENT levels are authoritative. L0 wins L1, and so on;
+  // destination-owned entries win an equal-level tie. Plan independently per
+  // physical shard: spare capacity in one shard cannot admit a key hashing to
+  // another. Usage not attributable to this CF is reserved and never selected
+  // as a victim.
+  std::vector<Candidate> incoming_winners;
+  std::vector<Candidate> existing_winners;
+  std::vector<std::vector<Candidate>> victims_by_shard(shard_count);
+  std::vector<std::unique_ptr<TableReader>> prepared_readers(entries.size());
+  auto prepare_incoming = [&](const Candidate& candidate) {
+    auto& entry = entries[candidate.incoming_index];
+    auto bundle = std::make_shared<TableCacheWarmupBundle>();
+    bundle->file_size = entry.file_size;
+    bundle->ranges.reserve(entry.ranges.size());
+    for (auto& range : entry.ranges) {
+      TableCacheWarmupRange internal_range;
+      internal_range.offset = range.offset;
+      internal_range.data = std::move(range.data);
+      bundle->ranges.emplace_back(std::move(internal_range));
+    }
+
+    auto current = by_number.find(candidate.file_number);
+    assert(current != by_number.end());
+    FileMetaData* file = current->second.metadata;
+    const int level = current->second.level;
+    Status s = table_cache->PrepareTableReaderForWarmup(
+        file_options_, cfd->internal_comparator(), *file,
+        sv->mutable_cf_options.prefix_extractor,
+        cfd->internal_stats()->GetFileReadHist(level), level,
+        MaxFileSizeForL0MetaPin(sv->mutable_cf_options), std::move(bundle),
+        &prepared_readers[candidate.incoming_index]);
+    if (!s.ok() || prepared_readers[candidate.incoming_index] == nullptr) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error =
+            s.ok() ? Status::Corruption(
+                         "table-cache warmup returned no prepared reader")
+                   : s;
+      }
+      return false;
+    }
+    return true;
+  };
+  for (size_t shard = 0; shard < shard_count; ++shard) {
+    auto& candidates = candidates_by_shard[shard];
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& lhs, const Candidate& rhs) {
+                if (lhs.level != rhs.level) {
+                  return lhs.level < rhs.level;
+                }
+                if (lhs.existing != rhs.existing) {
+                  return lhs.existing;
+                }
+                return lhs.file_number < rhs.file_number;
+              });
+
+    const size_t capacity = table_cache->GetCacheWarmupShardCapacity(shard);
+    const size_t usage = table_cache->GetCacheWarmupShardUsage(shard);
+    const size_t unrelated_usage = usage > known_resident_by_shard[shard]
+                                       ? usage - known_resident_by_shard[shard]
+                                       : 0;
+    const size_t available =
+        capacity > unrelated_usage ? capacity - unrelated_usage : 0;
+
+    size_t winner_count = 0;
+    for (const Candidate& candidate : candidates) {
+      if (winner_count < available) {
+        if (candidate.existing) {
+          existing_winners.push_back(candidate);
+          ++winner_count;
+        } else {
+          ++local_stats.selected;
+          // A corrupt/incomplete higher-priority entry must not reserve a
+          // slot and suppress a usable lower-priority candidate. Materialise
+          // prospective winners before finalising the shard ranking, then
+          // continue down the ordered candidates when preparation fails.
+          if (prepare_incoming(candidate)) {
+            incoming_winners.push_back(candidate);
+            ++winner_count;
+          }
+        }
+      } else if (candidate.existing) {
+        victims_by_shard[shard].push_back(candidate);
+      } else {
+        ++local_stats.skipped_lower_level;
+      }
+    }
+
+    // Try the least valuable destination reader first when an explicit victim
+    // is needed. Failed (for example, pinned) victims are left untouched.
+    std::sort(victims_by_shard[shard].begin(), victims_by_shard[shard].end(),
+              [](const Candidate& lhs, const Candidate& rhs) {
+                if (lhs.level != rhs.level) {
+                  return lhs.level > rhs.level;
+                }
+                return lhs.file_number > rhs.file_number;
+              });
+  }
+
+  // Admit the highest-value incoming readers first. All selected readers were
+  // constructed only from the received immutable ranges before any explicit
+  // victim can be removed.
+  std::sort(incoming_winners.begin(), incoming_winners.end(),
+            [](const Candidate& lhs, const Candidate& rhs) {
+              if (lhs.level != rhs.level) {
+                return lhs.level < rhs.level;
+              }
+              return lhs.file_number < rhs.file_number;
+            });
+  table_cache->SetLevelPriority(true);
+
+  // Admission is deliberately separated from reader construction, which can
+  // be expensive. Re-check the immutable identity and destination level under
+  // the DB mutex immediately before mutating the cache. This makes the check
+  // atomic with a concurrent Version install and prevents an obsolete warmup
+  // reader from displacing a reader that belongs to the new CURRENT.
+  auto matches_latest_current_locked = [&](const Candidate& candidate,
+                                           bool incoming) {
+    const VersionStorageInfo* latest = cfd->current()->storage_info();
+    const auto location = latest->GetFileLocation(candidate.file_number);
+    if (!location.IsValid() || location.GetLevel() != candidate.level) {
+      return false;
+    }
+    FileMetaData* metadata =
+        latest->GetFileMetaDataByNumber(candidate.file_number);
+    auto original = by_number.find(candidate.file_number);
+    if (metadata == nullptr || original == by_number.end() ||
+        metadata->fd.GetFileSize() !=
+            original->second.metadata->fd.GetFileSize() ||
+        metadata->fd.external_path !=
+            original->second.metadata->fd.external_path ||
+        metadata->unique_id != original->second.metadata->unique_id) {
+      return false;
+    }
+    if (!incoming) {
+      return true;
+    }
+
+    const auto& entry = entries[candidate.incoming_index];
+    if (metadata->fd.external_path != entry.external_file ||
+        metadata->fd.GetFileSize() != entry.file_size) {
+      return false;
+    }
+
+    // The request is keyed by physical path, so a path that became
+    // ambiguous in a newer CURRENT must not be resolved by file number
+    // alone even if this candidate still exists.
+    size_t path_matches = 0;
+    for (int level = 0; level < latest->num_levels(); ++level) {
+      for (FileMetaData* file : latest->LevelFiles(level)) {
+        if (file->fd.external_path == entry.external_file) {
+          ++path_matches;
+          if (path_matches > 1) {
+            return false;
+          }
+        }
+      }
+    }
+    return path_matches == 1;
+  };
+
+  auto insert_if_current =
+      [&](const Candidate& winner, std::unique_ptr<TableReader>* table_reader,
+          Cache::CacheWarmupInsertResult* result, bool* incoming_current) {
+        InstrumentedMutexLock lock(&mutex_);
+        *incoming_current = matches_latest_current_locked(winner, true);
+        if (!*incoming_current) {
+          return Status::OK();
+        }
+        return table_cache->InsertPreparedTableReaderForWarmupNoEvict(
+            winner.file_number, winner.level, table_reader, result);
+      };
+
+  auto replace_if_current = [&](const Candidate& winner,
+                                const Candidate& victim,
+                                std::unique_ptr<TableReader>* table_reader,
+                                Cache::CacheWarmupInsertResult* result,
+                                bool* incoming_current, bool* victim_current) {
+    InstrumentedMutexLock lock(&mutex_);
+    *incoming_current = matches_latest_current_locked(winner, true);
+    *victim_current = *incoming_current &&
+                      matches_latest_current_locked(victim, false) &&
+                      winner.level < victim.level;
+    if (!*victim_current) {
+      return Status::OK();
+    }
+    return table_cache->ReplacePreparedTableReaderForWarmup(
+        victim.file_number, winner.file_number, winner.level, table_reader,
+        result);
+  };
+
+  // Existing shallow readers might predate level-aware insertion. Promote
+  // winners in place. Keep the CURRENT check atomic with promotion so an
+  // obsolete reader cannot be promoted using a stale level.
+  for (const Candidate& winner : existing_winners) {
+    InstrumentedMutexLock lock(&mutex_);
+    if (matches_latest_current_locked(winner, false)) {
+      table_cache->PromoteFileForCacheWarmup(winner.file_number, winner.level)
+          .PermitUncheckedError();
+    }
+  }
+
+  std::vector<size_t> next_victim(shard_count, 0);
+  for (const Candidate& winner : incoming_winners) {
+    std::unique_ptr<TableReader> table_reader =
+        std::move(prepared_readers[winner.incoming_index]);
+    if (table_reader == nullptr) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error = Status::Corruption(
+            "table-cache warmup lost a prepared reader before admission");
+      }
+      continue;
+    }
+
+    Cache::CacheWarmupInsertResult result =
+        Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    bool incoming_current = false;
+    Status s =
+        insert_if_current(winner, &table_reader, &result, &incoming_current);
+    if (!s.ok()) {
+      ++local_stats.failed;
+      if (first_error.ok()) {
+        first_error = s;
+      }
+      continue;
+    }
+    if (!incoming_current) {
+      ++local_stats.skipped_not_current;
+      continue;
+    }
+    if (result == Cache::CacheWarmupInsertResult::kInserted) {
+      ++local_stats.installed;
+      continue;
+    }
+    if (result == Cache::CacheWarmupInsertResult::kDuplicate) {
+      ++local_stats.duplicate;
+      continue;
+    }
+
+    // The shard is full. Replace only a destination reader that lost the
+    // level ranking. The cache performs removal+insertion under one shard
+    // mutex, so a failed prepare or a pinned victim never creates a hole.
+    bool admitted = false;
+    auto& victims = victims_by_shard[winner.shard];
+    while (next_victim[winner.shard] < victims.size()) {
+      const Candidate& victim = victims[next_victim[winner.shard]++];
+      result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+      bool victim_current = false;
+      s = replace_if_current(winner, victim, &table_reader, &result,
+                             &incoming_current, &victim_current);
+      if (!s.ok()) {
+        ++local_stats.failed;
+        if (first_error.ok()) {
+          first_error = s;
+        }
+        admitted = true;
+        break;
+      }
+      if (!incoming_current) {
+        ++local_stats.skipped_not_current;
+        admitted = true;
+        break;
+      }
+      if (result == Cache::CacheWarmupInsertResult::kInserted) {
+        ++local_stats.installed;
+        ++local_stats.evicted_existing;
+        admitted = true;
+        break;
+      }
+      if (result == Cache::CacheWarmupInsertResult::kDuplicate) {
+        ++local_stats.duplicate;
+        admitted = true;
+        break;
+      }
+
+      // The victim may have disappeared from CURRENT/cache, or replacement
+      // may have raced with an ordinary eviction. In either case that race can
+      // have opened a slot. Retry non-evicting admission before considering
+      // another explicit victim.
+      result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+      s = insert_if_current(winner, &table_reader, &result, &incoming_current);
+      if (!s.ok()) {
+        ++local_stats.failed;
+        if (first_error.ok()) {
+          first_error = s;
+        }
+        admitted = true;
+        break;
+      }
+      if (!incoming_current) {
+        ++local_stats.skipped_not_current;
+        admitted = true;
+        break;
+      }
+      if (result == Cache::CacheWarmupInsertResult::kInserted) {
+        ++local_stats.installed;
+        admitted = true;
+        break;
+      }
+      if (result == Cache::CacheWarmupInsertResult::kDuplicate) {
+        ++local_stats.duplicate;
+        admitted = true;
+        break;
+      }
+    }
+    if (!admitted) {
+      ++local_stats.skipped_busy;
     }
   }
   ReturnAndCleanupSuperVersion(cfd, sv);
 
-  // Anything never claimed above (file already gone, open failed) would otherwise
-  // sit in the pending map for the lifetime of the DB.
-  table_cache->DropPendingTails();
-  ROCKS_LOG_INFO(immutable_db_options_.info_log,
-                 "[relink] installed %zu table tails (%.1f MB), %zu skipped",
-                 warmed, tail_bytes / 1048576.0, skipped);
-  return Status::OK();
+  ROCKS_LOG_INFO(
+      immutable_db_options_.info_log,
+      "[relink] table-cache warmup received=%" PRIu64 " selected=%" PRIu64
+      " installed=%" PRIu64 " duplicate=%" PRIu64 " evicted=%" PRIu64
+      " lower-level-skipped=%" PRIu64 " failed=%" PRIu64,
+      local_stats.received, local_stats.selected, local_stats.installed,
+      local_stats.duplicate, local_stats.evicted_existing,
+      local_stats.skipped_lower_level, local_stats.failed);
+  if (stats != nullptr) {
+    *stats = local_stats;
+  }
+  return first_error;
 }
 
 // [relink] Remove a relinked file from this CF's MANIFEST. The physical file has been

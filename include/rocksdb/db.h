@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <stdio.h>
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -146,25 +147,36 @@ struct GetMergeOperandsOptions {
 using TablePropertiesCollection =
     std::unordered_map<std::string, std::shared_ptr<const TableProperties>>;
 
-// [relink §21] One file to register via RegisterExternalFilesInPlace (batch). If
-// smallest_user/largest_user are both non-empty AND file_size > 0, the file is NOT
-// opened — the caller supplies the user-key bounds + size (the relink src already knows
-// them from GetColumnFamilyMetaData, so the dst skips a per-file HDFS open). Otherwise
-// the bounds/size are read from the file (fallback, matches RegisterExternalFileInPlace).
+// [relink §21] One file to register via RegisterExternalFilesInPlace (batch).
+// If smallest_user/largest_user are both non-empty AND file_size > 0, the file
+// is NOT opened — the caller supplies the user-key bounds + size (the relink
+// src already knows them from GetColumnFamilyMetaData, so the dst skips a
+// per-file HDFS open). Otherwise the bounds/size are read from the file
+// (fallback, matches RegisterExternalFileInPlace).
 struct ExternalFileForRegister {
-  std::string external_file;        // absolute path to the existing SST (referenced in place)
-  int level = 0;                    // target level
-  SequenceNumber global_seqno = 0;  // per-file GSN override (applied to all keys at read time)
-  std::string smallest_user;        // [opt] smallest user key (skip open if set + size>0)
-  std::string largest_user;         // [opt] largest user key
-  uint64_t file_size = 0;           // [opt] file size in bytes
-  // [relink fast-register 2026-09-19] Bounds+size above let the dst skip the open done BY THIS
-  // CALL; the table stats below let it skip the SECOND per-file read, the one RocksDB itself does
-  // later inside LogAndApply (LoadTableHandlers -> properties block) and in
-  // Version::MaybeInitializeFileMetaData. The relink src already holds all six (four from
-  // GetColumnFamilyMetaData, the raw_* pair from GetPropertiesOfAllTables over its open readers),
-  // so shipping them costs 48 B/file on the wire and saves a HDFS round trip per file.
-  // num_entries == 0 => not supplied => dst reads them from the file exactly as before.
+  std::string
+      external_file;  // absolute path to the existing SST (referenced in place)
+  int level = 0;      // target level
+  SequenceNumber global_seqno =
+      0;  // per-file GSN override (applied to all keys at read time)
+  std::string
+      smallest_user;  // [opt] smallest user key (skip open if set + size>0)
+  std::string largest_user;  // [opt] largest user key
+  uint64_t file_size = 0;    // [opt] file size in bytes
+  // [opt] stable SST ID as exactly 16 binary bytes in the public format
+  // returned by GetUniqueIdFromTableProperties(). Empty means unavailable. A
+  // destination preserves a supplied ID in its MANIFEST, which is required
+  // for stable block-cache keys across chained relinks.
+  std::string unique_id;
+  // [relink fast-register 2026-09-19] Bounds+size above let the dst skip the
+  // open done BY THIS CALL; the table stats below let it skip the SECOND
+  // per-file read, the one RocksDB itself does later inside LogAndApply
+  // (LoadTableHandlers -> properties block) and in
+  // Version::MaybeInitializeFileMetaData. The relink src already holds all six
+  // (four from GetColumnFamilyMetaData, the raw_* pair from
+  // GetPropertiesOfAllTables over its open readers), so shipping them costs 48
+  // B/file on the wire and saves a HDFS round trip per file. num_entries == 0
+  // => not supplied => dst reads them from the file exactly as before.
   uint64_t num_entries = 0;
   uint64_t num_deletions = 0;
   uint64_t raw_key_size = 0;
@@ -173,18 +185,68 @@ struct ExternalFileForRegister {
   uint64_t file_creation_time = 0;
 };
 
-// [relink tail-preload 2026-09-20] One already-registered file's metadata tail,
-// shipped CN-to-CN by the migration source so the destination can build the
-// file's TableReader without touching shared storage. `tail` is the raw bytes of
-// [tail_offset, file_size) exactly as they sit in the SST -- every metadata block
-// of a block-based table (filter, index, compression dict, range-del, properties,
-// metaindex, footer) lives in that suffix, so it is all Open needs.
-struct ExternalTableTail {
+// One source file eligible for table-cache warmup. `file_number` is meaningful
+// only at the source; relink assigns a fresh destination number, so
+// `external_file` is the cross-node identity.
+struct TableCacheWarmupRequest {
   uint64_t file_number = 0;
-  int level = 0;          // only used to order the warm-up, deepest level first
-  uint64_t tail_offset = 0;
-  std::string tail;
+  std::string external_file;
 };
+
+struct ExternalTableCacheRange {
+  uint64_t offset = 0;
+  std::string data;
+};
+
+// Exact SST metadata byte ranges retained by a resident source TableReader.
+// They are bytes the source already read during its normal open, never a new
+// storage read made for migration.
+struct ExternalTableCacheEntry {
+  std::string external_file;
+  uint64_t file_size = 0;
+  // Stable public SST ID (exactly 16 binary bytes), when available.
+  std::string unique_id;
+  std::vector<ExternalTableCacheRange> ranges;
+};
+
+// Source-side immutable view of a resident TableReader's retained metadata.
+// Each `data` pointer aliases the TableReader bundle and therefore keeps those
+// bytes (and their configured memory-accounting reservation) alive even if
+// migration subsequently unregisters or evicts the source SST. Creating this
+// snapshot copies no payload bytes and holds no cache lock or cache-entry pin
+// after the call returns.
+struct TableCacheWarmupSnapshotRange {
+  uint64_t offset = 0;
+  std::shared_ptr<const std::string> data;
+};
+
+struct TableCacheWarmupSnapshotEntry {
+  std::string external_file;
+  uint64_t file_size = 0;
+  std::string unique_id;
+  std::vector<TableCacheWarmupSnapshotRange> ranges;
+};
+
+struct TableCacheWarmupTransferStats {
+  uint64_t requested = 0;
+  uint64_t resident = 0;
+  uint64_t copied = 0;
+  uint64_t payload_bytes = 0;
+  uint64_t received = 0;
+  uint64_t selected = 0;
+  uint64_t installed = 0;
+  uint64_t duplicate = 0;
+  uint64_t evicted_existing = 0;
+  uint64_t skipped_busy = 0;
+  uint64_t skipped_unavailable = 0;
+  uint64_t skipped_too_large = 0;
+  uint64_t skipped_not_current = 0;
+  uint64_t skipped_lower_level = 0;
+  uint64_t failed = 0;
+};
+
+using TableCacheWarmupEntryCallback =
+    std::function<Status(ExternalTableCacheEntry&&)>;
 
 // A DB is a persistent, versioned ordered map from keys to values.
 // A DB is safe for concurrent access from multiple threads without
@@ -1714,26 +1776,30 @@ class DB {
   virtual Status IngestExternalFiles(
       const std::vector<IngestExternalFileArg>& args) = 0;
 
-  // [relink] Register an EXISTING SST file (e.g. already on shared HDFS) into this
-  // column family's MANIFEST at `level`, applying `global_seqno` as a per-file GSN
-  // override to ALL of the file's keys at read time. NO data copy: the file is moved
-  // into the DB directory via FileSystem::RenameFile (metadata-only on HDFS). This is
-  // additive/opt-in for key-group migration (relink): stock ingest/flush/compaction are
-  // untouched and the default implementation returns NotSupported, so other DB
-  // implementations are unaffected. NOTE: the GSN is currently applied in-memory only
-  // (not yet persisted in the MANIFEST -> it is lost on restart; recovery is future work).
+  // [relink] Register an EXISTING SST file (e.g. already on shared HDFS) into
+  // this column family's MANIFEST at `level`, applying `global_seqno` as a
+  // per-file GSN override to ALL of the file's keys at read time. NO data copy:
+  // the file is moved into the DB directory via FileSystem::RenameFile
+  // (metadata-only on HDFS). This is additive/opt-in for key-group migration
+  // (relink): stock ingest/flush/compaction are untouched and the default
+  // implementation returns NotSupported, so other DB implementations are
+  // unaffected. The per-file GSN and external path are persisted in the
+  // MANIFEST.
   virtual Status RegisterExternalFileInPlace(
-      ColumnFamilyHandle* /*column_family*/, const std::string& /*external_file*/,
-      int /*level*/, SequenceNumber /*global_seqno*/) {
+      ColumnFamilyHandle* /*column_family*/,
+      const std::string& /*external_file*/, int /*level*/,
+      SequenceNumber /*global_seqno*/) {
     return Status::NotSupported(
-        "RegisterExternalFileInPlace is not supported in this DB implementation");
+        "RegisterExternalFileInPlace is not supported in this DB "
+        "implementation");
   }
 
-  // [relink §21] BATCH register: register N existing SSTs into the MANIFEST at their
-  // per-file (level, GSN) in ONE VersionEdit + ONE LogAndApply (1 fsync for all, vs 1
-  // per file). When a file's user-key bounds + size are supplied (ExternalFileForRegister),
-  // its HDFS open is skipped. Equivalent to calling RegisterExternalFileInPlace per file
-  // but file-count-independent in fsyncs (and HDFS opens, when bounds are given).
+  // [relink §21] BATCH register: register N existing SSTs into the MANIFEST at
+  // their per-file (level, GSN) in ONE VersionEdit + ONE LogAndApply (1 fsync
+  // for all, vs 1 per file). When a file's user-key bounds + size are supplied
+  // (ExternalFileForRegister), its HDFS open is skipped. Equivalent to calling
+  // RegisterExternalFileInPlace per file but file-count-independent in fsyncs
+  // (and HDFS opens, when bounds are given).
   virtual Status RegisterExternalFilesInPlace(
       ColumnFamilyHandle* /*column_family*/,
       const std::vector<ExternalFileForRegister>& /*files*/) {
@@ -1741,29 +1807,51 @@ class DB {
         "RegisterExternalFilesInPlace is not supported in this DB implementation");
   }
 
-  // [relink tail-preload 2026-09-20] Install metadata tails the migration source
-  // shipped for files this DB has just registered, and warm their TableReaders in
-  // the order given. Call AFTER RegisterExternalFilesInPlace and AFTER the shard
-  // has resumed serving -- this does real work (parsing every index block) and
-  // deliberately does not belong in the cutover.
-  //
-  // Ordering is the whole point and the caller owns it: pass DEEPEST level first
-  // and level 0 last. A table cache entry joins the LRU list when its handle is
-  // released, so finishing in that order leaves the shallow files -- the ones a
-  // point read probes on every lookup -- at the young end. If more files are
-  // installed than max_open_files allows, stock LRU eviction then drops the
-  // deepest levels first, which is exactly the desired admission outcome and
-  // needs no budget arithmetic. Readers are NOT pinned into FileMetaData, so they
-  // stay evictable.
-  //
-  // Files whose tail is missing or which are no longer in the current version are
-  // skipped, not an error. Turns on level-derived table cache admission priority
-  // for this column family.
-  virtual Status InstallExternalTableTails(
+  // Streams resident source table-cache entries one at a time. A bounded,
+  // no-touch lease snapshots immutable bundle ownership without recording a
+  // cache hit, and every cache handle is released before payload copying or
+  // callback transport I/O. Evicted/unavailable entries and entries already
+  // leased by another warmup are best-effort skips. No SST/file-system read is
+  // issued.
+  virtual Status StreamTableCacheWarmupEntries(
       ColumnFamilyHandle* /*column_family*/,
-      std::vector<ExternalTableTail>&& /*tails*/) {
+      const std::vector<TableCacheWarmupRequest>& /*files*/,
+      size_t /*max_entry_bytes*/,
+      const TableCacheWarmupEntryCallback& /*callback*/,
+      TableCacheWarmupTransferStats* /*stats*/) {
     return Status::NotSupported(
-        "InstallExternalTableTails is not supported in this DB implementation");
+        "StreamTableCacheWarmupEntries is not supported in this DB "
+        "implementation");
+  }
+
+  // Takes a no-touch, payload-zero-copy snapshot of resident source entries.
+  // This is the handoff boundary for asynchronous migration: callers acquire
+  // it before source unregister, then may transmit it after migration itself
+  // has completed. The returned shared byte ranges remain valid independently
+  // of source TableCache/Version lifetime.
+  virtual Status SnapshotTableCacheWarmupEntries(
+      ColumnFamilyHandle* /*column_family*/,
+      const std::vector<TableCacheWarmupRequest>& /*files*/,
+      size_t /*max_entry_bytes*/,
+      std::vector<TableCacheWarmupSnapshotEntry>* /*entries*/,
+      TableCacheWarmupTransferStats* /*stats*/) {
+    return Status::NotSupported(
+        "SnapshotTableCacheWarmupEntries is not supported in this DB "
+        "implementation");
+  }
+
+  // Combines received entries with the destination's current resident table
+  // cache, ranks the union by the destination Version's CURRENT LSM level
+  // (L0 first), and keeps only capacity winners. Existing entries win ties.
+  // Selected incoming readers are reconstructed from the supplied memory
+  // ranges without opening or reading shared storage.
+  virtual Status InstallExternalTableCacheEntries(
+      ColumnFamilyHandle* /*column_family*/,
+      std::vector<ExternalTableCacheEntry>&& /*entries*/,
+      size_t /*max_entry_bytes*/, TableCacheWarmupTransferStats* /*stats*/) {
+    return Status::NotSupported(
+        "InstallExternalTableCacheEntries is not supported in this DB "
+        "implementation");
   }
 
   // [relink] Remove a (relinked) file from this column family's MANIFEST WITHOUT
@@ -1878,6 +1966,18 @@ class DB {
     return Status::NotSupported(
         "GetPropertiesOfResidentTables is not supported in this DB "
         "implementation");
+  }
+
+  // Returns stable block-cache key prefixes for the requested live SST file
+  // numbers using only MANIFEST metadata. Files without a stable unique ID, or
+  // numbers not present in the current Version, are absent from the result.
+  // This performs no table-cache lookup and no file I/O.
+  virtual Status GetBlockCacheKeyPrefixes(
+      ColumnFamilyHandle* /*column_family*/,
+      const std::vector<uint64_t>& /*file_numbers*/,
+      std::unordered_map<uint64_t, std::string>* /*prefixes*/) {
+    return Status::NotSupported(
+        "GetBlockCacheKeyPrefixes is not supported in this DB implementation");
   }
   virtual Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,

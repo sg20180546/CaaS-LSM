@@ -201,6 +201,14 @@ class RandomAccessFileReader {
 
   FSRandomAccessFile* file() { return file_.get(); }
 
+  // May be changed only before the owning TableReader is published. Relink
+  // warmup uses this to exclude in-memory metadata reconstruction from file-I/O
+  // counters, then restores normal accounting for later data reads.
+  void SetStatistics(Statistics* stats, HistogramImpl* file_read_hist) {
+    stats_ = stats;
+    file_read_hist_ = file_read_hist;
+  }
+
   const std::string& file_name() const { return file_name_; }
 
   bool use_direct_io() const { return file_->use_direct_io(); }

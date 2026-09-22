@@ -8,7 +8,10 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #pragma once
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "db/range_tombstone_fragmenter.h"
 #if USE_COROUTINES
@@ -31,6 +34,32 @@ struct ReadOptions;
 struct TableProperties;
 class GetContext;
 class MultiGetContext;
+class HistogramImpl;
+class Statistics;
+
+// Immutable bytes captured while a resident TableReader was opened. Each
+// range is an exact slice of the SST file that was already read as table
+// metadata (footer, meta-index, properties, index/filter/dictionary blocks).
+// Keeping the ranges with the TableReader makes a later relink warmup a pure
+// memory-to-memory transfer; it never goes back to the SST to manufacture a
+// dump.
+struct TableCacheWarmupRange {
+  uint64_t offset = 0;
+  std::string data;
+};
+
+struct TableCacheWarmupBundle {
+  uint64_t file_size = 0;
+  std::vector<TableCacheWarmupRange> ranges;
+
+  size_t ApproximateMemoryUsage() const {
+    size_t bytes = sizeof(*this) + ranges.capacity() * sizeof(ranges[0]);
+    for (const auto& range : ranges) {
+      bytes += range.data.capacity();
+    }
+    return bytes;
+  }
+};
 
 // A Table (also referred to as SST) is a sorted map from strings to strings.
 // Tables are immutable and persistent.  A Table may be safely accessed from
@@ -40,6 +69,21 @@ class MultiGetContext;
 class TableReader {
  public:
   virtual ~TableReader() {}
+
+  // Experimental relink table-cache warmup hooks. Implementations that can
+  // reconstruct themselves from captured metadata keep the immutable bundle
+  // here. The default leaves non-block-based table formats unaffected.
+  virtual Status SetTableCacheWarmupBundle(
+      std::shared_ptr<const TableCacheWarmupBundle> /*bundle*/) {
+    return Status::NotSupported(
+        "table-cache warmup bundle is not supported by this table reader");
+  }
+  virtual std::shared_ptr<const TableCacheWarmupBundle>
+  GetTableCacheWarmupBundle() const {
+    return nullptr;
+  }
+  virtual void SetFileReadStats(Statistics* /*stats*/,
+                                HistogramImpl* /*file_read_hist*/) {}
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must

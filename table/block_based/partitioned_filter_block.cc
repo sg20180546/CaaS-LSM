@@ -526,7 +526,7 @@ Status PartitionedFilterBlockReader::CacheDependencies(const ReadOptions& ro,
     assert(s.ok() || block.GetValue() == nullptr);
 
     if (block.GetValue() != nullptr) {
-      if (block.IsCached()) {
+      if (block.IsCached() || block.GetOwnValue()) {
         if (pin) {
           filter_map_[handle.offset()] = std::move(block);
         }

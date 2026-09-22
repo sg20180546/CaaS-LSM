@@ -7,6 +7,12 @@
 #include "table/block_based/block_based_table_reader.h"
 #ifndef ROCKSDB_LITE
 
+#include <array>
+#include <chrono>
+#include <cstring>
+#include <limits>
+#include <unordered_set>
+
 #include "cache/cache_entry_roles.h"
 #include "file/writable_file_writer.h"
 #include "port/lang.h"
@@ -18,6 +24,79 @@
 #include "utilities/cache_dump_load_impl.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+static_assert(OffsetableCacheKey::kCommonPrefixSize == sizeof(uint64_t),
+              "warmup prefix filter assumes the stable cache prefix is u64");
+
+uint64_t CacheWarmupPrefixAsUint64(const Slice& key) {
+  uint64_t prefix = 0;
+  std::memcpy(&prefix, key.data(), sizeof(prefix));
+  return prefix;
+}
+
+CacheWarmupPriorityTransferStats* CacheWarmupStatsForPriority(
+    CacheWarmupTransferStats* stats, Cache::Priority priority) {
+  assert(stats != nullptr);
+  switch (priority) {
+    case Cache::Priority::HIGH:
+      return &stats->high;
+    case Cache::Priority::LOW:
+      return &stats->low;
+    case Cache::Priority::BOTTOM:
+      return &stats->bottom;
+  }
+  return &stats->low;  // Defensive fallback for a future invalid enum value.
+}
+
+class WarmupCallDeadline {
+ public:
+  explicit WarmupCallDeadline(uint64_t duration_micros)
+      : duration_micros_(duration_micros),
+        start_(std::chrono::steady_clock::now()) {}
+
+  bool Expired() const {
+    if (duration_micros_ == 0) {
+      return false;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start_)
+                             .count();
+    return elapsed >= 0 && static_cast<uint64_t>(elapsed) >= duration_micros_;
+  }
+
+ private:
+  uint64_t duration_micros_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// A source entry must never remain warmup-pinned if staging throws. This small
+// guard also keeps every validation/early-return path visibly no-touch.
+class ScopedWarmupLease {
+ public:
+  ScopedWarmupLease(Cache* cache, Cache::Handle* handle,
+                    Cache::Priority priority)
+      : cache_(cache), handle_(handle), priority_(priority) {}
+  ~ScopedWarmupLease() { Release(); }
+
+  ScopedWarmupLease(const ScopedWarmupLease&) = delete;
+  ScopedWarmupLease& operator=(const ScopedWarmupLease&) = delete;
+
+  void Release() {
+    if (handle_ != nullptr) {
+      cache_->ReleaseForCacheWarmup(handle_, priority_);
+      handle_ = nullptr;
+    }
+  }
+
+ private:
+  Cache* cache_;
+  Cache::Handle* handle_;
+  Cache::Priority priority_;
+};
+
+}  // namespace
 
 // Set the dump filter with a list of DBs. Block cache may be shared by multipe
 // DBs and we may only want to dump out the blocks belonging to certain DB(s).
@@ -99,6 +178,21 @@ Status CacheDumperImpl::SetDumpFilterFiles(
                      : Status::NotFound("no matching tables for dump filter");
 }
 
+Status CacheDumperImpl::SetDumpFilterPrefixes(
+    const std::vector<std::string>& prefixes) {
+  size_t accepted = 0;
+  for (const auto& prefix : prefixes) {
+    if (prefix.size() != OffsetableCacheKey::kCommonPrefixSize) {
+      return Status::InvalidArgument(
+          "block-cache warmup prefix must be exactly 8 bytes");
+    }
+    accepted += prefix_filter_.insert(prefix).second ? 1 : 0;
+  }
+  return accepted > 0
+             ? Status::OK()
+             : Status::NotFound("no stable block-cache prefixes supplied");
+}
+
 // This is the main function to dump out the cache block entries to the writer.
 // The writer may create a file or write to other systems. Currently, we will
 // iterate the whole block cache, get the blocks, and write them to the writer
@@ -137,6 +231,261 @@ IOStatus CacheDumperImpl::DumpCacheEntriesToWriter() {
   }
   io_s = writer_->Close();
   return io_s;
+}
+
+// A warmup dump has a deliberately separate two-phase flow from the stock
+// dump. The first phase only catalogs data-entry metadata while a cache shard
+// lock is held. The second phase pins one entry, copies it directly into one
+// owned encoded record, releases it, and only then performs CRC/framing/writer
+// I/O. In particular, no network writer call happens under a cache shard lock
+// or while a cache entry is pinned.
+IOStatus CacheDumperImpl::DumpWarmupCacheEntriesToWriter(
+    const CacheWarmupOptions& warmup_options,
+    CacheWarmupTransferStats* warmup_stats) {
+  warmup_stats_ = CacheWarmupTransferStats{};
+  auto finish = [&](IOStatus status) {
+    if (warmup_stats != nullptr) {
+      *warmup_stats = warmup_stats_;
+    }
+    return status;
+  };
+  if (cache_ == nullptr) {
+    return finish(IOStatus::InvalidArgument("Cache is null"));
+  }
+  if (writer_ == nullptr) {
+    return finish(IOStatus::InvalidArgument("CacheDumpWriter is null"));
+  }
+  if (warmup_options.max_entry_bytes == 0) {
+    return finish(IOStatus::InvalidArgument(
+        "cache warmup max_entry_bytes must be nonzero"));
+  }
+  if (warmup_options.max_entries == 0 ||
+      warmup_options.max_total_bytes == 0) {
+    return finish(IOStatus::InvalidArgument(
+        "cache warmup aggregate limits must be nonzero"));
+  }
+  WarmupCallDeadline deadline(warmup_options.max_transfer_duration_micros);
+  role_map_ = CopyCacheDeleterRoleMap();
+  sequence_num_ = 0;
+
+  // Materialize the stable 8-byte prefixes once. The catalog callback does no
+  // std::string allocation or tree lookup to decide whether an entry belongs
+  // to the migrated file set.
+  std::unordered_set<uint64_t> warmup_prefix_filter;
+  warmup_prefix_filter.reserve(prefix_filter_.size());
+  for (const auto& prefix : prefix_filter_) {
+    if (prefix.size() == OffsetableCacheKey::kCommonPrefixSize) {
+      warmup_prefix_filter.insert(CacheWarmupPrefixAsUint64(Slice(prefix)));
+    }
+  }
+
+  struct WarmupCandidate {
+    std::array<char, kCacheKeySize> key;
+    size_t charge;
+    Cache::Priority priority;
+  };
+  // Bucketing during catalog is O(N), preserves catalog order within each
+  // class, and gives the wire stream its required HIGH -> LOW -> BOTTOM order
+  // without an O(N log N) sort.
+  std::vector<WarmupCandidate> high_candidates;
+  std::vector<WarmupCandidate> low_candidates;
+  std::vector<WarmupCandidate> bottom_candidates;
+  auto candidate_bucket =
+      [&](Cache::Priority priority) -> std::vector<WarmupCandidate>* {
+    switch (priority) {
+      case Cache::Priority::HIGH:
+        return &high_candidates;
+      case Cache::Priority::LOW:
+        return &low_candidates;
+      case Cache::Priority::BOTTOM:
+        return &bottom_candidates;
+    }
+    return nullptr;
+  };
+
+  Cache::ApplyToAllEntriesOptions catalog_options;
+  // Iterate a moderate number of hash buckets per lock acquisition. The
+  // callback only does fixed-key metadata work; batching avoids one mutex
+  // round trip per bucket on large caches without creating long lock holds.
+  catalog_options.average_entries_per_lock = 64;
+  bool catalog_deadline_expired = false;
+  Status catalog_status = cache_->ApplyToAllEntriesForCacheWarmup(
+      [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
+          Cache::Priority effective_priority) {
+        if (deadline.Expired()) {
+          catalog_deadline_expired = true;
+          return;
+        }
+        if (key.size() < OffsetableCacheKey::kCommonPrefixSize ||
+            warmup_prefix_filter.find(CacheWarmupPrefixAsUint64(key)) ==
+                warmup_prefix_filter.end()) {
+          return;
+        }
+        if (key.size() != kCacheKeySize) {
+          ++warmup_stats_.skipped_unsupported;
+          return;
+        }
+        const auto role_it = role_map_.find(deleter);
+        if (role_it == role_map_.end()) {
+          ++warmup_stats_.skipped_unsupported;
+          return;
+        }
+        if (role_it->second != CacheEntryRole::kDataBlock) {
+          // We intentionally do not copy a full key for index/filter/etc.
+          ++warmup_stats_.skipped_unsupported;
+          return;
+        }
+        std::vector<WarmupCandidate>* bucket =
+            candidate_bucket(effective_priority);
+        if (bucket == nullptr) {
+          ++warmup_stats_.skipped_unsupported;
+          return;
+        }
+        CacheWarmupPriorityTransferStats* priority_stats =
+            CacheWarmupStatsForPriority(&warmup_stats_, effective_priority);
+        ++warmup_stats_.cataloged_entries;
+        ++warmup_stats_.data_candidates;
+        ++priority_stats->cataloged_entries;
+        ++priority_stats->data_candidates;
+        WarmupCandidate candidate{};
+        std::memcpy(candidate.key.data(), key.data(), kCacheKeySize);
+        candidate.charge = charge;
+        candidate.priority = effective_priority;
+        bucket->push_back(candidate);
+      },
+      catalog_options);
+  if (!catalog_status.ok()) {
+    return finish(status_to_io_status(std::move(catalog_status)));
+  }
+  if (catalog_deadline_expired || deadline.Expired()) {
+    return finish(IOStatus::TimedOut("cache warmup catalog deadline"));
+  }
+
+  IOStatus io_s = WriteWarmupHeader();
+  if (!io_s.ok()) {
+    return finish(io_s);
+  }
+  const std::vector<WarmupCandidate>* const candidate_buckets[] = {
+      &high_candidates, &low_candidates, &bottom_candidates};
+  bool aggregate_limit_reached = false;
+  for (const auto* candidates : candidate_buckets) {
+    for (const auto& candidate : *candidates) {
+      if (deadline.Expired()) {
+        return finish(IOStatus::TimedOut("cache warmup dump deadline"));
+      }
+      if (warmup_stats_.entries_written >= warmup_options.max_entries) {
+        aggregate_limit_reached = true;
+        break;
+      }
+      Cache::Handle* handle = nullptr;
+      Cache::Priority current_priority = candidate.priority;
+      Status lookup_status = cache_->LookupForCacheWarmup(
+          Slice(candidate.key.data(), candidate.key.size()), &handle,
+          &current_priority);
+      if (!lookup_status.ok()) {
+        return finish(status_to_io_status(std::move(lookup_status)));
+      }
+      if (handle == nullptr) {
+        ++warmup_stats_.skipped_disappeared;
+        continue;
+      }
+      ScopedWarmupLease lease(cache_.get(), handle, current_priority);
+
+      // Every path below releases this one-and-only pinned handle before CRC,
+      // metadata framing, or a writer call.
+      const size_t current_charge = cache_->GetCharge(handle);
+      const Cache::DeleterFn current_deleter = cache_->GetDeleter(handle);
+      void* const current_value = cache_->Value(handle);
+      if (current_priority != candidate.priority) {
+        ++warmup_stats_.priority_changed_after_catalog;
+        // Keeping the catalog class here would mislabel the entry, while using
+        // the new class could violate the stream's HIGH -> LOW -> BOTTOM order.
+        // Skip this concurrently changed entry and preserve both invariants.
+        continue;
+      }
+      if (current_charge != candidate.charge) {
+        ++warmup_stats_.skipped_replaced;
+        continue;
+      }
+      const auto role_it = role_map_.find(current_deleter);
+      if (role_it == role_map_.end()) {
+        ++warmup_stats_.skipped_unsupported;
+        continue;
+      }
+      if (role_it->second != CacheEntryRole::kDataBlock) {
+        ++warmup_stats_.skipped_type_changed;
+        continue;
+      }
+      if (current_value == nullptr) {
+        ++warmup_stats_.skipped_unsupported;
+        continue;
+      }
+
+      const Block* block = static_cast<const Block*>(current_value);
+      const char* const block_data = block->data();
+      const size_t block_size = block->size();
+      if (block_size > warmup_options.max_entry_bytes ||
+          block_size > std::numeric_limits<uint32_t>::max()) {
+        ++warmup_stats_.skipped_too_large;
+        continue;
+      }
+      if (block_size != 0 && block_data == nullptr) {
+        ++warmup_stats_.skipped_unsupported;
+        continue;
+      }
+      if (warmup_stats_.payload_bytes > warmup_options.max_total_bytes ||
+          block_size > warmup_options.max_total_bytes -
+                           static_cast<size_t>(warmup_stats_.payload_bytes)) {
+        ++warmup_stats_.skipped_too_large;
+        continue;
+      }
+
+      // Encode directly into the reusable owned staging slab while this one
+      // cache handle is pinned. This is the only payload copy; CRC and all
+      // writer framing happen only after the release below.
+      CacheWarmupDumpUnit staged_unit;
+      staged_unit.type = CacheWarmupDumpUnitType::kData;
+      staged_unit.priority = candidate.priority;
+      staged_unit.key = Slice(candidate.key.data(), candidate.key.size());
+      staged_unit.value_len = block_size;
+      staged_unit.value = const_cast<char*>(block_size == 0 ? "" : block_data);
+      warmup_encoded_data_.clear();
+      Status staging_status = CacheDumperHelper::EncodeWarmupDumpUnit(
+          staged_unit, &warmup_encoded_data_);
+      lease.Release();
+      if (!staging_status.ok()) {
+        return finish(status_to_io_status(std::move(staging_status)));
+      }
+      if (deadline.Expired()) {
+        return finish(IOStatus::TimedOut("cache warmup dump deadline"));
+      }
+
+      CacheWarmupPriorityTransferStats* priority_stats =
+          CacheWarmupStatsForPriority(&warmup_stats_, candidate.priority);
+      ++warmup_stats_.entries_staged;
+      ++priority_stats->entries_staged;
+      io_s = WriteWarmupEncodedUnit();
+      if (!io_s.ok()) {
+        return finish(io_s);
+      }
+      ++warmup_stats_.entries_written;
+      warmup_stats_.payload_bytes += block_size;
+      ++priority_stats->entries_written;
+      priority_stats->payload_bytes += block_size;
+    }
+    if (aggregate_limit_reached) {
+      break;
+    }
+  }
+
+  if (deadline.Expired()) {
+    return finish(IOStatus::TimedOut("cache warmup dump deadline"));
+  }
+  io_s = WriteWarmupFooter();
+  if (!io_s.ok()) {
+    return finish(io_s);
+  }
+  return finish(writer_->Close());
 }
 
 // Check if we need to filter out the block based on its key
@@ -297,6 +646,57 @@ IOStatus CacheDumperImpl::WriteFooter() {
   std::string footer_value("cache dump completed");
   CacheDumpUnitType type = CacheDumpUnitType::kFooter;
   return WriteBlock(type, footer_key, footer_value);
+}
+
+IOStatus CacheDumperImpl::WriteWarmupUnit(CacheWarmupDumpUnitType type,
+                                          Cache::Priority priority,
+                                          const Slice& key,
+                                          const Slice& value) {
+  CacheWarmupDumpUnit unit;
+  unit.type = type;
+  unit.priority = priority;
+  unit.key = key;
+  unit.value_len = value.size();
+  unit.value = const_cast<char*>(value.data());
+
+  warmup_encoded_data_.clear();
+  Status encode_status =
+      CacheDumperHelper::EncodeWarmupDumpUnit(unit, &warmup_encoded_data_);
+  if (!encode_status.ok()) {
+    return status_to_io_status(std::move(encode_status));
+  }
+  return WriteWarmupEncodedUnit();
+}
+
+IOStatus CacheDumperImpl::WriteWarmupEncodedUnit() {
+  DumpUnitMeta unit_meta;
+  unit_meta.sequence_num = sequence_num_++;
+  unit_meta.dump_unit_checksum =
+      crc32c::Value(warmup_encoded_data_.data(), warmup_encoded_data_.size());
+  unit_meta.dump_unit_size = warmup_encoded_data_.size();
+  std::string encoded_meta;
+  CacheDumperHelper::EncodeDumpUnitMeta(unit_meta, &encoded_meta);
+
+  IOStatus io_s = writer_->WriteMetadata(encoded_meta);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  return writer_->WritePacket(warmup_encoded_data_);
+}
+
+IOStatus CacheDumperImpl::WriteWarmupHeader() {
+  static const std::string kHeaderKey = "cache-warmup-header";
+  static const std::string kHeaderValue =
+      "versioned data-block-only priority-preserving cache warmup";
+  return WriteWarmupUnit(CacheWarmupDumpUnitType::kHeader, Cache::Priority::LOW,
+                         Slice(kHeaderKey), Slice(kHeaderValue));
+}
+
+IOStatus CacheDumperImpl::WriteWarmupFooter() {
+  static const std::string kFooterKey = "cache-warmup-footer";
+  static const std::string kFooterValue = "cache warmup completed";
+  return WriteWarmupUnit(CacheWarmupDumpUnitType::kFooter, Cache::Priority::LOW,
+                         Slice(kFooterKey), Slice(kFooterValue));
 }
 
 // This is the main function to restore the cache entries to secondary cache.
@@ -472,6 +872,143 @@ IOStatus CacheDumpedLoaderImpl::RestoreCacheEntriesToPrimaryCache() {
   return io_s;
 }
 
+// Restore the separately versioned warmup stream. Unlike the legacy primary
+// restore above, this path calls the cache's warmup admission primitive so a
+// destination resident entry is never overwritten and a higher-priority
+// resident set is not displaced merely to admit warmup data.
+IOStatus CacheDumpedLoaderImpl::RestoreWarmupCacheEntriesToPrimaryCache(
+    const CacheWarmupOptions& warmup_options,
+    CacheWarmupTransferStats* warmup_stats) {
+  warmup_stats_ = CacheWarmupTransferStats{};
+  auto finish = [&](IOStatus status) {
+    if (warmup_stats != nullptr) {
+      *warmup_stats = warmup_stats_;
+    }
+    return status;
+  };
+  if (primary_cache_ == nullptr) {
+    return finish(IOStatus::InvalidArgument("Primary cache is null"));
+  }
+  if (reader_ == nullptr) {
+    return finish(IOStatus::InvalidArgument("CacheDumpReader is null"));
+  }
+  if (warmup_options.max_entry_bytes == 0) {
+    return finish(IOStatus::InvalidArgument(
+        "cache warmup max_entry_bytes must be nonzero"));
+  }
+  if (warmup_options.max_entries == 0 ||
+      warmup_options.max_total_bytes == 0) {
+    return finish(IOStatus::InvalidArgument(
+        "cache warmup aggregate limits must be nonzero"));
+  }
+  WarmupCallDeadline deadline(warmup_options.max_transfer_duration_micros);
+
+  std::string data;
+  CacheWarmupDumpUnit unit;
+  IOStatus io_s = ReadWarmupHeader(&data, &unit);
+  if (!io_s.ok()) {
+    return finish(io_s);
+  }
+  Cache::CacheItemHelper* helper =
+      BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData);
+  if (helper == nullptr) {
+    return finish(IOStatus::NotSupported("data block cache helper is null"));
+  }
+
+  while (true) {
+    if (deadline.Expired()) {
+      return finish(IOStatus::TimedOut("cache warmup restore deadline"));
+    }
+    unit = CacheWarmupDumpUnit{};
+    data.clear();
+    io_s = ReadWarmupCacheBlock(&data, &unit);
+    if (!io_s.ok()) {
+      return finish(io_s);
+    }
+    if (unit.type == CacheWarmupDumpUnitType::kFooter) {
+      return finish(IOStatus::OK());
+    }
+    if (unit.type != CacheWarmupDumpUnitType::kData) {
+      ++warmup_stats_.skipped_invalid;
+      return finish(
+          IOStatus::Corruption("non-data unit in cache warmup stream"));
+    }
+    if (unit.key.size() != kCacheKeySize) {
+      ++warmup_stats_.skipped_invalid;
+      return finish(IOStatus::Corruption(
+          "cache warmup data unit has non-standard cache key size"));
+    }
+    if (unit.value_len > warmup_options.max_entry_bytes) {
+      ++warmup_stats_.skipped_too_large;
+      return finish(IOStatus::Corruption(
+          "cache warmup data unit exceeds destination entry limit"));
+    }
+    if (warmup_stats_.entries_received >= warmup_options.max_entries) {
+      ++warmup_stats_.skipped_too_large;
+      return finish(IOStatus::Corruption(
+          "cache warmup stream exceeds destination entry-count limit"));
+    }
+    if (warmup_stats_.payload_bytes > warmup_options.max_total_bytes ||
+        unit.value_len > warmup_options.max_total_bytes -
+                             static_cast<size_t>(warmup_stats_.payload_bytes)) {
+      ++warmup_stats_.skipped_too_large;
+      return finish(IOStatus::Corruption(
+          "cache warmup stream exceeds destination aggregate byte limit"));
+    }
+
+    CacheWarmupPriorityTransferStats* priority_stats =
+        CacheWarmupStatsForPriority(&warmup_stats_, unit.priority);
+    ++warmup_stats_.entries_received;
+    ++priority_stats->entries_received;
+    warmup_stats_.payload_bytes += unit.value_len;
+    priority_stats->payload_bytes += unit.value_len;
+
+    CacheAllocationPtr buf = AllocateBlock(unit.value_len, nullptr);
+    if (unit.value_len != 0) {
+      std::memcpy(buf.get(), unit.value, unit.value_len);
+    }
+    BlockContents contents(std::move(buf), unit.value_len);
+    std::unique_ptr<Block> block_holder;
+    block_holder.reset(BlocklikeTraits<Block>::Create(
+        std::move(contents), toptions_.read_amp_bytes_per_bit,
+        /*statistics=*/nullptr, /*using_zstd=*/false,
+        toptions_.filter_policy.get()));
+    if (block_holder == nullptr) {
+      ++warmup_stats_.skipped_unsupported;
+      continue;
+    }
+
+    const size_t charge = block_holder->ApproximateMemoryUsage();
+    Cache::CacheWarmupInsertResult insert_result =
+        Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    Status insert_status = primary_cache_->InsertForCacheWarmup(
+        unit.key, block_holder.get(), charge, helper->del_cb, unit.priority,
+        &insert_result);
+    if (!insert_status.ok()) {
+      return finish(status_to_io_status(std::move(insert_status)));
+    }
+    switch (insert_result) {
+      case Cache::CacheWarmupInsertResult::kInserted:
+        block_holder.release();  // cache owns it only for this outcome
+        ++warmup_stats_.entries_inserted;
+        ++priority_stats->entries_inserted;
+        break;
+      case Cache::CacheWarmupInsertResult::kDuplicate:
+        ++warmup_stats_.entries_duplicate;
+        ++priority_stats->entries_duplicate;
+        break;
+      case Cache::CacheWarmupInsertResult::kRejectedNoSpace:
+        ++warmup_stats_.entries_rejected_no_space;
+        ++priority_stats->entries_rejected_no_space;
+        break;
+      default:
+        ++warmup_stats_.skipped_invalid;
+        return finish(
+            IOStatus::Corruption("unknown cache warmup admission outcome"));
+    }
+  }
+}
+
 // Read and copy the dump unit metadata to std::string data, decode and create
 // the unit metadata based on the string
 IOStatus CacheDumpedLoaderImpl::ReadDumpUnitMeta(std::string* data,
@@ -552,6 +1089,67 @@ IOStatus CacheDumpedLoaderImpl::ReadCacheBlock(std::string* data,
         "Checksum does not match! Read dumped unit corrupted!");
   }
   return io_s;
+}
+
+IOStatus CacheDumpedLoaderImpl::ReadWarmupUnit(size_t len, std::string* data,
+                                               CacheWarmupDumpUnit* unit) {
+  assert(reader_ != nullptr);
+  assert(data != nullptr);
+  assert(unit != nullptr);
+  IOStatus io_s = reader_->ReadPacket(data);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  if (data->size() != len) {
+    return IOStatus::Corruption(
+        "cache warmup packet size differs from its metadata");
+  }
+  return status_to_io_status(
+      CacheDumperHelper::DecodeWarmupDumpUnit(*data, unit));
+}
+
+IOStatus CacheDumpedLoaderImpl::ReadWarmupHeader(std::string* data,
+                                                 CacheWarmupDumpUnit* unit) {
+  DumpUnitMeta header_meta;
+  header_meta.reset();
+  std::string metadata;
+  IOStatus io_s = ReadDumpUnitMeta(&metadata, &header_meta);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  io_s = ReadWarmupUnit(header_meta.dump_unit_size, data, unit);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  if (crc32c::Value(data->data(), data->size()) !=
+      header_meta.dump_unit_checksum) {
+    return IOStatus::Corruption("cache warmup header checksum mismatch");
+  }
+  if (unit->type != CacheWarmupDumpUnitType::kHeader) {
+    return IOStatus::Corruption(
+        "cache warmup stream does not start with header");
+  }
+  return IOStatus::OK();
+}
+
+IOStatus CacheDumpedLoaderImpl::ReadWarmupCacheBlock(
+    std::string* data, CacheWarmupDumpUnit* unit) {
+  DumpUnitMeta metadata;
+  metadata.reset();
+  std::string metadata_string;
+  IOStatus io_s = ReadDumpUnitMeta(&metadata_string, &metadata);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  io_s = ReadWarmupUnit(metadata.dump_unit_size, data, unit);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  if (crc32c::Value(data->data(), data->size()) !=
+      metadata.dump_unit_checksum) {
+    return IOStatus::Corruption("cache warmup unit checksum mismatch");
+  }
+  return IOStatus::OK();
 }
 
 }  // namespace ROCKSDB_NAMESPACE

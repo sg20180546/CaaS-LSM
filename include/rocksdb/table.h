@@ -145,6 +145,20 @@ struct BlockBasedTableOptions {
   // block cache regardless of this option.
   bool cache_index_and_filter_blocks = false;
 
+  // Experimental relink warmup support. When enabled, a TableReader performs
+  // a complete metadata-read plan at open and retains an immutable copy of the
+  // exact SST byte ranges read. A migration can then reconstruct the same
+  // reader on a destination without an additional storage read or dependency
+  // on block-cache contents. Disabled by default so baseline opens have no
+  // recording or memory overhead.
+  bool cache_warmup_metadata_transfer = false;
+
+  // Hard per-TableReader bound for the retained metadata above. If an open
+  // needs more bytes, that reader simply becomes unavailable for best-effort
+  // warmup; foreground reads are unaffected. This bounds both capture CPU and
+  // retained memory before any migration starts.
+  size_t cache_warmup_metadata_max_bytes = 8u << 20;
+
   // If cache_index_and_filter_blocks is enabled, cache index and filter
   // blocks with high priority. If set to true, depending on implementation of
   // block cache, index, filter, and other metadata blocks may be less likely
@@ -914,6 +928,11 @@ class TableFactory : public Customizable {
 
   // Return is delete range supported
   virtual bool IsDeleteRangeSupported() const { return false; }
+
+  // Whether TableCache should record the metadata reads performed while
+  // constructing a reader for later relink warmup transfer.
+  virtual bool ShouldCaptureTableCacheWarmup() const { return false; }
+  virtual size_t TableCacheWarmupMaxBytes() const { return 0; }
 };
 
 #ifndef ROCKSDB_LITE

@@ -99,6 +99,11 @@ enum NewFileCustomTag : uint32_t {
 
   // Forward incompatible (aka unignorable) fields
   kPathId,
+  // [relink] A reader that ignores this field would expose the SST's original
+  // sequence numbers instead of its migration GSN, which can silently change
+  // key visibility and conflict resolution. Keep it unignorable so an older
+  // binary fails open rather than reading a relinked DB incorrectly.
+  kGlobalSeqnoOverride,
 };
 
 class VersionSet;
@@ -121,10 +126,11 @@ struct FileDescriptor {
   uint64_t file_size;             // File size in bytes
   SequenceNumber smallest_seqno;  // The smallest seqno in this file
   SequenceNumber largest_seqno;   // The largest seqno in this file
-  // [relink] per-file GSN override (key-group migration). kDisableGlobalSequenceNumber
-  // (default) = inert (use per-key seqnos, normal behavior). A real value overrides
-  // ALL keys in this file to that seqno at read time. Only set by RegisterExternalFileInPlace.
-  // NOTE: in-memory only for now; MANIFEST persistence (recovery) is a follow-up.
+  // [relink] per-file GSN override (key-group migration).
+  // kDisableGlobalSequenceNumber (default) = inert (use per-key seqnos, normal
+  // behavior). A real value overrides ALL keys in this file to that seqno at
+  // read time. Only set by RegisterExternalFileInPlace. Persisted in the
+  // MANIFEST for relinked files.
   SequenceNumber global_seqno_override = kDisableGlobalSequenceNumber;
   // [relink] non-empty => SST is at this absolute HDFS path (no rename).
   // EMPTY (default) => normal behavior (path derived from dbname+file_number).

@@ -22,6 +22,10 @@
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
 
+// Internal marker used for entries that account for an object retained only
+// in secondary cache.
+extern void* const kDummyValueMarker;
+
 // LRU cache implementation. This class is not thread-safe.
 
 // An entry is a variable length heap-allocated structure.
@@ -36,6 +40,9 @@ namespace lru_cache {
 // 2. Not referenced externally AND in hash table.
 //    In that case the entry is in the LRU list and can be freed.
 //    (refs == 0 && in_cache == true)
+//    A short-lived cache-warmup lease is the only exception: it keeps one
+//    reference while remaining in its original LRU position, and eviction
+//    skips it until that lease is released.
 // 3. Referenced externally AND not in hash table.
 //    In that case the entry is not in the LRU list and not in hash table.
 //    The entry must be freed if refs becomes 0 in this state.
@@ -83,6 +90,11 @@ struct LRUHandle {
     M_IN_HIGH_PRI_POOL = (1 << 2),
     // Whether this entry is in low-pri pool.
     M_IN_LOW_PRI_POOL = (1 << 3),
+    // A bounded, no-hit reference held by cache warmup.
+    M_WARMUP_PINNED = (1 << 4),
+    // A duplicate warmup entry requested promotion once external refs drain.
+    M_WARMUP_PROMOTE_HIGH = (1 << 5),
+    M_WARMUP_PROMOTE_LOW = (1 << 6),
   };
 
   // "Immutable" flags - only set in single-threaded context and then
@@ -130,6 +142,20 @@ struct LRUHandle {
   bool IsLowPri() const { return im_flags & IM_IS_LOW_PRI; }
   bool InLowPriPool() const { return m_flags & M_IN_LOW_PRI_POOL; }
   bool HasHit() const { return m_flags & M_HAS_HIT; }
+  bool IsInLRU() const {
+    assert((next == nullptr) == (prev == nullptr));
+    return next != nullptr;
+  }
+  bool IsWarmupPinned() const { return m_flags & M_WARMUP_PINNED; }
+  Cache::Priority GetWarmupPromotionPriority() const {
+    if (m_flags & M_WARMUP_PROMOTE_HIGH) {
+      return Cache::Priority::HIGH;
+    }
+    if (m_flags & M_WARMUP_PROMOTE_LOW) {
+      return Cache::Priority::LOW;
+    }
+    return Cache::Priority::BOTTOM;
+  }
   bool IsSecondaryCacheCompatible() const {
     return im_flags & IM_IS_SECONDARY_CACHE_COMPATIBLE;
   }
@@ -177,6 +203,28 @@ struct LRUHandle {
   }
 
   void SetHit() { m_flags |= M_HAS_HIT; }
+
+  void SetWarmupPinned(bool warmup_pinned) {
+    if (warmup_pinned) {
+      m_flags |= M_WARMUP_PINNED;
+    } else {
+      m_flags &= ~M_WARMUP_PINNED;
+    }
+  }
+
+  void RequestWarmupPromotion(Cache::Priority priority) {
+    if (priority == Cache::Priority::HIGH) {
+      m_flags |= M_WARMUP_PROMOTE_HIGH;
+      m_flags &= ~M_WARMUP_PROMOTE_LOW;
+    } else if (priority == Cache::Priority::LOW &&
+               !(m_flags & M_WARMUP_PROMOTE_HIGH)) {
+      m_flags |= M_WARMUP_PROMOTE_LOW;
+    }
+  }
+
+  void ClearWarmupPromotion() {
+    m_flags &= ~(M_WARMUP_PROMOTE_HIGH | M_WARMUP_PROMOTE_LOW);
+  }
 
   void SetSecondaryCacheCompatible(bool compat) {
     if (compat) {
@@ -368,6 +416,26 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
     return Lookup(key, hash, nullptr, nullptr, Cache::Priority::LOW, true,
                   nullptr);
   }
+  LRUHandle* LookupForCacheWarmup(const Slice& key, uint32_t hash,
+                                  Cache::Priority* effective_priority);
+  bool ReleaseForCacheWarmup(LRUHandle* handle,
+                             Cache::Priority effective_priority);
+  Status InsertForCacheWarmup(const Slice& key, uint32_t hash, void* value,
+                              size_t charge, Cache::DeleterFn deleter,
+                              Cache::Priority priority,
+                              Cache::CacheWarmupInsertResult* result);
+  Status InsertForCacheWarmupNoEvict(const Slice& key, uint32_t hash,
+                                     void* value, size_t charge,
+                                     Cache::DeleterFn deleter,
+                                     Cache::Priority priority,
+                                     Cache::CacheWarmupInsertResult* result);
+  Status ReplaceForCacheWarmup(const Slice& victim_key, uint32_t victim_hash,
+                               const Slice& key, uint32_t hash, void* value,
+                               size_t charge, Cache::DeleterFn deleter,
+                               Cache::Priority priority,
+                               Cache::CacheWarmupInsertResult* result);
+  Status PromoteForCacheWarmup(const Slice& key, uint32_t hash,
+                               Cache::Priority priority);
   bool Release(LRUHandle* handle, bool useful, bool erase_if_last_ref);
   bool IsReady(LRUHandle* /*handle*/);
   void Wait(LRUHandle* /*handle*/) {}
@@ -386,6 +454,9 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   void ApplyToSomeEntries(
       const std::function<void(const Slice& key, void* value, size_t charge,
                                DeleterFn deleter)>& callback,
+      size_t average_entries_per_lock, size_t* state);
+  void ApplyToSomeEntriesForCacheWarmup(
+      const Cache::CacheWarmupMetadataCallback& callback,
       size_t average_entries_per_lock, size_t* state);
 
   void EraseUnRefEntries();
@@ -428,6 +499,23 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   void Promote(LRUHandle* e);
   void LRU_Remove(LRUHandle* e);
   void LRU_Insert(LRUHandle* e);
+  void LRU_InsertInPriorityPool(LRUHandle* e, Cache::Priority priority);
+
+  // Returns the entry's current pool, excluding a deferred warmup promotion.
+  // mutex_ must be held.
+  Cache::Priority GetCurrentPriority(const LRUHandle* e) const;
+
+  // Returns the entry's effective LRU pool, including a deferred warmup
+  // promotion. mutex_ must be held.
+  Cache::Priority GetEffectivePriority(const LRUHandle* e) const;
+
+  // Maps a wire/source priority to a pool configured on this destination.
+  // mutex_ must be held.
+  Cache::Priority NormalizePriorityForPools(Cache::Priority priority) const;
+
+  // Applies a strictly higher normalized priority to a duplicate without
+  // changing its value ownership. mutex_ must be held.
+  void PromoteWarmupDuplicate(LRUHandle* resident, Cache::Priority priority);
 
   // Overflow the last entry in high-pri pool to low-pri pool until size of
   // high-pri pool is no larger than the size specify by high_pri_pool_pct.
@@ -498,6 +586,10 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Memory size for entries residing only in the LRU list.
   size_t lru_usage_;
 
+  // Memory size for short-lived warmup pins that remain linked in the LRU.
+  // Needed so GetPinnedUsage() remains exact while recency is preserved.
+  size_t lru_warmup_pinned_usage_;
+
   // mutex_ protects the following state.
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
@@ -525,6 +617,25 @@ class LRUCache
   size_t GetCharge(Handle* handle) const override;
   DeleterFn GetDeleter(Handle* handle) const override;
   void WaitAll(std::vector<Handle*>& handles) override;
+  Status ApplyToAllEntriesForCacheWarmup(
+      const CacheWarmupMetadataCallback& callback,
+      const ApplyToAllEntriesOptions& opts) override;
+  Status LookupForCacheWarmup(const Slice& key, Handle** handle,
+                              Priority* effective_priority) override;
+  bool ReleaseForCacheWarmup(Handle* handle,
+                             Priority effective_priority) override;
+  Status InsertForCacheWarmup(const Slice& key, void* value, size_t charge,
+                              DeleterFn deleter, Priority priority,
+                              CacheWarmupInsertResult* result) override;
+  Status InsertForCacheWarmupNoEvict(const Slice& key, void* value,
+                                     size_t charge, DeleterFn deleter,
+                                     Priority priority,
+                                     CacheWarmupInsertResult* result) override;
+  Status ReplaceForCacheWarmup(const Slice& victim_key, const Slice& key,
+                               void* value, size_t charge, DeleterFn deleter,
+                               Priority priority,
+                               CacheWarmupInsertResult* result) override;
+  Status PromoteForCacheWarmup(const Slice& key, Priority priority) override;
 
   // Retrieves number of elements in LRU, for unit test purpose only.
   size_t TEST_GetLRUSize();

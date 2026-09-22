@@ -12,6 +12,7 @@
 #pragma once
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -36,6 +37,23 @@ class Arena;
 struct FileDescriptor;
 class GetContext;
 class HistogramImpl;
+
+struct TableCacheWarmupSourceStats {
+  uint64_t requested = 0;
+  uint64_t resident = 0;
+  uint64_t copied = 0;
+  uint64_t bytes = 0;
+  uint64_t skipped_busy = 0;
+  uint64_t skipped_unavailable = 0;
+  uint64_t skipped_too_large = 0;
+};
+
+struct TableCacheWarmupSnapshotInternal {
+  uint64_t file_number = 0;
+  std::string external_file;
+  std::shared_ptr<const TableCacheWarmupBundle> bundle;
+  size_t payload_bytes = 0;
+};
 
 // Manages caching for TableReader objects for a column family. The actual
 // cache is allocated separately and passed to the constructor. TableCache
@@ -188,6 +206,13 @@ class TableCache {
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
       bool no_io = false);
 
+  // Copies properties for TableReaders already present in the backing cache.
+  // This enumerates cache entries directly, so it performs no file I/O and
+  // does not record hits or perturb table-cache recency.
+  Status GetPropertiesOfResidentTables(
+      std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+          properties);
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
@@ -232,20 +257,63 @@ class TableCache {
     }
   }
 
-  // [relink tail-preload 2026-09-20] Hand this cache the tail bytes of a file the
-  // migration source already sent over the network, so the NEXT open of that file
-  // (whether this is a deliberate warm-up or an ordinary read that got there
-  // first) builds its TableReader with zero storage I/O. See
-  // file/tail_backed_random_access_file.h for what a "tail" is and why serving it
-  // at the file layer is enough to cover every metadata read Open issues.
-  //
-  // The entry is consumed by the first open of that file number and is dropped
-  // even if the open fails, so a stale tail can never outlive the file identity
-  // it was captured for. Unclaimed entries are freed by DropPendingTails().
-  void AddPendingTail(uint64_t file_number, uint64_t tail_offset,
-                      std::string&& tail);
-  void DropPendingTails();
-  size_t PendingTailBytes() const;
+  // Captures requested resident readers one at a time. Lookup takes a bounded,
+  // no-hit warmup lease under the cache shard lock and retains immutable bundle
+  // ownership. The cache handle is released before payload copying or callback
+  // transport I/O. Entries already leased by another warmup are skipped.
+  using TableCacheWarmupCallback = std::function<Status(
+      const std::string& external_file, TableCacheWarmupBundle&& bundle)>;
+  Status StreamTableCacheWarmupEntries(
+      const std::vector<std::pair<uint64_t, std::string>>& files,
+      size_t max_entry_bytes, const TableCacheWarmupCallback& callback,
+      TableCacheWarmupSourceStats* stats);
+  Status SnapshotTableCacheWarmupEntries(
+      const std::vector<std::pair<uint64_t, std::string>>& files,
+      size_t max_entry_bytes,
+      std::vector<TableCacheWarmupSnapshotInternal>* entries,
+      TableCacheWarmupSourceStats* stats);
+
+  // Builds a reader entirely off-cache from an immutable in-memory metadata
+  // bundle. This validates completeness before any destination resident is
+  // considered for eviction and never acquires the ordinary loader mutex.
+  Status PrepareTableReaderForWarmup(
+      const FileOptions& file_options,
+      const InternalKeyComparator& internal_comparator,
+      const FileMetaData& file_meta,
+      const std::shared_ptr<const SliceTransform>& prefix_extractor,
+      HistogramImpl* file_read_hist, int level,
+      size_t max_file_size_for_l0_meta_pin,
+      std::shared_ptr<const TableCacheWarmupBundle> bundle,
+      std::unique_ptr<TableReader>* table_reader);
+
+  Status InsertPreparedTableReaderForWarmup(
+      uint64_t file_number, int level,
+      std::unique_ptr<TableReader>* table_reader,
+      Cache::CacheWarmupInsertResult* result);
+  Status InsertPreparedTableReaderForWarmupNoEvict(
+      uint64_t file_number, int level,
+      std::unique_ptr<TableReader>* table_reader,
+      Cache::CacheWarmupInsertResult* result);
+  Status ReplacePreparedTableReaderForWarmup(
+      uint64_t victim_file_number, uint64_t file_number, int level,
+      std::unique_ptr<TableReader>* table_reader,
+      Cache::CacheWarmupInsertResult* result);
+  Status PromoteFileForCacheWarmup(uint64_t file_number, int level);
+
+  void GetResidentFileNumbers(std::vector<uint64_t>* file_numbers) const;
+  void EraseFile(uint64_t file_number);
+  size_t GetCapacity() const { return cache_->GetCapacity(); }
+  size_t GetOccupancyCount() const { return cache_->GetOccupancyCount(); }
+  size_t GetCacheWarmupShardCount() const {
+    return cache_->GetCacheWarmupShardCount();
+  }
+  size_t GetCacheWarmupShardIndex(uint64_t file_number) const;
+  size_t GetCacheWarmupShardCapacity(size_t shard) const {
+    return cache_->GetCacheWarmupShardCapacity(shard);
+  }
+  size_t GetCacheWarmupShardUsage(size_t shard) const {
+    return cache_->GetCacheWarmupShardUsage(shard);
+  }
 
   // [relink tail-preload 2026-09-20] When on, a table cache entry is inserted with
   // a priority derived from the file's LSM level: level 0 -> HIGH, everything else
@@ -254,7 +322,9 @@ class TableCache {
   // fanout -- keeping the shallow files resident is worth far more per cache slot.
   // Off (default) keeps the stock 4-argument Insert, i.e. LOW for everything, so a
   // baseline run is byte-identical.
-  void SetLevelPriority(bool on) { level_priority_ = on; }
+  void SetLevelPriority(bool on) {
+    level_priority_.store(on, std::memory_order_relaxed);
+  }
 
  private:
   // Build a table reader
@@ -268,7 +338,8 @@ class TableCache {
       bool skip_filters = false, int level = -1,
       bool prefetch_index_and_filter_in_cache = true,
       size_t max_file_size_for_l0_meta_pin = 0,
-      Temperature file_temperature = Temperature::kUnknown);
+      Temperature file_temperature = Temperature::kUnknown,
+      std::shared_ptr<const TableCacheWarmupBundle> warmup_bundle = nullptr);
 
   // Update the max_covering_tombstone_seq in the GetContext for each key based
   // on the range deletions in the table
@@ -298,15 +369,7 @@ class TableCache {
   std::shared_ptr<IOTracer> io_tracer_;
   std::string db_session_id_;
 
-  // [relink tail-preload 2026-09-20] file number -> (tail offset, tail bytes)
-  // shipped by the migration source and not yet consumed by an open. Guarded by
-  // its own mutex rather than loader_mutex_ because entries are produced in bulk
-  // by the install path and consumed one at a time from GetTableReader; the map
-  // is empty on every non-relink DB, so the hot path pays one relaxed load.
-  mutable port::Mutex pending_tails_mu_;
-  std::unordered_map<uint64_t, std::pair<uint64_t, std::string>> pending_tails_;
-  std::atomic<bool> has_pending_tails_{false};
-  bool level_priority_ = false;
+  std::atomic<bool> level_priority_{false};
 };
 
 }  // namespace ROCKSDB_NAMESPACE

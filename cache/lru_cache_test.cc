@@ -5,7 +5,11 @@
 
 #include "cache/lru_cache.h"
 
+#include <array>
+#include <atomic>
+#include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "cache/cache_key.h"
@@ -26,6 +30,14 @@
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+void WarmupIncrementDeleter(const Slice& /*key*/, void* value) {
+  ++*static_cast<int*>(value);
+}
+
+}  // namespace
 
 class LRUCacheTest : public testing::Test {
  public:
@@ -140,7 +152,7 @@ class LRUCacheTest : public testing::Test {
     ASSERT_EQ(num_bottom_pri_pool_keys, bottom_pri_pool_keys);
   }
 
- private:
+ protected:
   LRUCacheShard* cache_ = nullptr;
 };
 
@@ -362,6 +374,935 @@ TEST_F(LRUCacheTest, EntriesWithPriority) {
   // Bottom-pri entries will be inserted to head of high-pri pool after lookup.
   ASSERT_TRUE(Lookup("m"));
   ValidateLRUList({"x", "y", "g", "z", "d", "m"}, 2, 2, 2);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupMetadataAndLookupDoNotRecordHit) {
+  NewCache(3, /*high_pri_pool_ratio=*/0.34,
+           /*low_pri_pool_ratio=*/0.34);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  Insert("low", Cache::Priority::LOW);
+  Insert("high", Cache::Priority::HIGH);
+
+  std::map<std::string, Cache::Priority> priorities;
+  size_t state = 0;
+  do {
+    cache_->ApplyToSomeEntriesForCacheWarmup(
+        [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
+            Cache::Priority priority) {
+          EXPECT_EQ(1U, charge);
+          EXPECT_EQ(nullptr, deleter);
+          priorities[key.ToString()] = priority;
+        },
+        /*average_entries_per_lock=*/1, &state);
+  } while (state != SIZE_MAX);
+  ASSERT_EQ(3U, priorities.size());
+  EXPECT_EQ(Cache::Priority::BOTTOM, priorities["bottom"]);
+  EXPECT_EQ(Cache::Priority::LOW, priorities["low"]);
+  EXPECT_EQ(Cache::Priority::HIGH, priorities["high"]);
+
+  Cache::Priority priority = Cache::Priority::HIGH;
+  LRUHandle* handle =
+      cache_->LookupForCacheWarmup("bottom", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(Cache::Priority::BOTTOM, priority);
+  EXPECT_FALSE(handle->HasHit());
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(handle, priority));
+
+  // If the warmup lookup had called SetHit(), "bottom" would have been
+  // promoted and there would be no BOTTOM victim for this LOW admission.
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-low", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_FALSE(Lookup("bottom"));
+  EXPECT_TRUE(Lookup("low"));
+  EXPECT_TRUE(Lookup("high"));
+  EXPECT_TRUE(Lookup("incoming-low"));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupReleasePreservesDemotedClass) {
+  NewCache(3, /*high_pri_pool_ratio=*/0.34,
+           /*low_pri_pool_ratio=*/0.34);
+  Insert("high-a", Cache::Priority::HIGH);
+  Insert("high-b", Cache::Priority::HIGH);
+  Insert("high-c", Cache::Priority::HIGH);
+
+  // Pool limits spill the oldest HIGH-tagged entry all the way to BOTTOM.
+  // A normal Release() would look at its immutable HIGH tag and promote it.
+  Cache::Priority priority = Cache::Priority::HIGH;
+  LRUHandle* handle =
+      cache_->LookupForCacheWarmup("high-a", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, handle);
+  ASSERT_EQ(Cache::Priority::BOTTOM, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(handle, priority));
+
+  std::map<std::string, Cache::Priority> priorities;
+  size_t state = 0;
+  do {
+    cache_->ApplyToSomeEntriesForCacheWarmup(
+        [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
+            Cache::Priority effective_priority) {
+          priorities[key.ToString()] = effective_priority;
+        },
+        /*average_entries_per_lock=*/1, &state);
+  } while (state != SIZE_MAX);
+  EXPECT_EQ(Cache::Priority::BOTTOM, priorities["high-a"]);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLeasePreservesExactRecency) {
+  NewCache(3, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  Insert("a");
+  Insert("b");
+  Insert("c");
+  ValidateLRUList({"a", "b", "c"}, 0, 3);
+
+  Cache::Priority priority;
+  LRUHandle* middle = cache_->LookupForCacheWarmup("b", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, middle);
+  EXPECT_EQ(1U, cache_->GetPinnedUsage());
+  ValidateLRUList({"a", "b", "c"}, 0, 3);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(middle, priority));
+  EXPECT_EQ(0U, cache_->GetPinnedUsage());
+  ValidateLRUList({"a", "b", "c"}, 0, 3);
+
+  // A leased oldest entry is pinned, so normal admission evicts the next
+  // oldest entry without moving the lease. Once released, it is still oldest.
+  LRUHandle* oldest = cache_->LookupForCacheWarmup("a", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, oldest);
+  Insert("d");
+  ValidateLRUList({"a", "c", "d"}, 0, 3);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(oldest, priority));
+  ValidateLRUList({"a", "c", "d"}, 0, 3);
+  Insert("e");
+  ValidateLRUList({"c", "d", "e"}, 0, 3);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupReleaseHonorsConcurrentRealHit) {
+  NewCache(3, /*high_pri_pool_ratio=*/0.34,
+           /*low_pri_pool_ratio=*/0.34);
+  Insert("high-a", Cache::Priority::HIGH);
+  Insert("high-b", Cache::Priority::HIGH);
+  Insert("high-c", Cache::Priority::HIGH);
+
+  Cache::Priority priority = Cache::Priority::HIGH;
+  LRUHandle* warmup =
+      cache_->LookupForCacheWarmup("high-a", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, warmup);
+  ASSERT_EQ(Cache::Priority::BOTTOM, priority);
+
+  // A foreground lookup during the lease is a real touch and must retain its
+  // normal HIGH promotion even when the warmup reference happens to be last.
+  LRUHandle* foreground = cache_->Lookup("high-a", 0 /*hash*/);
+  ASSERT_NE(nullptr, foreground);
+  EXPECT_FALSE(cache_->Release(foreground, true /*useful*/, false /*erase*/));
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+
+  Cache::Priority after = Cache::Priority::BOTTOM;
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("high-a", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupReleaseBeforeConcurrentRealHit) {
+  NewCache(3, /*high_pri_pool_ratio=*/0.34,
+           /*low_pri_pool_ratio=*/0.34);
+  Insert("high-a", Cache::Priority::HIGH);
+  Insert("high-b", Cache::Priority::HIGH);
+  Insert("high-c", Cache::Priority::HIGH);
+
+  Cache::Priority priority;
+  LRUHandle* warmup =
+      cache_->LookupForCacheWarmup("high-a", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, warmup);
+  ASSERT_EQ(Cache::Priority::BOTTOM, priority);
+  LRUHandle* foreground = cache_->Lookup("high-a", 0 /*hash*/);
+  ASSERT_NE(nullptr, foreground);
+
+  // The opposite release order must retain the foreground hit as well.
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+  EXPECT_FALSE(cache_->Release(foreground, true /*useful*/, false /*erase*/));
+
+  Cache::Priority after;
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("high-a", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupConcurrentHitReleaseOrderStress) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  Insert("key", Cache::Priority::BOTTOM);
+
+  for (int i = 0; i < 500; ++i) {
+    Cache::Priority priority;
+    LRUHandle* warmup =
+        cache_->LookupForCacheWarmup("key", 0 /*hash*/, &priority);
+    ASSERT_NE(nullptr, warmup);
+
+    std::atomic<bool> acquired{false};
+    std::atomic<bool> release_foreground{false};
+    std::atomic<bool> lookup_failed{false};
+    std::thread foreground_thread([&] {
+      LRUHandle* foreground = cache_->Lookup("key", 0 /*hash*/);
+      if (foreground == nullptr) {
+        lookup_failed.store(true, std::memory_order_relaxed);
+        acquired.store(true, std::memory_order_release);
+        return;
+      }
+      acquired.store(true, std::memory_order_release);
+      while (!release_foreground.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+      }
+      cache_->Release(foreground, true /*useful*/, false /*erase*/);
+    });
+    while (!acquired.load(std::memory_order_acquire)) {
+      std::this_thread::yield();
+    }
+    if (lookup_failed.load(std::memory_order_relaxed)) {
+      release_foreground.store(true, std::memory_order_release);
+      foreground_thread.join();
+      cache_->ReleaseForCacheWarmup(warmup, priority);
+      FAIL() << "foreground lookup unexpectedly missed";
+    }
+
+    if ((i & 1) == 0) {
+      release_foreground.store(true, std::memory_order_release);
+      foreground_thread.join();
+      EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+    } else {
+      EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+      release_foreground.store(true, std::memory_order_release);
+      foreground_thread.join();
+    }
+  }
+
+  Cache::Priority priority;
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("key", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, priority));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLeasesNormallyPinnedEntryBothReleaseOrders) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int first_deleted = 0;
+  int second_deleted = 0;
+
+  // Model TableCache's resident table_reader_handle: insertion itself returns
+  // a long-lived normal pin without recording a cache hit.
+  LRUHandle* first_normal = nullptr;
+  ASSERT_OK(cache_->Insert("first", 0 /*hash*/, &first_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, &first_normal,
+                           Cache::Priority::LOW));
+  ASSERT_NE(nullptr, first_normal);
+  ASSERT_EQ(1U, cache_->GetPinnedUsage());
+
+  Cache::Priority first_priority = Cache::Priority::BOTTOM;
+  LRUHandle* first_warmup =
+      cache_->LookupForCacheWarmup("first", 0 /*hash*/, &first_priority);
+  ASSERT_NE(nullptr, first_warmup);
+  EXPECT_EQ(Cache::Priority::LOW, first_priority);
+  EXPECT_EQ(&first_deleted, first_warmup->value);
+  // References, rather than bytes, increased, so pinned usage stays exact.
+  EXPECT_EQ(1U, cache_->GetPinnedUsage());
+  Cache::Priority ignored;
+  EXPECT_EQ(nullptr,
+            cache_->LookupForCacheWarmup("first", 0 /*hash*/, &ignored));
+
+  // Normal pin released first; the warmup release becomes the last release and
+  // must restore LOW without manufacturing a hit.
+  EXPECT_FALSE(cache_->Release(first_normal, true /*useful*/, false /*erase*/));
+  EXPECT_EQ(1U, cache_->GetPinnedUsage());
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(first_warmup, first_priority));
+  EXPECT_EQ(0U, cache_->GetPinnedUsage());
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("first", 0 /*hash*/, &ignored);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::LOW, ignored);
+  EXPECT_EQ(&first_deleted, verify->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, ignored));
+
+  LRUHandle* second_normal = nullptr;
+  ASSERT_OK(cache_->Insert("second", 0 /*hash*/, &second_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, &second_normal,
+                           Cache::Priority::LOW));
+  ASSERT_NE(nullptr, second_normal);
+  Cache::Priority second_priority;
+  LRUHandle* second_warmup =
+      cache_->LookupForCacheWarmup("second", 0 /*hash*/, &second_priority);
+  ASSERT_NE(nullptr, second_warmup);
+  ASSERT_EQ(Cache::Priority::LOW, second_priority);
+
+  // Warmup released first; the ordinary release remains responsible for the
+  // same LOW insertion policy.
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(second_warmup, second_priority));
+  EXPECT_EQ(1U, cache_->GetPinnedUsage());
+  EXPECT_FALSE(
+      cache_->Release(second_normal, true /*useful*/, false /*erase*/));
+  EXPECT_EQ(0U, cache_->GetPinnedUsage());
+  verify = cache_->LookupForCacheWarmup("second", 0 /*hash*/, &ignored);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::LOW, ignored);
+  EXPECT_EQ(&second_deleted, verify->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, ignored));
+
+  cache_->Erase("first", 0 /*hash*/);
+  cache_->Erase("second", 0 /*hash*/);
+  EXPECT_EQ(1, first_deleted);
+  EXPECT_EQ(1, second_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLeasesLookupPinnedEntryBothReleaseOrders) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  Insert("first", Cache::Priority::LOW);
+  Insert("second", Cache::Priority::LOW);
+
+  // Unlike an insertion handle, Lookup() is a real hit. Acquiring the warmup
+  // lease afterward must neither lose nor add to that hit, regardless of which
+  // reference is released last.
+  LRUHandle* first_normal = cache_->Lookup("first", 0 /*hash*/);
+  ASSERT_NE(nullptr, first_normal);
+  Cache::Priority first_before;
+  LRUHandle* first_warmup =
+      cache_->LookupForCacheWarmup("first", 0 /*hash*/, &first_before);
+  ASSERT_NE(nullptr, first_warmup);
+  ASSERT_EQ(Cache::Priority::LOW, first_before);
+  EXPECT_FALSE(cache_->Release(first_normal, true /*useful*/, false /*erase*/));
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(first_warmup, first_before));
+
+  Cache::Priority after;
+  LRUHandle* verify = cache_->LookupForCacheWarmup("first", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+
+  LRUHandle* second_normal = cache_->Lookup("second", 0 /*hash*/);
+  ASSERT_NE(nullptr, second_normal);
+  Cache::Priority second_before;
+  LRUHandle* second_warmup =
+      cache_->LookupForCacheWarmup("second", 0 /*hash*/, &second_before);
+  ASSERT_NE(nullptr, second_warmup);
+  ASSERT_EQ(Cache::Priority::LOW, second_before);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(second_warmup, second_before));
+  EXPECT_FALSE(
+      cache_->Release(second_normal, true /*useful*/, false /*erase*/));
+  verify = cache_->LookupForCacheWarmup("second", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupNormallyPinnedLifetimeAcrossErase) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int first_deleted = 0;
+  int second_deleted = 0;
+
+  LRUHandle* first_normal = nullptr;
+  ASSERT_OK(cache_->Insert("first", 0 /*hash*/, &first_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, &first_normal,
+                           Cache::Priority::LOW));
+  Cache::Priority first_priority;
+  LRUHandle* first_warmup =
+      cache_->LookupForCacheWarmup("first", 0 /*hash*/, &first_priority);
+  ASSERT_NE(nullptr, first_warmup);
+  cache_->Erase("first", 0 /*hash*/);
+  EXPECT_EQ(0, first_deleted);
+  EXPECT_FALSE(cache_->Release(first_normal, true /*useful*/, false /*erase*/));
+  EXPECT_EQ(0, first_deleted);
+  EXPECT_TRUE(cache_->ReleaseForCacheWarmup(first_warmup, first_priority));
+  EXPECT_EQ(1, first_deleted);
+
+  LRUHandle* second_normal = nullptr;
+  ASSERT_OK(cache_->Insert("second", 0 /*hash*/, &second_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, &second_normal,
+                           Cache::Priority::LOW));
+  Cache::Priority second_priority;
+  LRUHandle* second_warmup =
+      cache_->LookupForCacheWarmup("second", 0 /*hash*/, &second_priority);
+  ASSERT_NE(nullptr, second_warmup);
+  cache_->Erase("second", 0 /*hash*/);
+  EXPECT_EQ(0, second_deleted);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(second_warmup, second_priority));
+  EXPECT_EQ(0, second_deleted);
+  EXPECT_TRUE(cache_->Release(second_normal, true /*useful*/, false /*erase*/));
+  EXPECT_EQ(1, second_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLookupTreatsSecondaryDummyAsMiss) {
+  NewCache(1);
+  ASSERT_OK(cache_->Insert("dummy", 0 /*hash*/, lru_cache::kDummyValueMarker,
+                           0 /*charge*/, nullptr /*deleter*/,
+                           nullptr /*handle*/, Cache::Priority::LOW));
+
+  Cache::Priority priority = Cache::Priority::HIGH;
+  LRUHandle* handle =
+      cache_->LookupForCacheWarmup("dummy", 0 /*hash*/, &priority);
+  EXPECT_EQ(nullptr, handle);
+  cache_->Erase("dummy", 0 /*hash*/);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupDuplicateKeepsDestinationOwnership) {
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int destination_deleted = 0;
+  int incoming_deleted = 0;
+  ASSERT_OK(cache_->Insert("duplicate", 0 /*hash*/, &destination_deleted,
+                           1 /*charge*/, WarmupIncrementDeleter,
+                           nullptr /*handle*/, Cache::Priority::LOW));
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup(
+      "duplicate", 0 /*hash*/, &incoming_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  EXPECT_EQ(0, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+
+  Cache::Priority priority;
+  LRUHandle* handle =
+      cache_->LookupForCacheWarmup("duplicate", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, handle);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_EQ(&destination_deleted, handle->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(handle, priority));
+  cache_->Erase("duplicate", 0 /*hash*/);
+  EXPECT_EQ(1, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupDuplicatePromotionWaitsForPinnedResident) {
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int destination_deleted = 0;
+  int incoming_deleted = 0;
+  ASSERT_OK(cache_->Insert("duplicate", 0 /*hash*/, &destination_deleted,
+                           1 /*charge*/, WarmupIncrementDeleter,
+                           nullptr /*handle*/, Cache::Priority::BOTTOM));
+
+  Cache::Priority before;
+  LRUHandle* lease =
+      cache_->LookupForCacheWarmup("duplicate", 0 /*hash*/, &before);
+  ASSERT_NE(nullptr, lease);
+  ASSERT_EQ(Cache::Priority::BOTTOM, before);
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup(
+      "duplicate", 0 /*hash*/, &incoming_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  EXPECT_EQ(0, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(lease, before));
+
+  Cache::Priority after;
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("duplicate", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_EQ(&destination_deleted, verify->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+  cache_->Erase("duplicate", 0 /*hash*/);
+  EXPECT_EQ(1, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+
+  // The same deferred promotion is applied by ordinary Release() for an entry
+  // that was already pinned before the duplicate arrived.
+  destination_deleted = 0;
+  incoming_deleted = 0;
+  LRUHandle* pinned = nullptr;
+  ASSERT_OK(cache_->Insert("normal-pinned", 0 /*hash*/, &destination_deleted,
+                           1 /*charge*/, WarmupIncrementDeleter, &pinned,
+                           Cache::Priority::BOTTOM));
+  ASSERT_NE(nullptr, pinned);
+  ASSERT_OK(cache_->InsertForCacheWarmup(
+      "normal-pinned", 0 /*hash*/, &incoming_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  EXPECT_FALSE(cache_->Release(pinned, true /*useful*/, false /*erase*/));
+  verify = cache_->LookupForCacheWarmup("normal-pinned", 0 /*hash*/, &after);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::HIGH, after);
+  EXPECT_EQ(&destination_deleted, verify->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, after));
+  cache_->Erase("normal-pinned", 0 /*hash*/);
+  EXPECT_EQ(1, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLookupReportsDeferredPromotion) {
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  LRUHandle* pinned = nullptr;
+  ASSERT_OK(cache_->Insert("pinned", 0 /*hash*/, nullptr /*value*/,
+                           1 /*charge*/, nullptr /*deleter*/, &pinned,
+                           Cache::Priority::BOTTOM));
+  ASSERT_NE(nullptr, pinned);
+
+  ASSERT_OK(cache_->PromoteForCacheWarmup("pinned", 0 /*hash*/,
+                                          Cache::Priority::HIGH));
+
+  // The ordinary pin prevents an immediate pool move, but warmup capture must
+  // still observe and forward the deferred promotion.
+  Cache::Priority priority = Cache::Priority::BOTTOM;
+  LRUHandle* warmup =
+      cache_->LookupForCacheWarmup("pinned", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, warmup);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+
+  EXPECT_FALSE(cache_->Release(pinned, true /*useful*/, false /*erase*/));
+  warmup = cache_->LookupForCacheWarmup("pinned", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, warmup);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, priority));
+  cache_->Erase("pinned", 0 /*hash*/);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupNormalizesDisabledDestinationPools) {
+  Cache::CacheWarmupInsertResult result;
+  Cache::Priority priority;
+
+  // HIGH maps to LOW when the destination has no HIGH pool, so it cannot
+  // displace an equal-priority LOW resident.
+  NewCache(1, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  Insert("low", Cache::Priority::LOW);
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("low"));
+  EXPECT_FALSE(Lookup("incoming"));
+
+  // With free capacity, that same HIGH source entry is admitted as LOW.
+  NewCache(2, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  LRUHandle* verify =
+      cache_->LookupForCacheWarmup("incoming", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::LOW, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, priority));
+
+  // LOW maps to BOTTOM when LOW is disabled and therefore cannot evict even a
+  // BOTTOM entry. HIGH remains usable because its destination pool exists.
+  NewCache(1, /*high_pri_pool_ratio=*/1.0,
+           /*low_pri_pool_ratio=*/0.0);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-low", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("bottom"));
+
+  // Duplicate promotion is normalized by the same rule (HIGH -> LOW).
+  NewCache(4, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  Insert("duplicate", Cache::Priority::BOTTOM);
+  ASSERT_OK(cache_->InsertForCacheWarmup("duplicate", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  verify = cache_->LookupForCacheWarmup("duplicate", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, verify);
+  EXPECT_EQ(Cache::Priority::LOW, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(verify, priority));
+
+  // With neither optional pool configured, every incoming class normalizes to
+  // BOTTOM and cannot displace an existing BOTTOM entry.
+  NewCache(1, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/0.0);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-high", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("bottom"));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupAtomicExplicitVictimReplacement) {
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int victim_deleted = 0;
+  int incoming_deleted = 0;
+  ASSERT_OK(cache_->Insert("victim", 0 /*hash*/, &victim_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, nullptr /*handle*/,
+                           Cache::Priority::BOTTOM));
+  Insert("keeper", Cache::Priority::HIGH);
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "victim", 0 /*victim_hash*/, "incoming", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_EQ(1, victim_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+  EXPECT_FALSE(Lookup("victim"));
+  EXPECT_TRUE(Lookup("keeper"));
+
+  Cache::Priority priority;
+  LRUHandle* incoming =
+      cache_->LookupForCacheWarmup("incoming", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, incoming);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_EQ(&incoming_deleted, incoming->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(incoming, priority));
+  cache_->Erase("incoming", 0 /*hash*/);
+  EXPECT_EQ(1, incoming_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupAtomicReplacementAllowsEqualNormalizedClass) {
+  // Both source priorities normalize to BOTTOM when both destination pools
+  // are disabled. The explicitly selected victim is still authoritative.
+  NewCache(2, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/0.0);
+  int victim_deleted = 0;
+  int incoming_deleted = 0;
+  ASSERT_OK(cache_->Insert("victim", 0 /*hash*/, &victim_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, nullptr /*handle*/,
+                           Cache::Priority::LOW));
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "victim", 0 /*victim_hash*/, "incoming", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_EQ(1, victim_deleted);
+
+  Cache::Priority priority;
+  LRUHandle* incoming =
+      cache_->LookupForCacheWarmup("incoming", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, incoming);
+  EXPECT_EQ(Cache::Priority::BOTTOM, priority);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(incoming, priority));
+  cache_->Erase("incoming", 0 /*hash*/);
+  EXPECT_EQ(1, incoming_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupNoEvictUsesOnlyFreeShardCapacity) {
+  NewCache(2, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int keeper_deleted = 0;
+  int destination_deleted = 0;
+  int rejected_deleted = 0;
+  ASSERT_OK(cache_->Insert("keeper", 0 /*hash*/, &keeper_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, nullptr /*handle*/,
+                           Cache::Priority::BOTTOM));
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmupNoEvict(
+      "destination", 0 /*hash*/, &destination_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+
+  ASSERT_OK(cache_->InsertForCacheWarmupNoEvict(
+      "rejected", 0 /*hash*/, &rejected_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("keeper"));
+  EXPECT_TRUE(Lookup("destination"));
+  EXPECT_FALSE(Lookup("rejected"));
+  EXPECT_EQ(0, rejected_deleted);
+
+  // Duplicate admission keeps the destination value/deleter and can still
+  // promote its policy class without needing any free capacity.
+  ASSERT_OK(cache_->InsertForCacheWarmupNoEvict(
+      "destination", 0 /*hash*/, &rejected_deleted, 1 /*charge*/,
+      WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  Cache::Priority priority;
+  LRUHandle* destination =
+      cache_->LookupForCacheWarmup("destination", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, destination);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_EQ(&destination_deleted, destination->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(destination, priority));
+
+  cache_->Erase("keeper", 0 /*hash*/);
+  cache_->Erase("destination", 0 /*hash*/);
+  EXPECT_EQ(1, keeper_deleted);
+  EXPECT_EQ(1, destination_deleted);
+  EXPECT_EQ(0, rejected_deleted);
+}
+
+TEST_F(LRUCacheTest, CacheWarmupAtomicReplacementRejectsWithoutEviction) {
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  int victim_deleted = 0;
+  int destination_deleted = 0;
+  int incoming_deleted = 0;
+  ASSERT_OK(cache_->Insert("victim", 0 /*hash*/, &victim_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, nullptr /*handle*/,
+                           Cache::Priority::BOTTOM));
+  ASSERT_OK(cache_->Insert("duplicate", 0 /*hash*/, &destination_deleted,
+                           1 /*charge*/, WarmupIncrementDeleter,
+                           nullptr /*handle*/, Cache::Priority::LOW));
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "victim", 0 /*victim_hash*/, "duplicate", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate, result);
+  EXPECT_EQ(0, victim_deleted);
+  EXPECT_EQ(0, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+  EXPECT_TRUE(Lookup("victim"));
+  Cache::Priority priority;
+  LRUHandle* duplicate =
+      cache_->LookupForCacheWarmup("duplicate", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, duplicate);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_EQ(&destination_deleted, duplicate->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(duplicate, priority));
+
+  // A pinned victim, including a recency-preserving warmup lease, rejects the
+  // replacement and leaves both the victim and unrelated entries untouched.
+  LRUHandle* pinned = cache_->Lookup("victim", 0 /*hash*/);
+  ASSERT_NE(nullptr, pinned);
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "victim", 0 /*victim_hash*/, "new", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_FALSE(Lookup("new"));
+  EXPECT_EQ(0, victim_deleted);
+  EXPECT_FALSE(cache_->Release(pinned, true /*useful*/, false /*erase*/));
+
+  Cache::Priority victim_priority;
+  LRUHandle* warmup =
+      cache_->LookupForCacheWarmup("victim", 0 /*hash*/, &victim_priority);
+  ASSERT_NE(nullptr, warmup);
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "victim", 0 /*victim_hash*/, "new", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_FALSE(Lookup("new"));
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(warmup, victim_priority));
+
+  ASSERT_OK(cache_->ReplaceForCacheWarmup(
+      "missing", 0 /*victim_hash*/, "new", 0 /*hash*/, &incoming_deleted,
+      1 /*charge*/, WarmupIncrementDeleter, Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("victim"));
+  EXPECT_TRUE(Lookup("duplicate"));
+
+  cache_->Erase("victim", 0 /*hash*/);
+  cache_->Erase("duplicate", 0 /*hash*/);
+  EXPECT_EQ(1, victim_deleted);
+  EXPECT_EQ(1, destination_deleted);
+  EXPECT_EQ(0, incoming_deleted);
+}
+
+TEST(LRUCacheWarmupTest, AtomicReplacementRequiresSameShard) {
+  LRUCache cache(8 /*capacity*/, 1 /*num_shard_bits*/,
+                 false /*strict_capacity_limit*/, 0.5 /*high_pri_pool_ratio*/,
+                 0.5 /*low_pri_pool_ratio*/);
+  std::string victim_key = "victim-0";
+  std::string incoming_key;
+  const uint32_t victim_shard =
+      LRUCacheShard::ComputeHash(victim_key) & uint32_t{1};
+  for (int i = 0; i < 1000; ++i) {
+    std::string candidate = "incoming-" + std::to_string(i);
+    if ((LRUCacheShard::ComputeHash(candidate) & uint32_t{1}) != victim_shard) {
+      incoming_key = candidate;
+      break;
+    }
+  }
+  ASSERT_FALSE(incoming_key.empty());
+
+  Cache::CacheWarmupInsertResult result;
+  Status s = cache.ReplaceForCacheWarmup(victim_key, incoming_key, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result);
+  EXPECT_TRUE(s.IsInvalidArgument());
+}
+
+TEST(LRUCacheWarmupTest, PromoteExistingEntryImmediateAndDeferred) {
+  LRUCache cache(4 /*capacity*/, 0 /*num_shard_bits*/,
+                 false /*strict_capacity_limit*/, 0.5 /*high_pri_pool_ratio*/,
+                 0.5 /*low_pri_pool_ratio*/);
+  ASSERT_OK(cache.Insert("immediate", nullptr /*value*/, 1 /*charge*/,
+                         nullptr /*deleter*/, nullptr /*handle*/,
+                         Cache::Priority::BOTTOM));
+  ASSERT_OK(cache.PromoteForCacheWarmup("immediate", Cache::Priority::HIGH));
+
+  Cache::Handle* warmup = nullptr;
+  Cache::Priority priority;
+  ASSERT_OK(cache.LookupForCacheWarmup("immediate", &warmup, &priority));
+  ASSERT_NE(nullptr, warmup);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_FALSE(cache.ReleaseForCacheWarmup(warmup, priority));
+
+  Cache::Handle* pinned = nullptr;
+  ASSERT_OK(cache.Insert("pinned", nullptr /*value*/, 1 /*charge*/,
+                         nullptr /*deleter*/, &pinned,
+                         Cache::Priority::BOTTOM));
+  ASSERT_NE(nullptr, pinned);
+  ASSERT_OK(cache.PromoteForCacheWarmup("pinned", Cache::Priority::HIGH));
+  EXPECT_FALSE(cache.Release(pinned));
+  ASSERT_OK(cache.LookupForCacheWarmup("pinned", &warmup, &priority));
+  ASSERT_NE(nullptr, warmup);
+  EXPECT_EQ(Cache::Priority::HIGH, priority);
+  EXPECT_FALSE(cache.ReleaseForCacheWarmup(warmup, priority));
+
+  EXPECT_TRUE(cache.PromoteForCacheWarmup("missing", Cache::Priority::HIGH)
+                  .IsNotFound());
+  cache.Erase("immediate");
+  cache.Erase("pinned");
+}
+
+TEST(LRUCacheWarmupTest, PhysicalShardIntrospectionUsesChargeUnits) {
+  LRUCache cache(8 /*capacity*/, 2 /*num_shard_bits*/,
+                 false /*strict_capacity_limit*/, 0.0 /*high_pri_pool_ratio*/,
+                 1.0 /*low_pri_pool_ratio*/);
+  ASSERT_EQ(4U, cache.GetCacheWarmupShardCount());
+
+  std::array<std::string, 4> keys;
+  for (int i = 0; i < 1000; ++i) {
+    std::string candidate = "shard-key-" + std::to_string(i);
+    const size_t shard = cache.GetCacheWarmupShardIndex(candidate);
+    ASSERT_LT(shard, keys.size());
+    if (keys[shard].empty()) {
+      keys[shard] = std::move(candidate);
+    }
+  }
+  for (size_t shard = 0; shard < keys.size(); ++shard) {
+    ASSERT_FALSE(keys[shard].empty());
+    EXPECT_EQ(2U, cache.GetCacheWarmupShardCapacity(shard));
+    EXPECT_EQ(0U, cache.GetCacheWarmupShardUsage(shard));
+    ASSERT_OK(cache.Insert(keys[shard], nullptr /*value*/, 1 /*charge*/,
+                           nullptr /*deleter*/, nullptr /*handle*/,
+                           Cache::Priority::LOW));
+    EXPECT_EQ(1U, cache.GetCacheWarmupShardUsage(shard));
+  }
+  EXPECT_EQ(0U, cache.GetCacheWarmupShardCapacity(keys.size()));
+  EXPECT_EQ(0U, cache.GetCacheWarmupShardUsage(keys.size()));
+  for (const std::string& key : keys) {
+    cache.Erase(key);
+  }
+}
+
+TEST_F(LRUCacheTest, CacheWarmupPriorityAdmissionRules) {
+  Cache::CacheWarmupInsertResult result;
+
+  // HIGH can replace enough LOW and BOTTOM bytes, while retaining HIGH.
+  NewCache(3, /*high_pri_pool_ratio=*/0.34,
+           /*low_pri_pool_ratio=*/0.34);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  Insert("low", Cache::Priority::LOW);
+  Insert("high", Cache::Priority::HIGH);
+  ASSERT_OK(cache_->InsertForCacheWarmup("new-high", 0 /*hash*/, nullptr,
+                                         2 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_FALSE(Lookup("bottom"));
+  EXPECT_FALSE(Lookup("low"));
+  EXPECT_TRUE(Lookup("high"));
+  EXPECT_TRUE(Lookup("new-high"));
+
+  // LOW can replace BOTTOM but not another LOW.
+  NewCache(2, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  Insert("low", Cache::Priority::LOW);
+  ASSERT_OK(cache_->InsertForCacheWarmup("new-low", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_FALSE(Lookup("bottom"));
+  EXPECT_TRUE(Lookup("low"));
+  EXPECT_TRUE(Lookup("new-low"));
+
+  // With no BOTTOM space left, LOW rejects without replacing LOW.
+  NewCache(1, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  Insert("low", Cache::Priority::LOW);
+  ASSERT_OK(cache_->InsertForCacheWarmup("other-low", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("low"));
+  EXPECT_FALSE(Lookup("other-low"));
+
+  // BOTTOM never evicts, including another BOTTOM entry.
+  NewCache(1, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/0.0);
+  Insert("bottom", Cache::Priority::BOTTOM);
+  ASSERT_OK(cache_->InsertForCacheWarmup("other-bottom", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::BOTTOM, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_TRUE(Lookup("bottom"));
+  EXPECT_FALSE(Lookup("other-bottom"));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupAtomicRejectionWithPinnedVictim) {
+  NewCache(2, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/0.0);
+  Insert("bottom-a", Cache::Priority::BOTTOM);
+  Insert("bottom-b", Cache::Priority::BOTTOM);
+
+  Cache::Priority priority;
+  LRUHandle* pinned =
+      cache_->LookupForCacheWarmup("bottom-a", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, pinned);
+  ASSERT_EQ(Cache::Priority::BOTTOM, priority);
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup("new-low", 0 /*hash*/, nullptr,
+                                         2 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+
+  // The one eligible, unpinned entry was not partially evicted.
+  EXPECT_TRUE(Lookup("bottom-b"));
+  EXPECT_FALSE(Lookup("new-low"));
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(pinned, priority));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupLookupPinsLifetimeAcrossReplacement) {
+  NewCache(2);
+  int old_deleted = 0;
+  int new_deleted = 0;
+  ASSERT_OK(cache_->Insert("key", 0 /*hash*/, &old_deleted, 1 /*charge*/,
+                           WarmupIncrementDeleter, nullptr /*handle*/,
+                           Cache::Priority::LOW));
+
+  Cache::Priority priority;
+  LRUHandle* old_handle =
+      cache_->LookupForCacheWarmup("key", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, old_handle);
+  cache_->Erase("key", 0 /*hash*/);
+  EXPECT_EQ(0, old_deleted);
+
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup("key", 0 /*hash*/, &new_deleted,
+                                         1 /*charge*/, WarmupIncrementDeleter,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_EQ(&old_deleted, old_handle->value);
+  EXPECT_TRUE(cache_->ReleaseForCacheWarmup(old_handle, priority));
+  EXPECT_EQ(1, old_deleted);
+
+  LRUHandle* new_handle =
+      cache_->LookupForCacheWarmup("key", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, new_handle);
+  EXPECT_EQ(&new_deleted, new_handle->value);
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(new_handle, priority));
+  cache_->Erase("key", 0 /*hash*/);
+  EXPECT_EQ(1, new_deleted);
 }
 
 // TODO: FastLRUCache and ClockCache use the same tests. We can probably remove
@@ -657,7 +1598,7 @@ TEST_F(ClockCacheTest, Limits) {
     // verify usage tracking on detached entries.)
     {
       size_t n = shard_->GetTableAddressCount() + 1;
-      std::unique_ptr<HandleImpl* []> ha { new HandleImpl* [n] {} };
+      std::unique_ptr<HandleImpl*[]> ha{new HandleImpl*[n]{}};
       Status s;
       for (size_t i = 0; i < n && s.ok(); ++i) {
         hkey[1] = i;
@@ -2088,6 +3029,56 @@ class LRUCacheWithStat : public LRUCache {
 };
 
 #ifndef ROCKSDB_LITE
+
+TEST(CacheWarmupDumpFormatTest, RoundTripsPriorityAndRejectsCorruption) {
+  std::array<char, kCacheKeySize> key{};
+  for (size_t i = 0; i < key.size(); ++i) {
+    key[i] = static_cast<char>(i + 1);
+  }
+  const std::string value = "warm-block";
+  for (Cache::Priority priority :
+       {Cache::Priority::HIGH, Cache::Priority::LOW, Cache::Priority::BOTTOM}) {
+    CacheWarmupDumpUnit input;
+    input.type = CacheWarmupDumpUnitType::kData;
+    input.priority = priority;
+    input.key = Slice(key.data(), key.size());
+    input.value_len = value.size();
+    input.value = const_cast<char*>(value.data());
+    std::string encoded;
+    ASSERT_OK(CacheDumperHelper::EncodeWarmupDumpUnit(input, &encoded));
+
+    CacheWarmupDumpUnit decoded;
+    ASSERT_OK(CacheDumperHelper::DecodeWarmupDumpUnit(encoded, &decoded));
+    EXPECT_EQ(CacheWarmupDumpUnitType::kData, decoded.type);
+    EXPECT_EQ(priority, decoded.priority);
+    EXPECT_EQ(input.key, decoded.key);
+    EXPECT_EQ(
+        value,
+        Slice(static_cast<char*>(decoded.value), decoded.value_len).ToString());
+
+    std::string bad_magic = encoded;
+    bad_magic[0] ^= 1;
+    EXPECT_TRUE(CacheDumperHelper::DecodeWarmupDumpUnit(bad_magic, &decoded)
+                    .IsCorruption());
+
+    std::string bad_priority = encoded;
+    bad_priority[9] = static_cast<char>(0xff);
+    EXPECT_TRUE(CacheDumperHelper::DecodeWarmupDumpUnit(bad_priority, &decoded)
+                    .IsCorruption());
+  }
+
+  CacheWarmupDumpUnit bad_key;
+  bad_key.type = CacheWarmupDumpUnitType::kData;
+  bad_key.priority = Cache::Priority::LOW;
+  bad_key.key = Slice("short");
+  bad_key.value_len = value.size();
+  bad_key.value = const_cast<char*>(value.data());
+  std::string encoded_bad_key;
+  ASSERT_OK(CacheDumperHelper::EncodeWarmupDumpUnit(bad_key, &encoded_bad_key));
+  CacheWarmupDumpUnit decoded;
+  EXPECT_TRUE(CacheDumperHelper::DecodeWarmupDumpUnit(encoded_bad_key, &decoded)
+                  .IsCorruption());
+}
 
 TEST_F(DBSecondaryCacheTest, LRUCacheDumpLoadBasic) {
   LRUCacheOptions cache_opts(1024 * 1024 /* capacity */, 0 /* num_shard_bits */,

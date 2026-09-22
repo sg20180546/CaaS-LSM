@@ -246,6 +246,16 @@ static std::unordered_map<std::string, OptionTypeInfo>
                    cache_index_and_filter_blocks),
           OptionType::kBoolean, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        {"cache_warmup_metadata_transfer",
+         {offsetof(struct BlockBasedTableOptions,
+                   cache_warmup_metadata_transfer),
+          OptionType::kBoolean, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
+        {"cache_warmup_metadata_max_bytes",
+         {offsetof(struct BlockBasedTableOptions,
+                   cache_warmup_metadata_max_bytes),
+          OptionType::kSizeT, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"cache_index_and_filter_blocks_with_high_priority",
          {offsetof(struct BlockBasedTableOptions,
                    cache_index_and_filter_blocks_with_high_priority),
@@ -630,7 +640,10 @@ Status BlockBasedTableFactory::NewTableReader(
       table_reader_options.block_cache_tracer,
       table_reader_options.max_file_size_for_l0_meta_pin,
       table_reader_options.cur_db_session_id, table_reader_options.cur_file_num,
-      table_reader_options.unique_id, table_reader_options.global_seqno_override);
+      table_reader_options.unique_id, table_reader_options.skip_tail_prefetch,
+      table_reader_options.cache_warmup_replay,
+      table_reader_options.cache_warmup_capture,
+      table_reader_options.global_seqno_override);
 }
 
 TableBuilder* BlockBasedTableFactory::NewTableBuilder(
@@ -781,6 +794,13 @@ std::string BlockBasedTableFactory::GetPrintableOptions() const {
   ret.append(buffer);
   snprintf(buffer, kBufferSize, "  cache_index_and_filter_blocks: %d\n",
            table_options_.cache_index_and_filter_blocks);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  cache_warmup_metadata_transfer: %d\n",
+           table_options_.cache_warmup_metadata_transfer);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize,
+           "  cache_warmup_metadata_max_bytes: %" ROCKSDB_PRIszt "\n",
+           table_options_.cache_warmup_metadata_max_bytes);
   ret.append(buffer);
   snprintf(buffer, kBufferSize,
            "  cache_index_and_filter_blocks_with_high_priority: %d\n",

@@ -114,6 +114,33 @@ TEST_F(VersionEditTest, EncodeDecodeNewFile4) {
   ASSERT_EQ(1001, new_files[3].second.oldest_blob_file_number);
 }
 
+TEST_F(VersionEditTest, EncodeDecodeRelinkDescriptorExtensions) {
+  constexpr SequenceNumber kGlobalSeqno = 12345;
+  constexpr char kExternalPath[] = "/shared/relinked/000123.sst";
+  FileMetaData file(123, 0 /*file_path_id*/, 456 /*file_size*/,
+                    InternalKey("foo", kGlobalSeqno, kTypeValue),
+                    InternalKey("zoo", kGlobalSeqno, kTypeValue), kGlobalSeqno,
+                    kGlobalSeqno, false /*marked_for_compaction*/,
+                    Temperature::kUnknown, kInvalidBlobFileNumber,
+                    kUnknownOldestAncesterTime, kUnknownFileCreationTime,
+                    kUnknownFileChecksum, kUnknownFileChecksumFuncName,
+                    kNullUniqueId64x2);
+  file.fd.external_path = kExternalPath;
+  file.fd.global_seqno_override = kGlobalSeqno;
+
+  VersionEdit edit;
+  edit.AddFile(2, file);
+  std::string encoded;
+  ASSERT_TRUE(edit.EncodeTo(&encoded));
+
+  VersionEdit decoded;
+  ASSERT_OK(decoded.DecodeFrom(encoded));
+  ASSERT_EQ(decoded.GetNewFiles().size(), 1);
+  const FileDescriptor& decoded_fd = decoded.GetNewFiles()[0].second.fd;
+  EXPECT_EQ(decoded_fd.external_path, kExternalPath);
+  EXPECT_EQ(decoded_fd.global_seqno_override, kGlobalSeqno);
+}
+
 TEST_F(VersionEditTest, ForwardCompatibleNewFile4) {
   static const uint64_t kBig = 1ull << 50;
   VersionEdit edit;

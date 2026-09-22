@@ -231,6 +231,12 @@ bool VersionEdit::EncodeTo(std::string* dst) const {
       PutVarint32(dst, NewFileCustomTag::kExternalPath);
       PutLengthPrefixedSlice(dst, Slice(f.fd.external_path));
     }
+    if (f.fd.global_seqno_override != kDisableGlobalSequenceNumber) {
+      PutVarint32(dst, NewFileCustomTag::kGlobalSeqnoOverride);
+      std::string global_seqno_override;
+      PutVarint64(&global_seqno_override, f.fd.global_seqno_override);
+      PutLengthPrefixedSlice(dst, Slice(global_seqno_override));
+    }
 
     TEST_SYNC_POINT_CALLBACK("VersionEdit::EncodeTo:NewFile4:CustomizeFields",
                              dst);
@@ -320,6 +326,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   uint64_t file_size = 0;
   SequenceNumber smallest_seqno = 0;
   SequenceNumber largest_seqno = kMaxSequenceNumber;
+  SequenceNumber global_seqno_override = kDisableGlobalSequenceNumber;
   std::string external_path;  // [relink] empty => normal (no in-place ref)
   if (GetLevel(input, &level, &msg) && GetVarint64(input, &number) &&
       GetVarint64(input, &file_size) && GetInternalKey(input, &f.smallest) &&
@@ -404,6 +411,12 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
           // [relink] absolute HDFS path of an in-place referenced SST.
           external_path = field.ToString();
           break;
+        case kGlobalSeqnoOverride:
+          if (!GetVarint64(&field, &global_seqno_override) || !field.empty() ||
+              global_seqno_override > kMaxSequenceNumber) {
+            return "invalid global sequence number override";
+          }
+          break;
         default:
           if ((custom_tag & kCustomTagNonSafeIgnoreMask) != 0) {
             // Should not proceed if cannot understand it
@@ -420,6 +433,7 @@ const char* VersionEdit::DecodeNewFile4From(Slice* input) {
   // [relink] restore in-place external path (empty unless kExternalPath seen,
   // i.e. byte-identical decode result for baseline manifests).
   f.fd.external_path = external_path;
+  f.fd.global_seqno_override = global_seqno_override;
   new_files_.push_back(std::make_pair(level, f));
   return nullptr;
 }

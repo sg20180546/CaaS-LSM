@@ -70,6 +70,18 @@ struct TableReaderOptions {
   // fetch into RocksDB's buffer, rather than relying
   // RandomAccessFile::Prefetch().
   bool force_direct_prefetch;
+  // A relink table-cache capture/replay supplies exact metadata ranges through
+  // the file object. Skip the normal broad tail prefetch; capture records a
+  // bounded metadata superset, and replay cannot fall through to storage.
+  bool skip_tail_prefetch = false;
+  // True only while reconstructing a TableReader from a strict in-memory
+  // warmup bundle. Metadata is retained by the reader itself instead of being
+  // satisfied by or inserted into the independently transferred block cache.
+  bool cache_warmup_replay = false;
+  // True only while opening a normal source SST through the metadata recorder.
+  // Capture and replay use the same complete metadata-read plan, but capture
+  // reads the source file while replay must remain storage-free.
+  bool cache_warmup_capture = false;
   // What level this table/file is on, -1 for "not set, don't know." Used
   // for level-specific statistics.
   int level;

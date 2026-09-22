@@ -142,6 +142,18 @@ struct SstFileMetaData : public FileStorageInfo {
   // SystemClock::GetCurrentTime(). 0 if the information is not available.
   uint64_t file_creation_time = 0;
 
+  // Stable, universally unique identifier for this SST, in the same public
+  // 16-byte binary format returned by GetUniqueIdFromTableProperties(). Empty
+  // when the SST does not support stable unique IDs. This is deliberately the
+  // public/external representation; RocksDB's MANIFEST uses a private internal
+  // representation.
+  std::string unique_id;
+
+  // Absolute backing path for a relinked in-place SST. Empty for ordinary
+  // DB-owned files. This keeps chained relink migrations on the original
+  // shared-storage identity instead of fabricating a local file-number path.
+  std::string external_path;
+
   // DEPRECATED: The name of the file within its directory with a
   // leading slash (e.g. "/123456.sst"). Use relative_filename from base struct
   // instead.

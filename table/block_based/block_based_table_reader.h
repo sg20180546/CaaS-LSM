@@ -109,7 +109,8 @@ class BlockBasedTable : public TableReader {
       BlockCacheTracer* const block_cache_tracer = nullptr,
       size_t max_file_size_for_l0_meta_pin = 0,
       const std::string& cur_db_session_id = "", uint64_t cur_file_num = 0,
-      UniqueId64x2 expected_unique_id = {},
+      UniqueId64x2 expected_unique_id = {}, bool skip_tail_prefetch = false,
+      bool cache_warmup_replay = false, bool cache_warmup_capture = false,
       const SequenceNumber global_seqno_override =
           kDisableGlobalSequenceNumber);  // [relink] inert when kDisable
 
@@ -186,6 +187,13 @@ class BlockBasedTable : public TableReader {
   void SetupForCompaction() override;
 
   std::shared_ptr<const TableProperties> GetTableProperties() const override;
+
+  Status SetTableCacheWarmupBundle(
+      std::shared_ptr<const TableCacheWarmupBundle> bundle) override;
+  std::shared_ptr<const TableCacheWarmupBundle> GetTableCacheWarmupBundle()
+      const override;
+  void SetFileReadStats(Statistics* stats,
+                        HistogramImpl* file_read_hist) override;
 
   size_t ApproximateMemoryUsage() const override;
 
@@ -596,6 +604,19 @@ struct BlockBasedTable::Rep {
   BlockHandle compression_dict_handle;
 
   std::shared_ptr<const TableProperties> table_properties;
+  // Keep the payload and its cache reservation in one shared lifetime. The
+  // aliasing shared_ptr returned to a migration snapshot then continues to
+  // account for the bytes even after the source TableReader is evicted.
+  struct TableCacheWarmupState {
+    // Member order keeps the manager alive until after its handle is released.
+    std::shared_ptr<CacheReservationManager> reservation_manager;
+    std::unique_ptr<CacheReservationManager::CacheReservationHandle>
+        reservation;
+    // Declared last so it is destroyed before the reservation.
+    std::shared_ptr<const TableCacheWarmupBundle> bundle;
+  };
+  std::shared_ptr<const TableCacheWarmupState> table_cache_warmup_state;
+  std::shared_ptr<CacheReservationManager> table_reader_cache_res_mgr;
   BlockBasedTableOptions::IndexType index_type;
   bool whole_key_filtering;
   bool prefix_filtering;
@@ -634,6 +655,16 @@ struct BlockBasedTable::Rep {
 
   const bool immortal_table;
 
+  // True only while Open() reconstructs metadata for the experimental
+  // table-cache warmup path. Metadata cache lookups are bypassed in this
+  // interval so the captured byte bundle is self-contained and table warmup
+  // never depends on block-cache transfer ordering.
+  bool cache_warmup_replay = false;
+  // Source-side counterpart of cache_warmup_replay. This flag remains
+  // distinct because reads must hit the source file so the recording wrapper
+  // can capture them, while replay reads must hit only the transferred bundle.
+  bool cache_warmup_capture = false;
+
   std::unique_ptr<CacheReservationManager::CacheReservationHandle>
       table_reader_cache_res_handle = nullptr;
 
@@ -668,8 +699,9 @@ struct BlockBasedTable::Rep {
       uint64_t num_file_reads_for_auto_readahead) const {
     fpb->reset(new FilePrefetchBuffer(
         readahead_size, max_readahead_size,
-        !ioptions.allow_mmap_reads /* enable */, false /* track_min_offset */,
-        implicit_auto_readahead, num_file_reads,
+        !ioptions.allow_mmap_reads &&
+            !cache_warmup_replay /* enable; replay uses exact captured reads */,
+        false /* track_min_offset */, implicit_auto_readahead, num_file_reads,
         num_file_reads_for_auto_readahead, ioptions.fs.get(), ioptions.clock,
         ioptions.stats));
   }

@@ -592,6 +592,8 @@ Status BlockBasedTable::Open(
     BlockCacheTracer* const block_cache_tracer,
     size_t max_file_size_for_l0_meta_pin, const std::string& cur_db_session_id,
     uint64_t cur_file_num, UniqueId64x2 expected_unique_id,
+    const bool skip_tail_prefetch, const bool cache_warmup_replay,
+    const bool cache_warmup_capture,
     const SequenceNumber global_seqno_override) {  // [relink]
   table_reader->reset();
 
@@ -610,10 +612,22 @@ Status BlockBasedTable::Open(
   ro.rate_limiter_priority = read_options.rate_limiter_priority;
 
   // prefetch both index and filters, down to all partitions
-  const bool prefetch_all = prefetch_index_and_filter_in_cache || level == 0;
+  // Capture and replay deliberately execute the same complete metadata-read
+  // plan. This makes every replay read present in the source bundle, including
+  // partitioned index/filter dependencies, regardless of either block cache's
+  // contents or transfer order.
+  const bool prefetch_all = cache_warmup_capture || cache_warmup_replay ||
+                            prefetch_index_and_filter_in_cache || level == 0;
   const bool preload_all = !table_options.cache_index_and_filter_blocks;
 
-  if (!ioptions.allow_mmap_reads) {
+  if (skip_tail_prefetch) {
+    // Capture records exact metadata reads; replay serves those exact reads
+    // from an in-memory overlay. A broad tail prefetch would defeat either
+    // property (and on replay could fall through to shared storage).
+    prefetch_buffer.reset(new FilePrefetchBuffer(
+        0 /* readahead_size */, 0 /* max_readahead_size */, false /* enable */,
+        true /* track_min_offset */));
+  } else if (!ioptions.allow_mmap_reads) {
     s = PrefetchTail(ro, file.get(), file_size, force_direct_prefetch,
                      tail_prefetch_stats, prefetch_all, preload_all,
                      &prefetch_buffer);
@@ -655,6 +669,9 @@ Status BlockBasedTable::Open(
   Rep* rep = new BlockBasedTable::Rep(ioptions, env_options, table_options,
                                       internal_comparator, skip_filters,
                                       file_size, level, immortal_table);
+  rep->cache_warmup_replay = cache_warmup_replay;
+  rep->cache_warmup_capture = cache_warmup_capture;
+  rep->table_reader_cache_res_mgr = table_reader_cache_res_mgr;
   rep->file = std::move(file);
   rep->footer = footer;
 
@@ -769,9 +786,12 @@ Status BlockBasedTable::Open(
   SetupBaseCacheKey(rep->table_properties.get(), cur_db_session_id,
                     cur_file_num, &rep->base_cache_key);
 
-  rep->persistent_cache_options =
-      PersistentCacheOptions(rep->table_options.persistent_cache,
-                             rep->base_cache_key, rep->ioptions.stats);
+  PersistentCacheOptions regular_persistent_cache_options(
+      rep->table_options.persistent_cache, rep->base_cache_key,
+      rep->ioptions.stats);
+  if (!cache_warmup_capture && !cache_warmup_replay) {
+    rep->persistent_cache_options = regular_persistent_cache_options;
+  }
 
   s = new_table->ReadRangeDelBlock(ro, prefetch_buffer.get(),
                                    metaindex_iter.get(), internal_comparator,
@@ -787,7 +807,7 @@ Status BlockBasedTable::Open(
   if (s.ok()) {
     // Update tail prefetch stats
     assert(prefetch_buffer.get() != nullptr);
-    if (tail_prefetch_stats != nullptr) {
+    if (tail_prefetch_stats != nullptr && !skip_tail_prefetch) {
       assert(prefetch_buffer->min_offset_read() < file_size);
       tail_prefetch_stats->RecordEffectiveSize(
           static_cast<size_t>(file_size) - prefetch_buffer->min_offset_read());
@@ -809,6 +829,9 @@ Status BlockBasedTable::Open(
   }
 
   if (s.ok()) {
+    rep->persistent_cache_options = std::move(regular_persistent_cache_options);
+    rep->cache_warmup_replay = false;
+    rep->cache_warmup_capture = false;
     *table_reader = std::move(new_table);
   }
   return s;
@@ -1085,7 +1108,10 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
 
   BlockBasedTableOptions::IndexType index_type = rep_->index_type;
 
-  const bool use_cache = table_options.cache_index_and_filter_blocks;
+  const bool cache_warmup_metadata =
+      rep_->cache_warmup_capture || rep_->cache_warmup_replay;
+  const bool use_cache =
+      table_options.cache_index_and_filter_blocks && !cache_warmup_metadata;
 
   const bool maybe_flushed =
       level == 0 && file_size <= max_file_size_for_l0_meta_pin;
@@ -1112,16 +1138,20 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
         assert(false);
         return false;
       };
-  const bool pin_top_level_index = is_pinned(
-      table_options.metadata_cache_options.top_level_index_pinning,
-      table_options.pin_top_level_index_and_filter ? PinningTier::kAll
-                                                   : PinningTier::kNone);
+  const bool pin_top_level_index =
+      cache_warmup_metadata ||
+      is_pinned(table_options.metadata_cache_options.top_level_index_pinning,
+                table_options.pin_top_level_index_and_filter
+                    ? PinningTier::kAll
+                    : PinningTier::kNone);
   const bool pin_partition =
+      cache_warmup_metadata ||
       is_pinned(table_options.metadata_cache_options.partition_pinning,
                 table_options.pin_l0_filter_and_index_blocks_in_cache
                     ? PinningTier::kFlushedAndSimilar
                     : PinningTier::kNone);
   const bool pin_unpartitioned =
+      cache_warmup_metadata ||
       is_pinned(table_options.metadata_cache_options.unpartitioned_pinning,
                 table_options.pin_l0_filter_and_index_blocks_in_cache
                     ? PinningTier::kFlushedAndSimilar
@@ -1223,6 +1253,44 @@ std::shared_ptr<const TableProperties> BlockBasedTable::GetTableProperties()
   return rep_->table_properties;
 }
 
+Status BlockBasedTable::SetTableCacheWarmupBundle(
+    std::shared_ptr<const TableCacheWarmupBundle> bundle) {
+  if (bundle == nullptr) {
+    rep_->table_cache_warmup_state.reset();
+    return Status::OK();
+  }
+
+  std::unique_ptr<CacheReservationManager::CacheReservationHandle> reservation;
+  if (rep_->table_reader_cache_res_mgr != nullptr) {
+    Status s = rep_->table_reader_cache_res_mgr->MakeCacheReservation(
+        bundle->ApproximateMemoryUsage(), &reservation);
+    if (!s.ok()) {
+      return s;
+    }
+  }
+  auto state = std::make_shared<Rep::TableCacheWarmupState>();
+  state->reservation_manager = rep_->table_reader_cache_res_mgr;
+  state->bundle = std::move(bundle);
+  state->reservation = std::move(reservation);
+  rep_->table_cache_warmup_state = std::move(state);
+  return Status::OK();
+}
+
+std::shared_ptr<const TableCacheWarmupBundle>
+BlockBasedTable::GetTableCacheWarmupBundle() const {
+  auto state = rep_->table_cache_warmup_state;
+  if (state == nullptr || state->bundle == nullptr) {
+    return nullptr;
+  }
+  const TableCacheWarmupBundle* bundle = state->bundle.get();
+  return std::shared_ptr<const TableCacheWarmupBundle>(state, bundle);
+}
+
+void BlockBasedTable::SetFileReadStats(Statistics* stats,
+                                       HistogramImpl* file_read_hist) {
+  rep_->file->SetStatistics(stats, file_read_hist);
+}
+
 size_t BlockBasedTable::ApproximateMemoryUsage() const {
   size_t usage = 0;
   if (rep_) {
@@ -1241,6 +1309,9 @@ size_t BlockBasedTable::ApproximateMemoryUsage() const {
   }
   if (rep_->table_properties) {
     usage += rep_->table_properties->ApproximateMemoryUsage();
+  }
+  if (rep_->table_cache_warmup_state != nullptr) {
+    usage += rep_->table_cache_warmup_state->bundle->ApproximateMemoryUsage();
   }
   return usage;
 }
@@ -1598,6 +1669,9 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
   Cache* block_cache = rep_->table_options.block_cache.get();
   Cache* block_cache_compressed =
       rep_->table_options.block_cache_compressed.get();
+  const bool bypass_cache_for_warmup =
+      (rep_->cache_warmup_capture || rep_->cache_warmup_replay) &&
+      block_type != BlockType::kData;
 
   // First, try to get the block from the cache
   //
@@ -1606,12 +1680,13 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
   CacheKey key_data;
   Slice key;
   bool is_cache_hit = false;
-  if (block_cache != nullptr || block_cache_compressed != nullptr) {
+  if (block_cache != nullptr || block_cache_compressed != nullptr ||
+      bypass_cache_for_warmup) {
     // create key for block cache
     key_data = GetCacheKey(rep_->base_cache_key, handle);
     key = key_data.AsSlice();
 
-    if (!contents) {
+    if (!contents && !bypass_cache_for_warmup) {
       s = GetDataBlockFromCache(key, block_cache, block_cache_compressed, ro,
                                 out_parsed_block, uncompression_dict,
                                 block_type, wait, get_context);
@@ -1636,7 +1711,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
     // file.
     if (out_parsed_block->GetValue() == nullptr &&
         out_parsed_block->GetCacheHandle() == nullptr && !no_io &&
-        ro.fill_cache) {
+        (ro.fill_cache || bypass_cache_for_warmup)) {
       Statistics* statistics = rep_->ioptions.stats;
       const bool maybe_compressed =
           block_type != BlockType::kFilter &&
@@ -1691,9 +1766,11 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
         // If filling cache is allowed and a cache is configured, try to put the
         // block to the cache.
         s = PutDataBlockToCache(
-            key, block_cache, block_cache_compressed, out_parsed_block,
-            std::move(*contents), contents_comp_type, uncompression_dict,
-            GetMemoryAllocator(rep_->table_options), block_type, get_context);
+            key, bypass_cache_for_warmup ? nullptr : block_cache,
+            bypass_cache_for_warmup ? nullptr : block_cache_compressed,
+            out_parsed_block, std::move(*contents), contents_comp_type,
+            uncompression_dict, GetMemoryAllocator(rep_->table_options),
+            block_type, get_context);
       }
     }
   }
@@ -1733,7 +1810,7 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
         assert(false);
         break;
     }
-    bool no_insert = no_io || !ro.fill_cache;
+    bool no_insert = no_io || !ro.fill_cache || bypass_cache_for_warmup;
     if (BlockCacheTraceHelper::IsGetOrMultiGetOnDataBlock(
             trace_block_type, lookup_context->caller)) {
       // Defer logging the access to Get() and MultiGet() to trace additional

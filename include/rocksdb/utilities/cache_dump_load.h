@@ -6,6 +6,9 @@
 #pragma once
 #ifndef ROCKSDB_LITE
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <set>
 
 #include "rocksdb/cache.h"
@@ -71,6 +74,74 @@ struct CacheDumpOptions {
   SystemClock* clock;
 };
 
+// Options for the relink warmup stream. Unlike the stock cache dump format,
+// the warmup stream is deliberately data-block-only and preserves the cache
+// entry's effective LRU priority.
+constexpr size_t kDefaultCacheWarmupMaxEntryBytes = 8 * 1024 * 1024;
+
+struct CacheWarmupOptions {
+  // Skip a source entry larger than this many bytes. Must be nonzero; this
+  // bounds the one owned staging buffer held while copying an entry.
+  size_t max_entry_bytes = kDefaultCacheWarmupMaxEntryBytes;
+
+  // Aggregate limits for one versioned warmup stream. These default to
+  // unlimited for API compatibility; network users should always provide
+  // finite values. The payload budget counts decoded data-block bytes.
+  uint64_t max_entries = std::numeric_limits<uint64_t>::max();
+  size_t max_total_bytes = std::numeric_limits<size_t>::max();
+
+  // Monotonic per-call processing deadline. Zero preserves the historical
+  // unlimited API behavior. Network transports should additionally enforce
+  // their absolute deadline around socket reads and writes.
+  uint64_t max_transfer_duration_micros = 0;
+};
+
+// Per-priority counters. Bytes are data payload bytes, excluding the cache-dump
+// frame headers and checksums, so they remain meaningful for arbitrary writers.
+struct CacheWarmupPriorityTransferStats {
+  uint64_t cataloged_entries = 0;
+  uint64_t data_candidates = 0;
+  uint64_t entries_staged = 0;
+  uint64_t entries_written = 0;
+  uint64_t entries_received = 0;
+  uint64_t entries_inserted = 0;
+  uint64_t entries_duplicate = 0;
+  uint64_t entries_rejected_no_space = 0;
+  uint64_t payload_bytes = 0;
+};
+
+// Best-effort accounting for one warmup dump or restore call. The dump side
+// resets this structure before cataloging; the restore side resets it before
+// reading the warmup header. Entries skipped because the concurrent cache
+// changed are normal, not a stream failure.
+struct CacheWarmupTransferStats {
+  uint64_t cataloged_entries = 0;
+  uint64_t data_candidates = 0;
+  uint64_t entries_staged = 0;
+  uint64_t entries_written = 0;
+  uint64_t payload_bytes = 0;
+  uint64_t skipped_disappeared = 0;
+  uint64_t skipped_replaced = 0;
+  uint64_t skipped_type_changed = 0;
+  uint64_t skipped_unsupported = 0;
+  uint64_t skipped_too_large = 0;
+  uint64_t priority_changed_after_catalog = 0;
+
+  uint64_t entries_received = 0;
+  uint64_t entries_inserted = 0;
+  uint64_t entries_duplicate = 0;
+  uint64_t entries_rejected_no_space = 0;
+  uint64_t skipped_invalid = 0;
+
+  CacheWarmupPriorityTransferStats high;
+  CacheWarmupPriorityTransferStats low;
+  CacheWarmupPriorityTransferStats bottom;
+};
+
+// Transitional spelling retained for callers written against the first
+// warmup vertical-slice drop.
+using CacheWarmupStats = CacheWarmupTransferStats;
+
 // NOTE that: this class is EXPERIMENTAL! May be changed in the future!
 // This the class to dump out the block in the block cache, store/transfer them
 // via CacheDumpWriter. In order to dump out the blocks belonging to a certain
@@ -111,11 +182,37 @@ class CacheDumper {
     (void)sst_paths;
     return Status::NotSupported("SetDumpFilterFiles is not supported");
   }
+  // Restricts a warmup dump using stable 8-byte block-cache key prefixes
+  // already derived from in-memory Version metadata. This keeps block-cache
+  // transfer independent from table-cache residency.
+  virtual Status SetDumpFilterPrefixes(
+      const std::vector<std::string>& prefixes) {
+    (void)prefixes;
+    return Status::NotSupported("SetDumpFilterPrefixes is not supported");
+  }
   // The main function to dump out all the blocks that satisfy the filter
   // condition from block cache to a certain CacheDumpWriter in one shot. This
   // process may take some time.
   virtual IOStatus DumpCacheEntriesToWriter() {
     return IOStatus::NotSupported("DumpCacheEntriesToWriter is not supported");
+  }
+  // [relink cache handoff] A separately versioned, data-block-only stream for
+  // asynchronous cache warmup. It first catalogs matching resident keys and
+  // their effective priority, then pins and copies only one entry at a time
+  // into an owned encoded record. It releases the entry before CRC, framing,
+  // or writer I/O. This preserves the stock DumpCacheEntriesToWriter behavior
+  // and avoids doing I/O under a cache shard lock.
+  virtual IOStatus DumpWarmupCacheEntriesToWriter(
+      const CacheWarmupOptions& warmup_options,
+      CacheWarmupTransferStats* warmup_stats = nullptr) {
+    (void)warmup_options;
+    (void)warmup_stats;
+    return IOStatus::NotSupported(
+        "DumpWarmupCacheEntriesToWriter is not supported");
+  }
+  virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
+    static const CacheWarmupTransferStats kEmptyStats;
+    return kEmptyStats;
   }
 };
 
@@ -137,6 +234,27 @@ class CacheDumpedLoader {
   virtual IOStatus RestoreCacheEntriesToPrimaryCache() {
     return IOStatus::NotSupported(
         "RestoreCacheEntriesToPrimaryCache is not supported");
+  }
+  // [relink cache handoff] Restore the separately versioned warmup stream to
+  // a primary cache. The wire priority is used for admission. A duplicate key
+  // or no suitable lower-priority space is a normal per-entry skip, not a
+  // stream error.
+  virtual IOStatus RestoreWarmupCacheEntriesToPrimaryCache(
+      const CacheWarmupOptions& warmup_options,
+      CacheWarmupTransferStats* warmup_stats = nullptr) {
+    (void)warmup_options;
+    (void)warmup_stats;
+    return IOStatus::NotSupported(
+        "RestoreWarmupCacheEntriesToPrimaryCache is not supported");
+  }
+  IOStatus RestoreWarmupCacheEntriesToPrimaryCache(
+      CacheWarmupTransferStats* warmup_stats = nullptr) {
+    return RestoreWarmupCacheEntriesToPrimaryCache(CacheWarmupOptions{},
+                                                   warmup_stats);
+  }
+  virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
+    static const CacheWarmupTransferStats kEmptyStats;
+    return kEmptyStats;
   }
 };
 

@@ -9,10 +9,12 @@
 
 #include "cache/lru_cache.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <utility>
 
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
@@ -22,12 +24,30 @@
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
 
+namespace {
+
+bool IsStrictlyLowerPriority(Cache::Priority resident,
+                             Cache::Priority incoming) {
+  switch (incoming) {
+    case Cache::Priority::HIGH:
+      return resident == Cache::Priority::LOW ||
+             resident == Cache::Priority::BOTTOM;
+    case Cache::Priority::LOW:
+      return resident == Cache::Priority::BOTTOM;
+    case Cache::Priority::BOTTOM:
+      return false;
+  }
+  return false;
+}
+
+}  // namespace
+
 // A distinct pointer value for marking "dummy" cache entries
 void* const kDummyValueMarker = const_cast<char*>("kDummyValueMarker");
 
 LRUHandleTable::LRUHandleTable(int max_upper_hash_bits)
     : length_bits_(/* historical starting size*/ 4),
-      list_(new LRUHandle* [size_t{1} << length_bits_] {}),
+      list_(new LRUHandle*[size_t{1} << length_bits_]{}),
       elems_(0),
       max_length_bits_(max_upper_hash_bits) {}
 
@@ -92,9 +112,8 @@ void LRUHandleTable::Resize() {
 
   uint32_t old_length = uint32_t{1} << length_bits_;
   int new_length_bits = length_bits_ + 1;
-  std::unique_ptr<LRUHandle* []> new_list {
-    new LRUHandle* [size_t{1} << new_length_bits] {}
-  };
+  std::unique_ptr<LRUHandle*[]> new_list{
+      new LRUHandle*[size_t{1} << new_length_bits]{}};
   uint32_t count = 0;
   for (uint32_t i = 0; i < old_length; i++) {
     LRUHandle* h = list_[i];
@@ -131,6 +150,7 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       table_(max_upper_hash_bits),
       usage_(0),
       lru_usage_(0),
+      lru_warmup_pinned_usage_(0),
       mutex_(use_adaptive_mutex),
       secondary_cache_(secondary_cache) {
   // Make empty circular linked list.
@@ -145,16 +165,21 @@ void LRUCacheShard::EraseUnRefEntries() {
   autovector<LRUHandle*> last_reference_list;
   {
     DMutexLock l(mutex_);
-    while (lru_.next != &lru_) {
-      LRUHandle* old = lru_.next;
-      // LRU list contains only elements which can be evicted.
-      assert(old->InCache() && !old->HasRefs());
-      LRU_Remove(old);
-      table_.Remove(old->key(), old->hash);
-      old->SetInCache(false);
-      assert(usage_ >= old->total_charge);
-      usage_ -= old->total_charge;
-      last_reference_list.push_back(old);
+    LRUHandle* old = lru_.next;
+    while (old != &lru_) {
+      LRUHandle* next = old->next;
+      assert(old->InCache());
+      // A cache-warmup lease deliberately remains at its exact LRU position.
+      // It is pinned for this short interval and must not be erased.
+      if (!old->HasRefs()) {
+        LRU_Remove(old);
+        table_.Remove(old->key(), old->hash);
+        old->SetInCache(false);
+        assert(usage_ >= old->total_charge);
+        usage_ -= old->total_charge;
+        last_reference_list.push_back(old);
+      }
+      old = next;
     }
   }
 
@@ -201,6 +226,38 @@ void LRUCacheShard::ApplyToSomeEntries(
       index_begin, index_end);
 }
 
+void LRUCacheShard::ApplyToSomeEntriesForCacheWarmup(
+    const Cache::CacheWarmupMetadataCallback& callback,
+    size_t average_entries_per_lock, size_t* state) {
+  // As in ApplyToSomeEntries(), state represents the starting upper hash
+  // bits. Only this shard's mutex is held while the callback runs.
+  DMutexLock l(mutex_);
+  int length_bits = table_.GetLengthBits();
+  size_t length = size_t{1} << length_bits;
+
+  assert(average_entries_per_lock > 0);
+  size_t index_begin = *state >> (sizeof(size_t) * 8u - length_bits);
+  size_t remaining = length - index_begin;
+  size_t index_end;
+  if (average_entries_per_lock >= remaining) {
+    index_end = length;
+    *state = SIZE_MAX;
+  } else {
+    index_end = index_begin + average_entries_per_lock;
+    *state = index_end << (sizeof(size_t) * 8u - length_bits);
+  }
+
+  table_.ApplyToEntriesRange(
+      [this, &callback](LRUHandle* h) {
+        DeleterFn deleter = h->IsSecondaryCacheCompatible()
+                                ? h->info_.helper->del_cb
+                                : h->info_.deleter;
+        callback(h->key(), h->GetCharge(metadata_charge_policy_), deleter,
+                 GetEffectivePriority(h));
+      },
+      index_begin, index_end);
+}
+
 void LRUCacheShard::TEST_GetLRUList(LRUHandle** lru, LRUHandle** lru_low_pri,
                                     LRUHandle** lru_bottom_pri) {
   DMutexLock l(mutex_);
@@ -233,6 +290,10 @@ double LRUCacheShard::GetLowPriPoolRatio() {
 void LRUCacheShard::LRU_Remove(LRUHandle* e) {
   assert(e->next != nullptr);
   assert(e->prev != nullptr);
+  if (e->IsWarmupPinned()) {
+    assert(lru_warmup_pinned_usage_ >= e->total_charge);
+    lru_warmup_pinned_usage_ -= e->total_charge;
+  }
   if (lru_low_pri_ == e) {
     lru_low_pri_ = e->prev;
   }
@@ -257,7 +318,30 @@ void LRUCacheShard::LRU_Remove(LRUHandle* e) {
 void LRUCacheShard::LRU_Insert(LRUHandle* e) {
   assert(e->next == nullptr);
   assert(e->prev == nullptr);
+  Cache::Priority priority = Cache::Priority::BOTTOM;
   if (high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
+    priority = Cache::Priority::HIGH;
+  } else if (low_pri_pool_ratio_ > 0 &&
+             (e->IsHighPri() || e->IsLowPri() || e->HasHit())) {
+    priority = Cache::Priority::LOW;
+  }
+
+  const Cache::Priority requested =
+      NormalizePriorityForPools(e->GetWarmupPromotionPriority());
+  if (IsStrictlyLowerPriority(priority, requested)) {
+    priority = requested;
+  }
+  e->ClearWarmupPromotion();
+  LRU_InsertInPriorityPool(e, priority);
+}
+
+void LRUCacheShard::LRU_InsertInPriorityPool(LRUHandle* e,
+                                             Cache::Priority priority) {
+  assert(e->next == nullptr);
+  assert(e->prev == nullptr);
+  priority = NormalizePriorityForPools(priority);
+
+  if (priority == Cache::Priority::HIGH) {
     // Inset "e" to head of LRU list.
     e->next = &lru_;
     e->prev = lru_.prev;
@@ -267,8 +351,7 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
     e->SetInLowPriPool(false);
     high_pri_pool_usage_ += e->total_charge;
     MaintainPoolSize();
-  } else if (low_pri_pool_ratio_ > 0 &&
-             (e->IsHighPri() || e->IsLowPri() || e->HasHit())) {
+  } else if (priority == Cache::Priority::LOW) {
     // Insert "e" to the head of low-pri pool.
     e->next = lru_low_pri_->next;
     e->prev = lru_low_pri_;
@@ -296,6 +379,76 @@ void LRUCacheShard::LRU_Insert(LRUHandle* e) {
   lru_usage_ += e->total_charge;
 }
 
+Cache::Priority LRUCacheShard::GetCurrentPriority(const LRUHandle* e) const {
+  // Entries on the LRU (including a warmup-pinned entry) have an exact pool
+  // marker. Normally pinned entries retain their most recent HIGH/LOW marker;
+  // an entry with no marker receives the class it would get on Release().
+  if (e->InHighPriPool()) {
+    return Cache::Priority::HIGH;
+  }
+  if (e->InLowPriPool()) {
+    return Cache::Priority::LOW;
+  }
+  // A linked entry with neither marker is in BOTTOM. In particular, the
+  // warmup reference does not make a demoted HIGH-tagged entry look HIGH.
+  if (e->IsInLRU() || !e->HasRefs()) {
+    return Cache::Priority::BOTTOM;
+  }
+  if (high_pri_pool_ratio_ > 0 && (e->IsHighPri() || e->HasHit())) {
+    return Cache::Priority::HIGH;
+  }
+  if (low_pri_pool_ratio_ > 0 &&
+      (e->IsHighPri() || e->IsLowPri() || e->HasHit())) {
+    return Cache::Priority::LOW;
+  }
+  return Cache::Priority::BOTTOM;
+}
+
+Cache::Priority LRUCacheShard::GetEffectivePriority(const LRUHandle* e) const {
+  Cache::Priority priority = GetCurrentPriority(e);
+  const Cache::Priority requested =
+      NormalizePriorityForPools(e->GetWarmupPromotionPriority());
+  if (IsStrictlyLowerPriority(priority, requested)) {
+    priority = requested;
+  }
+  return priority;
+}
+
+Cache::Priority LRUCacheShard::NormalizePriorityForPools(
+    Cache::Priority priority) const {
+  if (priority == Cache::Priority::HIGH && high_pri_pool_ratio_ == 0) {
+    priority = low_pri_pool_ratio_ > 0 ? Cache::Priority::LOW
+                                       : Cache::Priority::BOTTOM;
+  }
+  if (priority == Cache::Priority::LOW && low_pri_pool_ratio_ == 0) {
+    priority = Cache::Priority::BOTTOM;
+  }
+  return priority;
+}
+
+void LRUCacheShard::PromoteWarmupDuplicate(LRUHandle* resident,
+                                           Cache::Priority priority) {
+  assert(resident != nullptr);
+  priority = NormalizePriorityForPools(priority);
+  Cache::Priority resident_priority = GetEffectivePriority(resident);
+  const Cache::Priority pending =
+      NormalizePriorityForPools(resident->GetWarmupPromotionPriority());
+  if (IsStrictlyLowerPriority(resident_priority, pending)) {
+    resident_priority = pending;
+  }
+  if (!IsStrictlyLowerPriority(resident_priority, priority)) {
+    return;
+  }
+  if (resident->HasRefs()) {
+    resident->RequestWarmupPromotion(priority);
+  } else {
+    assert(resident->IsInLRU());
+    LRU_Remove(resident);
+    resident->ClearWarmupPromotion();
+    LRU_InsertInPriorityPool(resident, priority);
+  }
+}
+
 void LRUCacheShard::MaintainPoolSize() {
   while (high_pri_pool_usage_ > high_pri_pool_capacity_) {
     // Overflow last entry in high-pri pool to low-pri pool.
@@ -321,16 +474,23 @@ void LRUCacheShard::MaintainPoolSize() {
 
 void LRUCacheShard::EvictFromLRU(size_t charge,
                                  autovector<LRUHandle*>* deleted) {
-  while ((usage_ + charge) > capacity_ && lru_.next != &lru_) {
-    LRUHandle* old = lru_.next;
-    // LRU list contains only elements which can be evicted.
-    assert(old->InCache() && !old->HasRefs());
+  LRUHandle* old = lru_.next;
+  while ((usage_ + charge) > capacity_ && old != &lru_) {
+    LRUHandle* next = old->next;
+    assert(old->InCache());
+    if (old->HasRefs()) {
+      // Warmup pins remain linked so that an unsuccessful/no-hit transfer is
+      // a literal no-touch operation. Treat them like ordinary pinned entries.
+      old = next;
+      continue;
+    }
     LRU_Remove(old);
     table_.Remove(old->key(), old->hash);
     old->SetInCache(false);
     assert(usage_ >= old->total_charge);
     usage_ -= old->total_charge;
     deleted->push_back(old);
+    old = next;
   }
 }
 
@@ -400,9 +560,12 @@ Status LRUCacheShard::InsertItem(LRUHandle* e, LRUHandle** handle,
         s = Status::OkOverwritten();
         assert(old->InCache());
         old->SetInCache(false);
-        if (!old->HasRefs()) {
-          // old is on LRU because it's in cache and its reference count is 0.
+        if (old->IsInLRU()) {
+          // Usually this implies !HasRefs(). A warmup lease is intentionally
+          // kept in place while referenced, so unlink it on replacement too.
           LRU_Remove(old);
+        }
+        if (!old->HasRefs()) {
           assert(usage_ >= old->total_charge);
           usage_ -= old->total_charge;
           last_reference_list.push_back(old);
@@ -527,9 +690,15 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
         // Let the dummy entry be overwritten
         e = nullptr;
       } else {
-        if (!e->HasRefs()) {
-          // The entry is in LRU since it's in hash and has no external
-          // references.
+        if (e->IsWarmupPinned()) {
+          // The warmup lease stays at its exact recency position until a real
+          // lookup occurs. The first real hit converts it to a normal pin.
+          if (e->IsInLRU()) {
+            LRU_Remove(e);
+          }
+        } else if (e->IsInLRU()) {
+          // Ordinarily this means there are no external references. It also
+          // covers a warmup handle that was Ref()'d and released first.
           LRU_Remove(e);
         }
         e->Ref();
@@ -610,6 +779,96 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
   return e;
 }
 
+LRUHandle* LRUCacheShard::LookupForCacheWarmup(
+    const Slice& key, uint32_t hash, Cache::Priority* effective_priority) {
+  assert(effective_priority != nullptr);
+  DMutexLock l(mutex_);
+  LRUHandle* e = table_.Lookup(key, hash);
+  if (e == nullptr || e->value == kDummyValueMarker || e->IsPending() ||
+      e->IsWarmupPinned()) {
+    return nullptr;
+  }
+
+  assert(e->InCache());
+  *effective_priority = GetEffectivePriority(e);
+  // If currently evictable, keep the entry linked at its exact recency
+  // position and let eviction skip this bounded lease. If another normal
+  // caller already pins it, merely add a lifetime reference; it is already
+  // outside the LRU and the last release will restore its ordinary policy.
+  const bool stays_linked = e->IsInLRU();
+  e->SetWarmupPinned(true);
+  if (stays_linked) {
+    lru_warmup_pinned_usage_ += e->total_charge;
+  }
+  e->Ref();
+  return e;
+}
+
+bool LRUCacheShard::ReleaseForCacheWarmup(LRUHandle* e,
+                                          Cache::Priority effective_priority) {
+  if (e == nullptr) {
+    return false;
+  }
+  bool last_reference = false;
+  assert(!e->IsPending());
+  {
+    DMutexLock l(mutex_);
+    assert(e->IsWarmupPinned());
+    if (e->IsInLRU()) {
+      assert(lru_warmup_pinned_usage_ >= e->total_charge);
+      lru_warmup_pinned_usage_ -= e->total_charge;
+    }
+    e->SetWarmupPinned(false);
+    last_reference = e->Unref();
+    if (!last_reference && e->InCache() && e->IsInLRU()) {
+      // Only an explicit Ref() of the warmup handle can leave a non-warmup
+      // reference attached to a linked entry. It can no longer participate in
+      // the recency-preserving lease, so restore the ordinary pinned invariant
+      // and pinned-usage accounting until that reference is released.
+      LRU_Remove(e);
+    }
+    if (last_reference && e->InCache()) {
+      if (usage_ > capacity_) {
+        if (e->IsInLRU()) {
+          LRU_Remove(e);
+        }
+        table_.Remove(e->key(), e->hash);
+        e->SetInCache(false);
+      } else if (e->IsInLRU()) {
+        // No foreground lookup occurred, so leaving the entry linked is a
+        // literal recency-preserving no-touch. A duplicate warmup admission
+        // may nevertheless have requested a priority-only promotion.
+        const Cache::Priority requested =
+            NormalizePriorityForPools(e->GetWarmupPromotionPriority());
+        if (IsStrictlyLowerPriority(GetCurrentPriority(e), requested)) {
+          LRU_Remove(e);
+          e->ClearWarmupPromotion();
+          LRU_InsertInPriorityPool(e, requested);
+        } else {
+          e->ClearWarmupPromotion();
+        }
+        last_reference = false;
+      } else {
+        // Either a real lookup removed the entry from the LRU during this
+        // lease, or it was already normally pinned when warmup leased it. In
+        // both cases, restore exactly the policy that an ordinary last release
+        // would apply (including any real hit or pending duplicate promotion).
+        LRU_Insert(e);
+        last_reference = false;
+      }
+    }
+    if (last_reference) {
+      assert(usage_ >= e->total_charge);
+      usage_ -= e->total_charge;
+    }
+  }
+  if (last_reference) {
+    e->Free();
+  }
+  (void)effective_priority;
+  return last_reference;
+}
+
 bool LRUCacheShard::Ref(LRUHandle* e) {
   DMutexLock l(mutex_);
   // To create another reference - entry must be already externally referenced.
@@ -649,11 +908,26 @@ bool LRUCacheShard::Release(LRUHandle* e, bool /*useful*/,
     if (last_reference && e->InCache()) {
       // The item is still in cache, and nobody else holds a reference to it.
       if (usage_ > capacity_ || erase_if_last_ref) {
-        // The LRU list must be empty since the cache is full.
-        assert(lru_.next == &lru_ || erase_if_last_ref);
         // Take this opportunity and remove the item.
+        if (e->IsInLRU()) {
+          LRU_Remove(e);
+        }
         table_.Remove(e->key(), e->hash);
         e->SetInCache(false);
+      } else if (e->IsInLRU()) {
+        // This can happen only if a warmup lease was shared with Ref() and
+        // released first. Preserve its position unless a duplicate requested
+        // a priority promotion while it was pinned.
+        const Cache::Priority requested =
+            NormalizePriorityForPools(e->GetWarmupPromotionPriority());
+        if (IsStrictlyLowerPriority(GetCurrentPriority(e), requested)) {
+          LRU_Remove(e);
+          e->ClearWarmupPromotion();
+          LRU_InsertInPriorityPool(e, requested);
+        } else {
+          e->ClearWarmupPromotion();
+        }
+        last_reference = false;
       } else {
         // Put the item back on the LRU list, and don't free it.
         LRU_Insert(e);
@@ -711,6 +985,248 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
   return InsertItem(e, handle, /* free_handle_on_fail */ true);
 }
 
+Status LRUCacheShard::InsertForCacheWarmup(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    Cache::DeleterFn deleter, Cache::Priority priority,
+    Cache::CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup insertion requires a result pointer");
+  }
+
+  // Allocate and initialize outside the mutex. Unless admission succeeds, the
+  // raw handle is freed without invoking the deleter because ownership stays
+  // with the caller.
+  LRUHandle* e =
+      static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  e->value = value;
+  e->m_flags = 0;
+  e->im_flags = 0;
+  e->info_.deleter = deleter;
+  e->key_length = key.size();
+  e->hash = hash;
+  e->refs = 0;
+  e->next = e->prev = nullptr;
+  e->SetInCache(true);
+  memcpy(e->key_data, key.data(), key.size());
+  e->CalcTotalCharge(charge, metadata_charge_policy_);
+
+  bool inserted = false;
+  autovector<LRUHandle*> evicted;
+  {
+    DMutexLock l(mutex_);
+    priority = NormalizePriorityForPools(priority);
+    e->SetPriority(priority);
+
+    LRUHandle* resident = table_.Lookup(key, hash);
+    if (resident != nullptr) {
+      // Destination ownership always wins. The incoming allocation remains
+      // owned by the caller, but a strictly higher effective source priority
+      // is retained as a metadata-only promotion.
+      PromoteWarmupDuplicate(resident, priority);
+      *result = Cache::CacheWarmupInsertResult::kDuplicate;
+    } else if (e->total_charge > capacity_) {
+      *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    } else {
+      size_t required = 0;
+      const size_t usage_limit = capacity_ - e->total_charge;
+      if (usage_ > usage_limit) {
+        required = usage_ - usage_limit;
+      }
+
+      // Preflight the exact evictable set. Warmup leases stay linked to retain
+      // recency, so pool byte counters alone also include temporarily pinned
+      // entries and cannot establish atomic admission.
+      size_t eligible = 0;
+      for (LRUHandle* candidate = lru_.next; candidate != &lru_;
+           candidate = candidate->next) {
+        if (!candidate->HasRefs() &&
+            IsStrictlyLowerPriority(GetEffectivePriority(candidate),
+                                    priority)) {
+          eligible += candidate->total_charge;
+        }
+      }
+
+      if (eligible < required) {
+        *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+      } else {
+        size_t reclaimed = 0;
+        LRUHandle* victim = lru_.next;
+        while (reclaimed < required && victim != &lru_) {
+          LRUHandle* next = victim->next;
+          if (!victim->HasRefs() &&
+              IsStrictlyLowerPriority(GetEffectivePriority(victim), priority)) {
+            const size_t victim_charge = victim->total_charge;
+            LRU_Remove(victim);
+            LRUHandle* removed = table_.Remove(victim->key(), victim->hash);
+            assert(removed == victim);
+            victim->SetInCache(false);
+            assert(usage_ >= victim_charge);
+            usage_ -= victim_charge;
+            evicted.push_back(victim);
+            if (victim_charge >= required - reclaimed) {
+              reclaimed = required;
+            } else {
+              reclaimed += victim_charge;
+            }
+          }
+          victim = next;
+        }
+        assert(reclaimed >= required);
+        assert(usage_ <= capacity_ - e->total_charge);
+        assert(table_.Insert(e) == nullptr);
+        usage_ += e->total_charge;
+        LRU_Insert(e);
+        inserted = true;
+        *result = Cache::CacheWarmupInsertResult::kInserted;
+      }
+    }
+  }
+
+  if (!inserted) {
+    free(e);
+  }
+  // Demotion and deleters can be expensive and must not run under mutex_.
+  TryInsertIntoSecondaryCache(std::move(evicted));
+  return Status::OK();
+}
+
+Status LRUCacheShard::InsertForCacheWarmupNoEvict(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    Cache::DeleterFn deleter, Cache::Priority priority,
+    Cache::CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "non-evicting cache-warmup insertion requires a result pointer");
+  }
+
+  LRUHandle* e =
+      static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  e->value = value;
+  e->m_flags = 0;
+  e->im_flags = 0;
+  e->info_.deleter = deleter;
+  e->key_length = key.size();
+  e->hash = hash;
+  e->refs = 0;
+  e->next = e->prev = nullptr;
+  e->SetInCache(true);
+  memcpy(e->key_data, key.data(), key.size());
+  e->CalcTotalCharge(charge, metadata_charge_policy_);
+
+  bool inserted = false;
+  {
+    DMutexLock l(mutex_);
+    priority = NormalizePriorityForPools(priority);
+    e->SetPriority(priority);
+
+    LRUHandle* resident = table_.Lookup(key, hash);
+    if (resident != nullptr) {
+      PromoteWarmupDuplicate(resident, priority);
+      *result = Cache::CacheWarmupInsertResult::kDuplicate;
+    } else if (e->total_charge > capacity_ ||
+               usage_ > capacity_ - e->total_charge) {
+      *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    } else {
+      assert(table_.Insert(e) == nullptr);
+      usage_ += e->total_charge;
+      LRU_Insert(e);
+      inserted = true;
+      *result = Cache::CacheWarmupInsertResult::kInserted;
+    }
+  }
+
+  if (!inserted) {
+    // The caller retains value ownership for duplicate and rejected entries.
+    free(e);
+  }
+  return Status::OK();
+}
+
+Status LRUCacheShard::ReplaceForCacheWarmup(
+    const Slice& victim_key, uint32_t victim_hash, const Slice& key,
+    uint32_t hash, void* value, size_t charge, Cache::DeleterFn deleter,
+    Cache::Priority priority, Cache::CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup replacement requires a result pointer");
+  }
+
+  LRUHandle* e =
+      static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  e->value = value;
+  e->m_flags = 0;
+  e->im_flags = 0;
+  e->info_.deleter = deleter;
+  e->key_length = key.size();
+  e->hash = hash;
+  e->refs = 0;
+  e->next = e->prev = nullptr;
+  e->SetInCache(true);
+  memcpy(e->key_data, key.data(), key.size());
+  e->CalcTotalCharge(charge, metadata_charge_policy_);
+
+  bool inserted = false;
+  autovector<LRUHandle*> evicted;
+  {
+    DMutexLock l(mutex_);
+    priority = NormalizePriorityForPools(priority);
+    e->SetPriority(priority);
+
+    LRUHandle* resident = table_.Lookup(key, hash);
+    if (resident != nullptr) {
+      PromoteWarmupDuplicate(resident, priority);
+      *result = Cache::CacheWarmupInsertResult::kDuplicate;
+    } else {
+      LRUHandle* victim = table_.Lookup(victim_key, victim_hash);
+      const bool replaceable = victim != nullptr && victim->InCache() &&
+                               victim->value != kDummyValueMarker &&
+                               !victim->IsPending() && !victim->HasRefs() &&
+                               victim->IsInLRU() &&
+                               usage_ >= victim->total_charge;
+      const bool fits =
+          replaceable && e->total_charge <= capacity_ &&
+          usage_ - victim->total_charge <= capacity_ - e->total_charge;
+      if (!fits) {
+        *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+      } else {
+        LRU_Remove(victim);
+        LRUHandle* removed = table_.Remove(victim->key(), victim->hash);
+        assert(removed == victim);
+        victim->SetInCache(false);
+        assert(usage_ >= victim->total_charge);
+        usage_ -= victim->total_charge;
+        evicted.push_back(victim);
+
+        assert(table_.Insert(e) == nullptr);
+        usage_ += e->total_charge;
+        LRU_Insert(e);
+        inserted = true;
+        *result = Cache::CacheWarmupInsertResult::kInserted;
+      }
+    }
+  }
+
+  if (!inserted) {
+    free(e);
+  }
+  TryInsertIntoSecondaryCache(std::move(evicted));
+  return Status::OK();
+}
+
+Status LRUCacheShard::PromoteForCacheWarmup(const Slice& key, uint32_t hash,
+                                            Cache::Priority priority) {
+  DMutexLock l(mutex_);
+  LRUHandle* resident = table_.Lookup(key, hash);
+  if (resident == nullptr || resident->value == kDummyValueMarker ||
+      resident->IsPending()) {
+    return Status::NotFound("cache-warmup promotion entry is not resident");
+  }
+  assert(resident->InCache());
+  PromoteWarmupDuplicate(resident, priority);
+  return Status::OK();
+}
+
 void LRUCacheShard::Erase(const Slice& key, uint32_t hash) {
   LRUHandle* e;
   bool last_reference = false;
@@ -720,9 +1236,11 @@ void LRUCacheShard::Erase(const Slice& key, uint32_t hash) {
     if (e != nullptr) {
       assert(e->InCache());
       e->SetInCache(false);
-      if (!e->HasRefs()) {
-        // The entry is in LRU since it's in hash and has no external references
+      if (e->IsInLRU()) {
+        // This also covers an entry carrying the bounded warmup reference.
         LRU_Remove(e);
+      }
+      if (!e->HasRefs()) {
         assert(usage_ >= e->total_charge);
         usage_ -= e->total_charge;
         last_reference = true;
@@ -755,7 +1273,7 @@ size_t LRUCacheShard::GetUsage() const {
 size_t LRUCacheShard::GetPinnedUsage() const {
   DMutexLock l(mutex_);
   assert(usage_ >= lru_usage_);
-  return usage_ - lru_usage_;
+  return usage_ - lru_usage_ + lru_warmup_pinned_usage_;
 }
 
 size_t LRUCacheShard::GetOccupancyCount() const {
@@ -820,6 +1338,99 @@ Cache::DeleterFn LRUCache::GetDeleter(Handle* handle) const {
   } else {
     return h->info_.deleter;
   }
+}
+
+Status LRUCache::ApplyToAllEntriesForCacheWarmup(
+    const CacheWarmupMetadataCallback& callback,
+    const ApplyToAllEntriesOptions& opts) {
+  if (!callback) {
+    return Status::InvalidArgument(
+        "cache-warmup metadata callback must be set");
+  }
+  const size_t entries_per_lock =
+      std::max(size_t{1}, opts.average_entries_per_lock);
+  ForEachShard([&](LRUCacheShard* shard) {
+    size_t state = 0;
+    do {
+      shard->ApplyToSomeEntriesForCacheWarmup(callback, entries_per_lock,
+                                              &state);
+    } while (state != SIZE_MAX);
+  });
+  return Status::OK();
+}
+
+Status LRUCache::LookupForCacheWarmup(const Slice& key, Handle** handle,
+                                      Priority* effective_priority) {
+  if (handle == nullptr || effective_priority == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup lookup requires handle and priority outputs");
+  }
+  *handle = nullptr;
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  LRUHandle* result =
+      GetShard(hash).LookupForCacheWarmup(key, hash, effective_priority);
+  *handle = reinterpret_cast<Handle*>(result);
+  return Status::OK();
+}
+
+bool LRUCache::ReleaseForCacheWarmup(Handle* handle,
+                                     Priority effective_priority) {
+  if (handle == nullptr) {
+    return false;
+  }
+  auto* h = reinterpret_cast<LRUHandle*>(handle);
+  return GetShard(h->hash).ReleaseForCacheWarmup(h, effective_priority);
+}
+
+Status LRUCache::InsertForCacheWarmup(const Slice& key, void* value,
+                                      size_t charge, DeleterFn deleter,
+                                      Priority priority,
+                                      CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup insertion requires a result pointer");
+  }
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  return GetShard(hash).InsertForCacheWarmup(key, hash, value, charge, deleter,
+                                             priority, result);
+}
+
+Status LRUCache::InsertForCacheWarmupNoEvict(const Slice& key, void* value,
+                                             size_t charge, DeleterFn deleter,
+                                             Priority priority,
+                                             CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "non-evicting cache-warmup insertion requires a result pointer");
+  }
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  return GetShard(hash).InsertForCacheWarmupNoEvict(key, hash, value, charge,
+                                                    deleter, priority, result);
+}
+
+Status LRUCache::ReplaceForCacheWarmup(const Slice& victim_key,
+                                       const Slice& key, void* value,
+                                       size_t charge, DeleterFn deleter,
+                                       Priority priority,
+                                       CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup replacement requires a result pointer");
+  }
+  uint32_t victim_hash = LRUCacheShard::ComputeHash(victim_key);
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  LRUCacheShard* shard = &GetShard(hash);
+  if (shard != &GetShard(victim_hash)) {
+    return Status::InvalidArgument(
+        "cache-warmup replacement keys map to different shards");
+  }
+  return shard->ReplaceForCacheWarmup(victim_key, victim_hash, key, hash, value,
+                                      charge, deleter, priority, result);
+}
+
+Status LRUCache::PromoteForCacheWarmup(const Slice& key, Priority priority) {
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  return GetShard(hash).PromoteForCacheWarmup(key, hash, priority);
 }
 
 size_t LRUCache::TEST_GetLRUSize() {

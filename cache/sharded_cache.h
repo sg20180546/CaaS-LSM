@@ -238,10 +238,21 @@ class ShardedCache : public ShardedCacheBase {
     return SumOverShards2(&CacheShard::GetPinnedUsage);
   }
   size_t GetOccupancyCount() const override {
-    return SumOverShards2(&CacheShard::GetPinnedUsage);
+    return SumOverShards2(&CacheShard::GetOccupancyCount);
   }
   size_t GetTableAddressCount() const override {
     return SumOverShards2(&CacheShard::GetTableAddressCount);
+  }
+  size_t GetCacheWarmupShardCount() const override { return GetNumShards(); }
+  size_t GetCacheWarmupShardIndex(const Slice& key) const override {
+    HashVal hash = CacheShard::ComputeHash(key);
+    return CacheShard::HashPieceForSharding(hash) & shard_mask_;
+  }
+  size_t GetCacheWarmupShardCapacity(size_t shard_index) const override {
+    return shard_index < GetNumShards() ? GetPerShardCapacity() : 0;
+  }
+  size_t GetCacheWarmupShardUsage(size_t shard_index) const override {
+    return shard_index < GetNumShards() ? shards_[shard_index].GetUsage() : 0;
   }
   void ApplyToAllEntries(
       const std::function<void(const Slice& key, void* value, size_t charge,

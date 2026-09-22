@@ -22,6 +22,7 @@
 #include "rocksdb/persistent_cache.h"
 #include "rocksdb/trace_record.h"
 #include "rocksdb/trace_record_result.h"
+#include "rocksdb/unique_id.h"
 #include "rocksdb/utilities/replayer.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
@@ -7508,6 +7509,455 @@ TEST_F(DBTest2, SstUniqueIdVerifyMultiCFs) {
   auto s = TryReopenWithColumnFamilies({"default", "one", "two"}, options);
   ASSERT_TRUE(s.IsCorruption());
 }
+
+#ifndef ROCKSDB_LITE
+TEST_F(DBTest2, RelinkPreservesSstUniqueIdAcrossRegistrations) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.max_open_files = 64;
+  options.verify_sst_unique_id_in_manifest = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyMetaData source_metadata;
+  db_->GetColumnFamilyMetaData(&source_metadata);
+  ASSERT_EQ(source_metadata.file_count, 1);
+  ASSERT_EQ(source_metadata.levels[0].files.size(), 1);
+  const SstFileMetaData source_file = source_metadata.levels[0].files[0];
+  ASSERT_EQ(source_file.unique_id.size(), 16);
+
+  TablePropertiesCollection source_properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&source_properties));
+  ASSERT_EQ(source_properties.size(), 1);
+  std::string properties_unique_id;
+  ASSERT_OK(GetUniqueIdFromTableProperties(*source_properties.begin()->second,
+                                           &properties_unique_id));
+  ASSERT_EQ(source_file.unique_id, properties_unique_id);
+
+  const std::string source_path =
+      source_file.directory + "/" + source_file.relative_filename;
+  // Force the edit after registration to snapshot the current Version into a
+  // new MANIFEST. This exercises WriteCurrentStateToManifest rather than only
+  // the original registration edit.
+  options.max_manifest_file_size = 1;
+  const std::string dst1_name =
+      test::PerThreadDBPath(env_, "relink_unique_id_dst1");
+  const std::string dst2_name =
+      test::PerThreadDBPath(env_, "relink_unique_id_dst2");
+  const std::string fallback_name =
+      test::PerThreadDBPath(env_, "relink_unique_id_fallback");
+  ASSERT_OK(DestroyDB(dst1_name, options));
+  ASSERT_OK(DestroyDB(dst2_name, options));
+  ASSERT_OK(DestroyDB(fallback_name, options));
+
+  DB* dst1_raw = nullptr;
+  DB* dst2_raw = nullptr;
+  DB* fallback_raw = nullptr;
+  ASSERT_OK(DB::Open(options, dst1_name, &dst1_raw));
+  ASSERT_OK(DB::Open(options, dst2_name, &dst2_raw));
+  ASSERT_OK(DB::Open(options, fallback_name, &fallback_raw));
+  std::unique_ptr<DB> dst1(dst1_raw);
+  std::unique_ptr<DB> dst2(dst2_raw);
+  std::unique_ptr<DB> fallback(fallback_raw);
+
+  auto register_arg = [&](const SstFileMetaData& file) {
+    ExternalFileForRegister arg;
+    arg.external_file = source_path;
+    arg.level = 0;
+    arg.global_seqno = file.largest_seqno;
+    arg.smallest_user = file.smallestkey;
+    arg.largest_user = file.largestkey;
+    arg.file_size = file.size;
+    arg.unique_id = file.unique_id;
+    arg.num_entries = file.num_entries;
+    arg.num_deletions = file.num_deletions;
+    arg.oldest_ancester_time = file.oldest_ancester_time;
+    arg.file_creation_time = file.file_creation_time;
+    return arg;
+  };
+
+  // First hop uses the source's public metadata and the no-open fast path.
+  ASSERT_OK(dst1->RegisterExternalFilesInPlace(dst1->DefaultColumnFamily(),
+                                               {register_arg(source_file)}));
+  ColumnFamilyMetaData dst1_metadata;
+  dst1->GetColumnFamilyMetaData(&dst1_metadata);
+  ASSERT_EQ(dst1_metadata.file_count, 1);
+  ASSERT_EQ(dst1_metadata.levels[0].files.size(), 1);
+  const SstFileMetaData dst1_file = dst1_metadata.levels[0].files[0];
+  ASSERT_EQ(dst1_file.unique_id, source_file.unique_id);
+  std::string value;
+  ASSERT_OK(dst1->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "value");
+
+  const uint64_t manifest_before_rollover =
+      static_cast_with_check<DBImpl>(dst1.get())
+          ->TEST_Current_Manifest_FileNo();
+  ASSERT_OK(dst1->Put(WriteOptions(), "rollover-key", "rollover-value"));
+  ASSERT_OK(dst1->Flush(FlushOptions()));
+  const uint64_t manifest_after_rollover =
+      static_cast_with_check<DBImpl>(dst1.get())
+          ->TEST_Current_Manifest_FileNo();
+  ASSERT_GT(manifest_after_rollover, manifest_before_rollover);
+
+  dst1.reset();
+  dst1_raw = nullptr;
+  ASSERT_OK(DB::Open(options, dst1_name, &dst1_raw));
+  dst1.reset(dst1_raw);
+
+  ColumnFamilyMetaData reopened_dst1_metadata;
+  dst1->GetColumnFamilyMetaData(&reopened_dst1_metadata);
+  size_t matching_external_files = 0;
+  for (const auto& level : reopened_dst1_metadata.levels) {
+    for (const auto& file : level.files) {
+      if (file.external_path == source_path) {
+        ++matching_external_files;
+        ASSERT_EQ(file.unique_id, source_file.unique_id);
+      }
+    }
+  }
+  ASSERT_EQ(matching_external_files, 1);
+
+  std::vector<LiveFileMetaData> reopened_dst1_live_files;
+  dst1->GetLiveFilesMetaData(&reopened_dst1_live_files);
+  size_t matching_live_external_files = 0;
+  for (const auto& file : reopened_dst1_live_files) {
+    if (file.external_path == source_path) {
+      ++matching_live_external_files;
+      ASSERT_EQ(file.unique_id, source_file.unique_id);
+    }
+  }
+  ASSERT_EQ(matching_live_external_files, 1);
+
+  // The second hop obtains the ID from the first destination's metadata. Its
+  // MANIFEST must retain the original ID rather than minting a new one.
+  ASSERT_OK(dst2->RegisterExternalFilesInPlace(dst2->DefaultColumnFamily(),
+                                               {register_arg(dst1_file)}));
+  ColumnFamilyMetaData dst2_metadata;
+  dst2->GetColumnFamilyMetaData(&dst2_metadata);
+  ASSERT_EQ(dst2_metadata.file_count, 1);
+  ASSERT_EQ(dst2_metadata.levels[0].files.size(), 1);
+  ASSERT_EQ(dst2_metadata.levels[0].files[0].unique_id, source_file.unique_id);
+  ASSERT_OK(dst2->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "value");
+
+  ExternalFileForRegister malformed = register_arg(source_file);
+  malformed.unique_id = "too short";
+  Status s = fallback->RegisterExternalFilesInPlace(
+      fallback->DefaultColumnFamily(), {malformed});
+  ASSERT_TRUE(s.IsInvalidArgument());
+
+  malformed.unique_id.assign(16, '\0');
+  s = fallback->RegisterExternalFilesInPlace(fallback->DefaultColumnFamily(),
+                                             {malformed});
+  ASSERT_TRUE(s.IsInvalidArgument());
+
+  // If the batch fallback opens the SST, validate a supplied ID against the
+  // table properties before installing it.
+  malformed = register_arg(source_file);
+  malformed.smallest_user.clear();
+  malformed.unique_id[0] ^= 1;
+  s = fallback->RegisterExternalFilesInPlace(fallback->DefaultColumnFamily(),
+                                             {malformed});
+  ASSERT_TRUE(s.IsCorruption());
+
+  // The legacy one-file entry point already opens the SST, so it can derive
+  // and preserve the ID without adding another public parameter.
+  ASSERT_OK(fallback->RegisterExternalFileInPlace(
+      fallback->DefaultColumnFamily(), source_path, 0,
+      source_file.largest_seqno));
+  ColumnFamilyMetaData fallback_metadata;
+  fallback->GetColumnFamilyMetaData(&fallback_metadata);
+  ASSERT_EQ(fallback_metadata.file_count, 1);
+  ASSERT_EQ(fallback_metadata.levels[0].files[0].unique_id,
+            source_file.unique_id);
+
+  fallback.reset();
+  dst2.reset();
+  dst1.reset();
+  ASSERT_OK(DestroyDB(fallback_name, options));
+  ASSERT_OK(DestroyDB(dst2_name, options));
+  ASSERT_OK(DestroyDB(dst1_name, options));
+}
+
+TEST_F(DBTest2, RelinkGlobalSeqnoSurvivesManifestRolloverAndReopen) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.max_open_files = 64;
+  options.verify_sst_unique_id_in_manifest = true;
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("key", "source-value"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData source_metadata;
+  db_->GetColumnFamilyMetaData(&source_metadata);
+  ASSERT_EQ(source_metadata.file_count, 1);
+  ASSERT_EQ(source_metadata.levels[0].files.size(), 1);
+  const SstFileMetaData source_file = source_metadata.levels[0].files[0];
+  const std::string source_path =
+      source_file.directory + "/" + source_file.relative_filename;
+
+  options.max_manifest_file_size = 1;
+  const std::string destination_name =
+      test::PerThreadDBPath(env_, "relink_gsn_recovery");
+  ASSERT_OK(DestroyDB(destination_name, options));
+  DB* destination_raw = nullptr;
+  ASSERT_OK(DB::Open(options, destination_name, &destination_raw));
+  std::unique_ptr<DB> destination(destination_raw);
+
+  // Give the destination a conflicting version whose physical sequence number
+  // is newer than the one stored in the source SST. The relink GSN must make
+  // the source value win when a post-recovery compaction merges both files.
+  ASSERT_OK(destination->Put(WriteOptions(), "key", "destination-value-1"));
+  ASSERT_OK(destination->Put(WriteOptions(), "key", "destination-value-2"));
+  ASSERT_OK(destination->Flush(FlushOptions()));
+  const SequenceNumber migration_gsn =
+      destination->GetLatestSequenceNumber() + 100;
+  ASSERT_GT(migration_gsn, source_file.largest_seqno);
+
+  ExternalFileForRegister registration;
+  registration.external_file = source_path;
+  registration.level = 0;
+  registration.global_seqno = migration_gsn;
+  registration.smallest_user = source_file.smallestkey;
+  registration.largest_user = source_file.largestkey;
+  registration.file_size = source_file.size;
+  registration.unique_id = source_file.unique_id;
+  registration.num_entries = source_file.num_entries;
+  registration.num_deletions = source_file.num_deletions;
+  registration.oldest_ancester_time = source_file.oldest_ancester_time;
+  registration.file_creation_time = source_file.file_creation_time;
+  ASSERT_OK(destination->RegisterExternalFilesInPlace(
+      destination->DefaultColumnFamily(), {registration}));
+
+  std::string value;
+  ASSERT_OK(destination->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "source-value");
+
+  const uint64_t manifest_before_rollover =
+      static_cast_with_check<DBImpl>(destination.get())
+          ->TEST_Current_Manifest_FileNo();
+  ASSERT_OK(destination->Put(WriteOptions(), "rollover-key", "value"));
+  ASSERT_OK(destination->Flush(FlushOptions()));
+  const uint64_t manifest_after_rollover =
+      static_cast_with_check<DBImpl>(destination.get())
+          ->TEST_Current_Manifest_FileNo();
+  ASSERT_GT(manifest_after_rollover, manifest_before_rollover);
+
+  destination.reset();
+  destination_raw = nullptr;
+  ASSERT_OK(DB::Open(options, destination_name, &destination_raw));
+  destination.reset(destination_raw);
+  ASSERT_OK(destination->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "source-value");
+
+  CompactRangeOptions compact_options;
+  ASSERT_OK(destination->CompactRange(compact_options, nullptr, nullptr));
+  ASSERT_OK(destination->Get(ReadOptions(), "key", &value));
+  ASSERT_EQ(value, "source-value");
+
+  destination.reset();
+  ASSERT_OK(DestroyDB(destination_name, options));
+}
+
+TEST_F(DBTest2, RelinkTableCacheWarmupUsesMemoryAndCurrentLevels) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  // The TableCache capacity is max_open_files - 10, so this gives the
+  // destination exactly ten reader slots.
+  options.max_open_files = 20;
+  options.table_cache_numshardbits = 0;
+  BlockBasedTableOptions table_options;
+  // Exercise capture/replay with independently populated metadata block
+  // caches. Reopen retains the source cache, so capture must not silently rely
+  // on a cache hit; the destination gets a distinct cache and missing SST
+  // paths, so replay can succeed only from the transferred table bundle.
+  table_options.block_cache = NewLRUCache(8u << 20, 0);
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.cache_warmup_metadata_transfer = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("source-key", "source-value"));
+  ASSERT_OK(Flush());
+  // Reopen so the next Get constructs an evictable TableReader through
+  // TableCache and records its complete bounded metadata-read plan.
+  Reopen(options);
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "source-key", &value));
+  ASSERT_EQ(value, "source-value");
+
+  ColumnFamilyMetaData source_metadata;
+  db_->GetColumnFamilyMetaData(&source_metadata);
+  ASSERT_EQ(source_metadata.file_count, 1);
+  const SstFileMetaData& source_file = source_metadata.levels[0].files[0];
+  ASSERT_EQ(source_file.unique_id.size(), 16);
+  const std::string source_path =
+      source_file.directory + "/" + source_file.relative_filename;
+
+  constexpr size_t kMaxEntryBytes = 8u << 20;
+  std::vector<TableCacheWarmupSnapshotEntry> snapshots;
+  TableCacheWarmupTransferStats source_stats;
+  ASSERT_OK(db_->SnapshotTableCacheWarmupEntries(
+      db_->DefaultColumnFamily(), {{source_file.file_number, source_path}},
+      kMaxEntryBytes, &snapshots, &source_stats));
+  ASSERT_EQ(source_stats.requested, 1);
+  ASSERT_EQ(source_stats.resident, 1);
+  ASSERT_EQ(source_stats.copied, 1);
+  ASSERT_EQ(snapshots.size(), 1);
+  ASSERT_EQ(snapshots[0].unique_id, source_file.unique_id);
+  ASSERT_FALSE(snapshots[0].ranges.empty());
+
+  // Snapshot byte strings own the resident metadata bundle independently of
+  // the source DB/TableCache. Reopen first, then copy the wire representation
+  // from the aliases to exercise the async migration lifetime boundary.
+  Reopen(options);
+  std::vector<ExternalTableCacheEntry> captured;
+  ExternalTableCacheEntry captured_entry;
+  captured_entry.external_file = snapshots[0].external_file;
+  captured_entry.file_size = snapshots[0].file_size;
+  captured_entry.unique_id = snapshots[0].unique_id;
+  for (const auto& range : snapshots[0].ranges) {
+    ASSERT_NE(range.data, nullptr);
+    captured_entry.ranges.push_back({range.offset, *range.data});
+  }
+  captured.emplace_back(std::move(captured_entry));
+  ASSERT_EQ(captured.size(), 1);
+  ASSERT_FALSE(captured[0].ranges.empty());
+
+  const std::string destination_name =
+      test::PerThreadDBPath(env_, "relink_table_cache_destination");
+  Options destination_options = options;
+  BlockBasedTableOptions destination_table_options = table_options;
+  destination_table_options.block_cache = NewLRUCache(8u << 20, 0);
+  destination_options.table_factory.reset(
+      NewBlockBasedTableFactory(destination_table_options));
+  ASSERT_OK(DestroyDB(destination_name, destination_options));
+  DB* destination_raw = nullptr;
+  ASSERT_OK(
+      DB::Open(destination_options, destination_name, &destination_raw));
+  std::unique_ptr<DB> destination(destination_raw);
+
+  // Register ten deep files and one L0 file. None of these paths exists. The
+  // metadata-complete registration and warmup must therefore succeed without
+  // opening or reading an SST.
+  std::vector<std::string> external_paths;
+  std::vector<ExternalFileForRegister> registrations;
+  external_paths.reserve(11);
+  registrations.reserve(11);
+  for (size_t i = 0; i < 11; ++i) {
+    external_paths.emplace_back(destination_name + "/missing-external-" +
+                                std::to_string(i) + ".sst");
+    ExternalFileForRegister registration;
+    registration.external_file = external_paths.back();
+    registration.level = i == 0 ? 0 : 6;
+    registration.global_seqno = 100 + i;
+    registration.smallest_user = i == 0 ? "l0" : Key(100 + static_cast<int>(i));
+    registration.largest_user = registration.smallest_user;
+    registration.file_size = captured[0].file_size;
+    registration.unique_id = source_file.unique_id;
+    registration.num_entries = 1;
+    registrations.emplace_back(std::move(registration));
+  }
+  ASSERT_OK(destination->RegisterExternalFilesInPlace(
+      destination->DefaultColumnFamily(), registrations));
+
+  auto warmup_entry = [&](size_t index) {
+    ExternalTableCacheEntry entry = captured[0];
+    entry.external_file = external_paths[index];
+    return entry;
+  };
+
+  std::vector<ExternalTableCacheEntry> deep_entries;
+  for (size_t i = 1; i < 10; ++i) {
+    deep_entries.emplace_back(warmup_entry(i));
+  }
+  TableCacheWarmupTransferStats deep_stats;
+  ASSERT_OK(destination->InstallExternalTableCacheEntries(
+      destination->DefaultColumnFamily(), std::move(deep_entries),
+      kMaxEntryBytes, &deep_stats));
+  ASSERT_EQ(deep_stats.selected, 9);
+  ASSERT_EQ(deep_stats.installed, 9);
+  ASSERT_EQ(deep_stats.evicted_existing, 0);
+
+  // A syntactically valid but metadata-incomplete L0 candidate must fail
+  // without reserving the remaining slot from a usable L6 candidate.
+  // Truncating the range that reaches the end of the SST makes the footer read
+  // fail during off-cache preparation.
+  ExternalTableCacheEntry incomplete_l0 = warmup_entry(0);
+  ASSERT_FALSE(incomplete_l0.ranges.empty());
+  ASSERT_GT(incomplete_l0.ranges.back().data.size(), 1);
+  incomplete_l0.ranges.back().data.resize(
+      incomplete_l0.ranges.back().data.size() - 1);
+  std::vector<ExternalTableCacheEntry> incomplete_entries;
+  incomplete_entries.emplace_back(std::move(incomplete_l0));
+  incomplete_entries.emplace_back(warmup_entry(10));
+  TableCacheWarmupTransferStats incomplete_stats;
+  ASSERT_NOK(destination->InstallExternalTableCacheEntries(
+      destination->DefaultColumnFamily(), std::move(incomplete_entries),
+      kMaxEntryBytes, &incomplete_stats));
+  ASSERT_EQ(incomplete_stats.selected, 2);
+  ASSERT_EQ(incomplete_stats.installed, 1);
+  ASSERT_EQ(incomplete_stats.evicted_existing, 0);
+  ASSERT_EQ(incomplete_stats.failed, 1);
+
+  ColumnFamilyMetaData before_replacement;
+  destination->GetColumnFamilyMetaData(&before_replacement);
+  std::vector<TableCacheWarmupRequest> deep_probes;
+  for (const auto& file : before_replacement.levels[6].files) {
+    deep_probes.push_back({file.file_number, ""});
+  }
+  ASSERT_EQ(deep_probes.size(), 10);
+  uint64_t deep_resident = 0;
+  TableCacheWarmupTransferStats deep_probe_stats;
+  ASSERT_OK(destination->StreamTableCacheWarmupEntries(
+      destination->DefaultColumnFamily(), deep_probes, kMaxEntryBytes,
+      [&](ExternalTableCacheEntry&&) {
+        ++deep_resident;
+        return Status::OK();
+      },
+      &deep_probe_stats));
+  ASSERT_EQ(deep_resident, 10);
+
+  // The cache is full. Destination CURRENT level ordering must admit the new
+  // L0 reader and explicitly evict one existing L6 reader.
+  std::vector<ExternalTableCacheEntry> l0_entry;
+  l0_entry.emplace_back(warmup_entry(0));
+  TableCacheWarmupTransferStats l0_stats;
+  ASSERT_OK(destination->InstallExternalTableCacheEntries(
+      destination->DefaultColumnFamily(), std::move(l0_entry), kMaxEntryBytes,
+      &l0_stats));
+  ASSERT_EQ(l0_stats.selected, 1);
+  ASSERT_EQ(l0_stats.installed, 1);
+  ASSERT_EQ(l0_stats.evicted_existing, 1);
+
+  ColumnFamilyMetaData destination_metadata;
+  destination->GetColumnFamilyMetaData(&destination_metadata);
+  ASSERT_EQ(destination_metadata.file_count, 11);
+  ASSERT_EQ(destination_metadata.levels[0].files.size(), 1);
+  const uint64_t destination_l0_number =
+      destination_metadata.levels[0].files[0].file_number;
+  TableCacheWarmupTransferStats probe_stats;
+  uint64_t probed = 0;
+  ASSERT_OK(destination->StreamTableCacheWarmupEntries(
+      destination->DefaultColumnFamily(),
+      {{destination_l0_number, external_paths[0]}}, kMaxEntryBytes,
+      [&](ExternalTableCacheEntry&&) {
+        ++probed;
+        return Status::OK();
+      },
+      &probe_stats));
+  ASSERT_EQ(probed, 1);
+  ASSERT_EQ(probe_stats.copied, 1);
+
+  destination.reset();
+  ASSERT_OK(DestroyDB(destination_name, destination_options));
+}
+#endif  // ROCKSDB_LITE
 
 #ifndef ROCKSDB_LITE
 TEST_F(DBTest2, GetLatestSeqAndTsForKey) {

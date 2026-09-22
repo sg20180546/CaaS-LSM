@@ -931,6 +931,9 @@ class Version {
   Status GetPropertiesOfResidentTables(
       std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
           props);
+  Status GetBlockCacheKeyPrefixes(
+      const std::vector<uint64_t>& file_numbers,
+      std::unordered_map<uint64_t, std::string>* prefixes) const;
   Status GetPropertiesOfAllTables(TablePropertiesCollection* props, int level);
   Status GetPropertiesOfTablesInRange(const Range* range, std::size_t n,
                                       TablePropertiesCollection* props) const;
