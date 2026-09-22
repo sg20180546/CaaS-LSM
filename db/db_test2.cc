@@ -7536,6 +7536,7 @@ TEST_F(DBTest2, RelinkPreservesSstUniqueIdAcrossRegistrations) {
   ASSERT_OK(GetUniqueIdFromTableProperties(*source_properties.begin()->second,
                                            &properties_unique_id));
   ASSERT_EQ(source_file.unique_id, properties_unique_id);
+  const auto& source_table_properties = *source_properties.begin()->second;
 
   const std::string source_path =
       source_file.directory + "/" + source_file.relative_filename;
@@ -7574,6 +7575,8 @@ TEST_F(DBTest2, RelinkPreservesSstUniqueIdAcrossRegistrations) {
     arg.unique_id = file.unique_id;
     arg.num_entries = file.num_entries;
     arg.num_deletions = file.num_deletions;
+    arg.raw_key_size = source_table_properties.raw_key_size;
+    arg.raw_value_size = source_table_properties.raw_value_size;
     arg.oldest_ancester_time = file.oldest_ancester_time;
     arg.file_creation_time = file.file_creation_time;
     return arg;
@@ -7699,6 +7702,10 @@ TEST_F(DBTest2, RelinkGlobalSeqnoSurvivesManifestRolloverAndReopen) {
   const SstFileMetaData source_file = source_metadata.levels[0].files[0];
   const std::string source_path =
       source_file.directory + "/" + source_file.relative_filename;
+  TablePropertiesCollection source_properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&source_properties));
+  ASSERT_EQ(source_properties.size(), 1);
+  const auto& source_table_properties = *source_properties.begin()->second;
 
   options.max_manifest_file_size = 1;
   const std::string destination_name =
@@ -7728,6 +7735,8 @@ TEST_F(DBTest2, RelinkGlobalSeqnoSurvivesManifestRolloverAndReopen) {
   registration.unique_id = source_file.unique_id;
   registration.num_entries = source_file.num_entries;
   registration.num_deletions = source_file.num_deletions;
+  registration.raw_key_size = source_table_properties.raw_key_size;
+  registration.raw_value_size = source_table_properties.raw_value_size;
   registration.oldest_ancester_time = source_file.oldest_ancester_time;
   registration.file_creation_time = source_file.file_creation_time;
   ASSERT_OK(destination->RegisterExternalFilesInPlace(
@@ -7798,6 +7807,10 @@ TEST_F(DBTest2, RelinkTableCacheWarmupUsesMemoryAndCurrentLevels) {
   ASSERT_EQ(source_file.unique_id.size(), 16);
   const std::string source_path =
       source_file.directory + "/" + source_file.relative_filename;
+  TablePropertiesCollection source_properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&source_properties));
+  ASSERT_EQ(source_properties.size(), 1);
+  const auto& source_table_properties = *source_properties.begin()->second;
 
   constexpr size_t kMaxEntryBytes = 8u << 20;
   std::vector<TableCacheWarmupSnapshotEntry> snapshots;
@@ -7861,6 +7874,8 @@ TEST_F(DBTest2, RelinkTableCacheWarmupUsesMemoryAndCurrentLevels) {
     registration.file_size = captured[0].file_size;
     registration.unique_id = source_file.unique_id;
     registration.num_entries = 1;
+    registration.raw_key_size = source_table_properties.raw_key_size;
+    registration.raw_value_size = source_table_properties.raw_value_size;
     registrations.emplace_back(std::move(registration));
   }
   ASSERT_OK(destination->RegisterExternalFilesInPlace(
