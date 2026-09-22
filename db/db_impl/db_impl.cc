@@ -4463,6 +4463,21 @@ Status DBImpl::CheckConsistency() {
     // directory separately.
     std::map<std::string, std::vector<std::string>> files_by_directory;
     for (const auto& md : metadata) {
+      if (!md.external_path.empty()) {
+        const size_t separator = md.external_path.find_last_of("/\\");
+        if (separator == std::string::npos ||
+            separator + 1 == md.external_path.size()) {
+          corruption_messages +=
+              "Invalid external SST path " + md.external_path + "\n";
+          continue;
+        }
+        const std::string directory =
+            separator == 0 ? md.external_path.substr(0, 1)
+                           : md.external_path.substr(0, separator);
+        files_by_directory[directory].push_back(
+            md.external_path.substr(separator + 1));
+        continue;
+      }
       // md.name has a leading "/". Remove it.
       std::string fname = md.name;
       if (!fname.empty() && fname[0] == '/') {
@@ -4497,8 +4512,10 @@ Status DBImpl::CheckConsistency() {
     }
   } else {
     for (const auto& md : metadata) {
-      // md.name has a leading "/".
-      std::string file_path = md.db_path + md.name;
+      // Relinked files remain at their shared-storage path. Ordinary files use
+      // the DB-owned path assembled from db_path and the slash-prefixed name.
+      const std::string file_path =
+          md.external_path.empty() ? md.db_path + md.name : md.external_path;
 
       uint64_t fsize = 0;
       TEST_SYNC_POINT("DBImpl::CheckConsistency:BeforeGetFileSize");
@@ -4509,7 +4526,7 @@ Status DBImpl::CheckConsistency() {
       }
       if (!s.ok()) {
         corruption_messages +=
-            "Can't access " + md.name + ": " + s.ToString() + "\n";
+            "Can't access " + file_path + ": " + s.ToString() + "\n";
       } else if (fsize != md.size) {
         corruption_messages += "Sst file size mismatch: " + file_path +
                                ". Size recorded in manifest " +

@@ -578,8 +578,8 @@ Status DBImplSecondary::CheckConsistency() {
 
   std::string corruption_messages;
   for (const auto& md : metadata) {
-    // md.name has a leading "/".
-    std::string file_path = md.db_path + md.name;
+    const std::string file_path =
+        md.external_path.empty() ? md.db_path + md.name : md.external_path;
 
     uint64_t fsize = 0;
     s = env_->GetFileSize(file_path, &fsize);
@@ -590,7 +590,7 @@ Status DBImplSecondary::CheckConsistency() {
     }
     if (!s.ok()) {
       corruption_messages +=
-          "Can't access " + md.name + ": " + s.ToString() + "\n";
+          "Can't access " + file_path + ": " + s.ToString() + "\n";
     }
   }
   return corruption_messages.empty() ? Status::OK()
