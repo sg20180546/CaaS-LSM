@@ -1087,7 +1087,12 @@ Status LRUCacheShard::InsertForCacheWarmup(
         }
         assert(reclaimed >= required);
         assert(usage_ <= capacity_ - e->total_charge);
-        assert(table_.Insert(e) == nullptr);
+        // NOT inside assert(): the insert must execute in NDEBUG builds too.
+        // (2026-09-22: as an assert, Release builds never linked the entry
+        // into the hash table, so every warmed block/reader was unreachable.)
+        LRUHandle* old_entry = table_.Insert(e);
+        assert(old_entry == nullptr);
+        (void)old_entry;
         usage_ += e->total_charge;
         LRU_Insert(e);
         inserted = true;
@@ -1141,7 +1146,10 @@ Status LRUCacheShard::InsertForCacheWarmupNoEvict(
                usage_ > capacity_ - e->total_charge) {
       *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
     } else {
-      assert(table_.Insert(e) == nullptr);
+      // NOT inside assert(): see InsertForCacheWarmup.
+      LRUHandle* old_entry = table_.Insert(e);
+      assert(old_entry == nullptr);
+      (void)old_entry;
       usage_ += e->total_charge;
       LRU_Insert(e);
       inserted = true;
@@ -1211,7 +1219,12 @@ Status LRUCacheShard::ReplaceForCacheWarmup(
         usage_ -= victim->total_charge;
         evicted.push_back(victim);
 
-        assert(table_.Insert(e) == nullptr);
+        // NOT inside assert(): the insert must execute in NDEBUG builds too.
+        // (2026-09-22: as an assert, Release builds never linked the entry
+        // into the hash table, so every warmed block/reader was unreachable.)
+        LRUHandle* old_entry = table_.Insert(e);
+        assert(old_entry == nullptr);
+        (void)old_entry;
         usage_ += e->total_charge;
         LRU_Insert(e);
         inserted = true;
