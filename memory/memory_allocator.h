@@ -6,33 +6,7 @@
 
 #pragma once
 
+// 2026-09-23 [relink cache handoff]: CustomDeleter, CacheAllocationPtr and
+// AllocateBlock now live in the public header so CacheDumpedLoader can take
+// an owned buffer. This shim keeps the internal include path working.
 #include "rocksdb/memory_allocator.h"
-
-namespace ROCKSDB_NAMESPACE {
-
-struct CustomDeleter {
-  CustomDeleter(MemoryAllocator* a = nullptr) : allocator(a) {}
-
-  void operator()(char* ptr) const {
-    if (allocator) {
-      allocator->Deallocate(reinterpret_cast<void*>(ptr));
-    } else {
-      delete[] ptr;
-    }
-  }
-
-  MemoryAllocator* allocator;
-};
-
-using CacheAllocationPtr = std::unique_ptr<char[], CustomDeleter>;
-
-inline CacheAllocationPtr AllocateBlock(size_t size,
-                                        MemoryAllocator* allocator) {
-  if (allocator) {
-    auto block = reinterpret_cast<char*>(allocator->Allocate(size));
-    return CacheAllocationPtr(block, allocator);
-  }
-  return CacheAllocationPtr(new char[size]);
-}
-
-}  // namespace ROCKSDB_NAMESPACE

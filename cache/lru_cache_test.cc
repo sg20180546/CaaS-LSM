@@ -29,6 +29,7 @@
 #include "util/random.h"
 #include "utilities/cache_dump_load_impl.h"
 #include "utilities/fault_injection_fs.h"
+#include "utilities/memory_allocators.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -3663,6 +3664,226 @@ TEST(CacheWarmupPullTest, CatalogLeasesAndInsertRoundTrip) {
   catalog.reset();  // destructor after Release() must be a no-op
   dumper.reset();
   loader.reset();
+}
+
+// [relink cache handoff, zero-copy landing, 2026-09-23] The owned-buffer
+// admission entry point: on kInserted the cache keeps the caller's buffer
+// (Block::data() is the very pointer handed in, no copy); on kDuplicate,
+// kRejectedNoSpace and on a gate failure the buffer goes back through its
+// allocator exactly once before the call returns; concurrent owned inserts
+// from several threads, each with its own loader and stats, admit every
+// distinct key. A counting allocator plays the role of the pinned arena.
+TEST(CacheWarmupPullTest, OwnedInsertOwnershipAndConcurrency) {
+  Random rnd(302);
+  const size_t kBlockSize = 4096;
+  const std::string kPrefix("\x21\x22\x23\x24\x25\x26\x27\x28", 8);
+  CountedMemoryAllocator alloc;
+
+  // Charge of one test block whose payload came from the counted allocator
+  // (its UsableSize is the allocation size, so every block charges the same).
+  size_t block_charge = 0;
+  {
+    std::string probe = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+    CacheAllocationPtr buf = AllocateBlock(probe.size(), &alloc);
+    memcpy(buf.get(), probe.data(), probe.size());
+    Block block(BlockContents(std::move(buf), probe.size()));
+    block_charge = block.ApproximateMemoryUsage();
+  }
+  ASSERT_GT(block_charge, kBlockSize);
+  ASSERT_EQ(1U, alloc.GetNumAllocations());
+  ASSERT_EQ(1U, alloc.GetNumDeallocations());
+
+  CacheDumpOptions cd_options;
+  cd_options.clock = SystemClock::Default().get();
+  BlockBasedTableOptions toptions;
+  auto make_cache = [&](size_t capacity_blocks, int num_shard_bits) {
+    LRUCacheOptions opts(capacity_blocks * block_charge, num_shard_bits,
+                         false /*strict_capacity_limit*/,
+                         0.5 /*high_pri_pool_ratio*/,
+                         nullptr /*memory_allocator*/, kDefaultToAdaptiveMutex,
+                         kDontChargeCacheMetadata, 0.5 /*low_pri_pool_ratio*/);
+    return NewLRUCache(opts);
+  };
+  auto make_loader = [&](const std::shared_ptr<Cache>& cache) {
+    std::unique_ptr<CacheDumpedLoader> loader;
+    EXPECT_OK(NewDefaultCacheDumpedLoaderToPrimary(cd_options, toptions, cache,
+                                                   nullptr /*reader*/,
+                                                   &loader));
+    return loader;
+  };
+  auto make_owned = [&](const std::string& bytes) {
+    CacheAllocationPtr buf = AllocateBlock(bytes.size(), &alloc);
+    memcpy(buf.get(), bytes.data(), bytes.size());
+    return buf;
+  };
+
+  // kInserted keeps the buffer; kDuplicate and a gate failure release it.
+  {
+    std::shared_ptr<Cache> cache = make_cache(12, 0 /*num_shard_bits*/);
+    ASSERT_NE(nullptr, cache);
+    std::unique_ptr<CacheDumpedLoader> loader = make_loader(cache);
+    ASSERT_NE(nullptr, loader);
+    CacheWarmupTransferStats st;
+    const std::string key = MakeWarmupPullTestKey(kPrefix, 0);
+    const std::string bytes = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+
+    CacheAllocationPtr buf = make_owned(bytes);
+    const char* raw = buf.get();
+    const uint64_t allocs_before = alloc.GetNumAllocations();
+    const uint64_t frees_before = alloc.GetNumDeallocations();
+    ASSERT_OK(loader->InsertWarmupDataBlockOwned(
+        Slice(key), Cache::Priority::HIGH, std::move(buf), bytes.size(), &st));
+    EXPECT_EQ(nullptr, buf.get());
+    EXPECT_EQ(1U, st.entries_received);
+    EXPECT_EQ(1U, st.entries_inserted);
+    EXPECT_EQ(1U, st.high.entries_inserted);
+    EXPECT_EQ(kBlockSize, st.payload_bytes);
+    EXPECT_EQ(allocs_before, alloc.GetNumAllocations());
+    EXPECT_EQ(frees_before, alloc.GetNumDeallocations());
+    {
+      Cache::Handle* h = cache->Lookup(key);
+      ASSERT_NE(nullptr, h);
+      const Block* blk = static_cast<const Block*>(cache->Value(h));
+      ASSERT_EQ(kBlockSize, blk->size());
+      EXPECT_EQ(raw, blk->data());  // zero copy: the very buffer handed in
+      EXPECT_EQ(0, memcmp(blk->data(), bytes.data(), kBlockSize));
+      cache->Release(h);
+    }
+
+    // Same key again with a fresh buffer: duplicate, freed exactly once.
+    buf = make_owned(bytes);
+    ASSERT_OK(loader->InsertWarmupDataBlockOwned(
+        Slice(key), Cache::Priority::HIGH, std::move(buf), bytes.size(), &st));
+    EXPECT_EQ(nullptr, buf.get());
+    EXPECT_EQ(2U, st.entries_received);
+    EXPECT_EQ(1U, st.entries_inserted);
+    EXPECT_EQ(1U, st.entries_duplicate);
+    EXPECT_EQ(1U, st.high.entries_duplicate);
+    EXPECT_EQ(allocs_before + 1, alloc.GetNumAllocations());
+    EXPECT_EQ(frees_before + 1, alloc.GetNumDeallocations());
+
+    // Gate failure (malformed key): refused, counted, freed exactly once.
+    buf = make_owned(bytes);
+    EXPECT_TRUE(loader
+                    ->InsertWarmupDataBlockOwned(Slice("short-key"),
+                                                 Cache::Priority::LOW,
+                                                 std::move(buf), bytes.size(),
+                                                 &st)
+                    .IsCorruption());
+    EXPECT_EQ(nullptr, buf.get());
+    EXPECT_EQ(1U, st.skipped_invalid);
+    EXPECT_EQ(2U, st.entries_received);
+    EXPECT_EQ(allocs_before + 2, alloc.GetNumAllocations());
+    EXPECT_EQ(frees_before + 2, alloc.GetNumDeallocations());
+
+    // The one admitted block goes back through the allocator with the cache.
+    loader.reset();
+    cache.reset();
+    EXPECT_EQ(frees_before + 3, alloc.GetNumDeallocations());
+  }
+
+  // kRejectedNoSpace: a block larger than the whole (single) shard can never
+  // be admitted; the buffer is freed exactly once and nothing is resident.
+  {
+    LRUCacheOptions opts(block_charge / 2, 0 /*num_shard_bits*/,
+                         false /*strict_capacity_limit*/,
+                         0.5 /*high_pri_pool_ratio*/,
+                         nullptr /*memory_allocator*/, kDefaultToAdaptiveMutex,
+                         kDontChargeCacheMetadata, 0.5 /*low_pri_pool_ratio*/);
+    std::shared_ptr<Cache> cache = NewLRUCache(opts);
+    ASSERT_NE(nullptr, cache);
+    std::unique_ptr<CacheDumpedLoader> loader = make_loader(cache);
+    ASSERT_NE(nullptr, loader);
+    CacheWarmupTransferStats st;
+    const std::string key = MakeWarmupPullTestKey(kPrefix, 1);
+    const std::string bytes = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+    CacheAllocationPtr buf = make_owned(bytes);
+    const uint64_t frees_before = alloc.GetNumDeallocations();
+    ASSERT_OK(loader->InsertWarmupDataBlockOwned(
+        Slice(key), Cache::Priority::HIGH, std::move(buf), bytes.size(), &st));
+    EXPECT_EQ(nullptr, buf.get());
+    EXPECT_EQ(1U, st.entries_received);
+    EXPECT_EQ(0U, st.entries_inserted);
+    EXPECT_EQ(1U, st.entries_rejected_no_space);
+    EXPECT_EQ(1U, st.high.entries_rejected_no_space);
+    EXPECT_EQ(frees_before + 1, alloc.GetNumDeallocations());
+    EXPECT_EQ(nullptr, cache->Lookup(key));
+  }
+
+  // Concurrency: 4 threads, each with its own loader and stats, 64 distinct
+  // keys each, all owned inserts at once. 16 shards with 8x headroom (HIGH
+  // entries cannot evict each other, so no shard may fill).
+  {
+    const int kThreads = 4;
+    const size_t kPerThread = 64;
+    const size_t kTotal = kThreads * kPerThread;
+    std::shared_ptr<Cache> cache = make_cache(kTotal * 8, 4 /*num_shard_bits*/);
+    ASSERT_NE(nullptr, cache);
+    std::vector<std::string> keys(kTotal);
+    std::vector<std::string> bytes(kTotal);
+    std::vector<CacheAllocationPtr> bufs(kTotal);
+    const uint64_t allocs_before = alloc.GetNumAllocations();
+    const uint64_t frees_before = alloc.GetNumDeallocations();
+    for (size_t n = 0; n < kTotal; ++n) {
+      keys[n] = MakeWarmupPullTestKey(kPrefix, 1000 + n);
+      bytes[n] = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+      bufs[n] = make_owned(bytes[n]);  // Random is not thread-safe: fill here
+    }
+    EXPECT_EQ(allocs_before + kTotal, alloc.GetNumAllocations());
+    std::vector<std::unique_ptr<CacheDumpedLoader>> loaders(kThreads);
+    std::vector<CacheWarmupTransferStats> stats(kThreads);
+    std::vector<int> failures(kThreads, 0);
+    for (int t = 0; t < kThreads; ++t) {
+      loaders[t] = make_loader(cache);
+      ASSERT_NE(nullptr, loaders[t]);
+    }
+    std::vector<port::Thread> threads;
+    for (int t = 0; t < kThreads; ++t) {
+      threads.emplace_back([&, t]() {
+        for (size_t i = 0; i < kPerThread; ++i) {
+          const size_t n = static_cast<size_t>(t) * kPerThread + i;
+          IOStatus s = loaders[t]->InsertWarmupDataBlockOwned(
+              Slice(keys[n]), Cache::Priority::HIGH, std::move(bufs[n]),
+              kBlockSize, &stats[t]);
+          if (!s.ok()) {
+            ++failures[t];
+          }
+        }
+      });
+    }
+    for (auto& th : threads) {
+      th.join();
+    }
+    uint64_t received = 0, inserted = 0, duplicate = 0, rejected = 0;
+    for (int t = 0; t < kThreads; ++t) {
+      EXPECT_EQ(0, failures[t]) << "thread " << t;
+      received += stats[t].entries_received;
+      inserted += stats[t].entries_inserted;
+      duplicate += stats[t].entries_duplicate;
+      rejected += stats[t].entries_rejected_no_space;
+    }
+    EXPECT_EQ(kTotal, received);
+    EXPECT_EQ(kTotal, inserted);
+    EXPECT_EQ(0U, duplicate);
+    EXPECT_EQ(0U, rejected);
+    EXPECT_EQ(allocs_before + kTotal, alloc.GetNumAllocations());
+    EXPECT_EQ(frees_before, alloc.GetNumDeallocations());  // all kept
+    for (size_t n = 0; n < kTotal; ++n) {
+      Cache::Handle* h = cache->Lookup(keys[n]);
+      ASSERT_NE(nullptr, h) << "block " << n << " not admitted";
+      const Block* blk = static_cast<const Block*>(cache->Value(h));
+      ASSERT_EQ(kBlockSize, blk->size());
+      EXPECT_EQ(0, memcmp(blk->data(), bytes[n].data(), kBlockSize));
+      cache->Release(h);
+    }
+    for (auto& l : loaders) {
+      l.reset();
+    }
+    cache.reset();
+  }
+
+  // Every buffer ever handed out came back through the allocator exactly once.
+  EXPECT_EQ(alloc.GetNumAllocations(), alloc.GetNumDeallocations());
 }
 
 // Test the option not to use the secondary cache in a certain DB.

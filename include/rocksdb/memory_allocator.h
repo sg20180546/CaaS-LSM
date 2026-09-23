@@ -39,6 +39,35 @@ class MemoryAllocator : public Customizable {
   std::string GetId() const override { return GenerateIndividualId(); }
 };
 
+// 2026-09-23 [relink cache handoff]: CustomDeleter / CacheAllocationPtr /
+// AllocateBlock moved here verbatim from the internal memory/memory_allocator.h
+// (which now includes this header) so that CacheDumpedLoader's owned-buffer
+// entry points can be spelled in the public API. Inline only; ABI-neutral.
+struct CustomDeleter {
+  CustomDeleter(MemoryAllocator* a = nullptr) : allocator(a) {}
+
+  void operator()(char* ptr) const {
+    if (allocator) {
+      allocator->Deallocate(reinterpret_cast<void*>(ptr));
+    } else {
+      delete[] ptr;
+    }
+  }
+
+  MemoryAllocator* allocator;
+};
+
+using CacheAllocationPtr = std::unique_ptr<char[], CustomDeleter>;
+
+inline CacheAllocationPtr AllocateBlock(size_t size,
+                                        MemoryAllocator* allocator) {
+  if (allocator) {
+    auto block = reinterpret_cast<char*>(allocator->Allocate(size));
+    return CacheAllocationPtr(block, allocator);
+  }
+  return CacheAllocationPtr(new char[size]);
+}
+
 struct JemallocAllocatorOptions {
   static const char* kName() { return "JemallocAllocatorOptions"; }
   // Jemalloc tcache cache allocations by size class. For each size class,

@@ -306,16 +306,48 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   IOStatus InsertWarmupDataBlock(const Slice& key, Cache::Priority priority,
                                  const char* data, size_t size,
                                  CacheWarmupTransferStats* stats) override;
+  // 2026-09-23: owned-buffer variant (no copy); see the public header.
+  IOStatus InsertWarmupDataBlockOwned(const Slice& key,
+                                      Cache::Priority priority,
+                                      CacheAllocationPtr&& buf, size_t size,
+                                      CacheWarmupTransferStats* stats) override;
+  // 2026-09-23: streamed-path sink; see the public header.
+  void SetWarmupUnitSink(WarmupUnitSink sink,
+                         MemoryAllocator* allocator) override {
+    unit_sink_ = std::move(sink);
+    sink_allocator_ = allocator;
+  }
   const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const override {
     return warmup_stats_;
   }
 
  private:
-  // The one admission unit both transports share (streamed restore and the
-  // pull receiver). Validates key size and the per-entry / aggregate limits
-  // of `warmup_options` against the cumulative counters in *stats, copies
-  // the payload into cache-owned memory, builds the Block and admits it with
-  // InsertForCacheWarmup. All counters are updated in *stats.
+  // The one admission unit both transports share (streamed restore, the
+  // pull receiver and the owned-buffer entry point) is split in two so the
+  // streamed sink path can gate before it allocates (2026-09-23):
+  //
+  // CheckWarmupUnitLimits: cache / helper presence, key size, per-entry and
+  // aggregate limits of `warmup_options` (the aggregate caps compare against
+  // the explicit `received_so_far` / `bytes_so_far`, which the inline callers
+  // pass from *stats and the sink path from reader-local counters), null
+  // payload. Bumps skipped_invalid / skipped_too_large in *stats on failure.
+  // Order of checks is the original streamed order.
+  IOStatus CheckWarmupUnitLimits(const Slice& key, size_t size,
+                                 bool has_payload,
+                                 const CacheWarmupOptions& warmup_options,
+                                 uint64_t received_so_far,
+                                 uint64_t bytes_so_far,
+                                 CacheWarmupTransferStats* stats);
+  // AdmitWarmupBlock: counts the unit as received, wraps the caller-owned
+  // buffer in a Block (no copy) and admits it with InsertForCacheWarmup. The
+  // buffer is owned by the cache on kInserted and released through its
+  // deleter before return on every other outcome. Thread-safe with a
+  // per-thread *stats (touches only primary_cache_ and toptions_ otherwise).
+  IOStatus AdmitWarmupBlock(const Slice& key, Cache::Priority priority,
+                            CacheAllocationPtr&& buf, size_t size,
+                            CacheWarmupTransferStats* stats);
+  // Check + AllocateBlock(size, nullptr) + memcpy + Admit: the historical
+  // inline unit, behaviour unchanged.
   IOStatus InsertWarmupDataBlockWithLimits(
       const Slice& key, Cache::Priority priority, const char* data,
       size_t size, const CacheWarmupOptions& warmup_options,
@@ -336,6 +368,9 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   std::unique_ptr<CacheDumpReader> reader_;
   UnorderedMap<Cache::DeleterFn, CacheEntryRole> role_map_;
   CacheWarmupTransferStats warmup_stats_;
+  // 2026-09-23: streamed-path sink (null = admit inline, historical path).
+  WarmupUnitSink unit_sink_;
+  MemoryAllocator* sink_allocator_ = nullptr;
 };
 
 // The default implementation of CacheDumpWriter. We write the blocks to a file

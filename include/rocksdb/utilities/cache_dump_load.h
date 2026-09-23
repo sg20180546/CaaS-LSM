@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <set>
@@ -18,6 +19,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
+#include "rocksdb/memory_allocator.h"
 #include "rocksdb/secondary_cache.h"
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
@@ -324,6 +326,17 @@ class CacheDumpedLoader {
   // is implemented on top of this same function so both transports admit
   // identically. A non-OK return means the unit was invalid (skipped_invalid
   // / skipped_too_large already bumped); the caller decides whether to go on.
+  //
+  // Thread safety (2026-09-23, both InsertWarmupDataBlock entry points): the
+  // admission routine behind them touches only the primary cache (whose
+  // InsertForCacheWarmup takes the per-shard mutex), the const table options,
+  // a function-local static cache helper, and *stats. It is therefore safe to
+  // call concurrently from several threads PROVIDED each thread passes its own
+  // non-null `stats`; the recommended shape is one loader instance per thread
+  // (NewDefaultCacheDumpedLoaderToPrimary is one small heap allocation) with
+  // its own CacheWarmupTransferStats. A null `stats` falls back to the
+  // loader's own counters, which is the one case that must NOT be shared
+  // across threads.
   virtual IOStatus InsertWarmupDataBlock(const Slice& key,
                                          Cache::Priority priority,
                                          const char* data, size_t size,
@@ -334,6 +347,52 @@ class CacheDumpedLoader {
     (void)size;
     (void)stats;
     return IOStatus::NotSupported("InsertWarmupDataBlock is not supported");
+  }
+  // [relink cache handoff, zero-copy landing, 2026-09-23] Same checks,
+  // counters and admission outcome as InsertWarmupDataBlock, but the caller
+  // supplies the already-filled buffer (e.g. an arena slot an RDMA READ or
+  // WRITE landed in) and no copy is made. On kInserted the cache owns `buf`.
+  // On kDuplicate / kRejectedNoSpace / skipped_unsupported / any non-OK
+  // return, `buf` has been released through its deleter (the allocator it
+  // came from) exactly once BEFORE this returns; the caller's CacheAllocationPtr
+  // is null afterwards in every case. Thread safety: as InsertWarmupDataBlock.
+  virtual IOStatus InsertWarmupDataBlockOwned(const Slice& key,
+                                              Cache::Priority priority,
+                                              CacheAllocationPtr&& buf,
+                                              size_t size,
+                                              CacheWarmupTransferStats* stats) {
+    (void)key;
+    (void)priority;
+    (void)size;
+    (void)stats;
+    buf.reset();  // honour the release-before-return contract
+    return IOStatus::NotSupported(
+        "InsertWarmupDataBlockOwned is not supported");
+  }
+  // [relink cache handoff, 2026-09-23] Optional hook on the streamed restore
+  // (RestoreWarmupCacheEntriesToPrimaryCache). When a sink is set, each data
+  // unit read from the reader is validated against the per-unit and aggregate
+  // limits in the same order as the inline path (key size, max_entry_bytes,
+  // max_entries, max_total_bytes, null payload), then its payload is copied
+  // into a buffer from AllocateBlock(size, allocator) (allocator may be null
+  // = new char[]) and handed to the sink INSTEAD of being admitted inline.
+  // The sink owns the buffer and normally admits it later, from any thread,
+  // via InsertWarmupDataBlockOwned on its own loader; a non-OK sink return
+  // ends the stream with that status.
+  // Accounting in sink mode: the stats returned by the streamed call carry
+  // only the reader-side gate outcomes (skipped_invalid / skipped_too_large;
+  // the aggregate caps are enforced on reader-local counters), NOT
+  // entries_received / inserted / duplicate / rejected_no_space /
+  // payload_bytes — those are produced by whoever performs the owned inserts,
+  // so a caller adds loader stats + inserter stats without double counting.
+  // No sink set: byte-identical to the historical inline behaviour.
+  using WarmupUnitSink = std::function<IOStatus(
+      const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+      size_t size)>;
+  virtual void SetWarmupUnitSink(WarmupUnitSink sink,
+                                 MemoryAllocator* allocator) {
+    (void)sink;
+    (void)allocator;
   }
   virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
     static const CacheWarmupTransferStats kEmptyStats;

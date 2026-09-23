@@ -1084,6 +1084,12 @@ IOStatus CacheDumpedLoaderImpl::RestoreWarmupCacheEntriesToPrimaryCache(
     return finish(IOStatus::NotSupported("data block cache helper is null"));
   }
 
+  // Sink mode (2026-09-23): the aggregate caps are enforced on these
+  // reader-local counters because entries_received / payload_bytes are then
+  // produced by whoever runs the owned inserts, not by this loader.
+  uint64_t gate_received = 0;
+  uint64_t gate_bytes = 0;
+
   while (true) {
     if (deadline.Expired()) {
       return finish(IOStatus::TimedOut("cache warmup restore deadline"));
@@ -1102,6 +1108,32 @@ IOStatus CacheDumpedLoaderImpl::RestoreWarmupCacheEntriesToPrimaryCache(
       return finish(
           IOStatus::Corruption("non-data unit in cache warmup stream"));
     }
+    if (unit_sink_) {
+      // Same gate, same order, then copy out of the per-iteration `data`
+      // string (unit.value points into it) into a buffer the sink owns.
+      io_s = CheckWarmupUnitLimits(unit.key, unit.value_len,
+                                   unit.value != nullptr, warmup_options,
+                                   gate_received, gate_bytes, &warmup_stats_);
+      if (!io_s.ok()) {
+        return finish(io_s);
+      }
+      ++gate_received;
+      gate_bytes += unit.value_len;
+      CacheAllocationPtr buf = AllocateBlock(unit.value_len, sink_allocator_);
+      if (unit.value_len != 0) {
+        if (buf == nullptr) {
+          return finish(IOStatus::IOError(
+              "cache warmup sink allocator returned null"));
+        }
+        std::memcpy(buf.get(), unit.value, unit.value_len);
+      }
+      io_s = unit_sink_(unit.key, unit.priority, std::move(buf),
+                        unit.value_len);
+      if (!io_s.ok()) {
+        return finish(io_s);
+      }
+      continue;
+    }
     // One admission unit, shared with the pull receiver. A non-OK status is a
     // stream error here (the framed stream is trusted to be well-formed once
     // its CRC passed), exactly as before the factoring.
@@ -1114,21 +1146,23 @@ IOStatus CacheDumpedLoaderImpl::RestoreWarmupCacheEntriesToPrimaryCache(
   }
 }
 
-// The single admission unit behind both transports. The order of the checks
-// and of the counter updates is the streamed path's original order, so a
-// block admitted over RDMA is accounted and admitted exactly like the same
-// block admitted from the TCP stream.
-IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockWithLimits(
-    const Slice& key, Cache::Priority priority, const char* data, size_t size,
-    const CacheWarmupOptions& warmup_options,
-    CacheWarmupTransferStats* stats) {
+// The single admission unit behind every transport, split (2026-09-23) into
+// the gate (CheckWarmupUnitLimits) and the admission (AdmitWarmupBlock) so
+// the streamed sink path can gate before it allocates and the owned-buffer
+// entry point can admit without a copy. The order of the checks and of the
+// counter updates is the streamed path's original order, so a block admitted
+// over RDMA is accounted and admitted exactly like the same block admitted
+// from the TCP stream.
+IOStatus CacheDumpedLoaderImpl::CheckWarmupUnitLimits(
+    const Slice& key, size_t size, bool has_payload,
+    const CacheWarmupOptions& warmup_options, uint64_t received_so_far,
+    uint64_t bytes_so_far, CacheWarmupTransferStats* stats) {
   assert(stats != nullptr);
   if (primary_cache_ == nullptr) {
     return IOStatus::InvalidArgument("Primary cache is null");
   }
-  Cache::CacheItemHelper* helper =
-      BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData);
-  if (helper == nullptr) {
+  if (BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData) ==
+      nullptr) {
     return IOStatus::NotSupported("data block cache helper is null");
   }
   if (key.size() != kCacheKeySize) {
@@ -1141,23 +1175,37 @@ IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockWithLimits(
     return IOStatus::Corruption(
         "cache warmup data unit exceeds destination entry limit");
   }
-  if (stats->entries_received >= warmup_options.max_entries) {
+  if (received_so_far >= warmup_options.max_entries) {
     ++stats->skipped_too_large;
     return IOStatus::Corruption(
         "cache warmup stream exceeds destination entry-count limit");
   }
-  if (stats->payload_bytes > warmup_options.max_total_bytes ||
+  if (bytes_so_far > warmup_options.max_total_bytes ||
       size > warmup_options.max_total_bytes -
-                 static_cast<size_t>(stats->payload_bytes)) {
+                 static_cast<size_t>(bytes_so_far)) {
     ++stats->skipped_too_large;
     return IOStatus::Corruption(
         "cache warmup stream exceeds destination aggregate byte limit");
   }
-  if (size != 0 && data == nullptr) {
+  if (size != 0 && !has_payload) {
     ++stats->skipped_invalid;
     return IOStatus::Corruption("cache warmup data unit has null payload");
   }
+  return IOStatus::OK();
+}
 
+// Thread-safe with a per-thread *stats: touches only primary_cache_ (the
+// shard mutex is inside InsertForCacheWarmup), the const toptions_, and a
+// function-local static helper. `buf` is moved into the Block; on any
+// outcome but kInserted the Block (and with it the buffer, through its
+// deleter) is destroyed by block_holder before this returns.
+IOStatus CacheDumpedLoaderImpl::AdmitWarmupBlock(
+    const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+    size_t size, CacheWarmupTransferStats* stats) {
+  assert(stats != nullptr);
+  Cache::CacheItemHelper* helper =
+      BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData);
+  assert(helper != nullptr);  // CheckWarmupUnitLimits ran first
   CacheWarmupPriorityTransferStats* priority_stats =
       CacheWarmupStatsForPriority(stats, priority);
   ++stats->entries_received;
@@ -1165,10 +1213,6 @@ IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockWithLimits(
   stats->payload_bytes += size;
   priority_stats->payload_bytes += size;
 
-  CacheAllocationPtr buf = AllocateBlock(size, nullptr);
-  if (size != 0) {
-    std::memcpy(buf.get(), data, size);
-  }
   BlockContents contents(std::move(buf), size);
   std::unique_ptr<Block> block_holder;
   block_holder.reset(BlocklikeTraits<Block>::Create(
@@ -1210,6 +1254,27 @@ IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockWithLimits(
   return IOStatus::OK();
 }
 
+// The historical inline unit: gate, copy into fresh cache-owned memory,
+// admit. Unchanged behaviour (the received/payload counters are now bumped
+// after the allocation instead of before it; unobservable).
+IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockWithLimits(
+    const Slice& key, Cache::Priority priority, const char* data, size_t size,
+    const CacheWarmupOptions& warmup_options,
+    CacheWarmupTransferStats* stats) {
+  assert(stats != nullptr);
+  IOStatus io_s = CheckWarmupUnitLimits(
+      key, size, data != nullptr, warmup_options, stats->entries_received,
+      stats->payload_bytes, stats);
+  if (!io_s.ok()) {
+    return io_s;
+  }
+  CacheAllocationPtr buf = AllocateBlock(size, nullptr);
+  if (size != 0) {
+    std::memcpy(buf.get(), data, size);
+  }
+  return AdmitWarmupBlock(key, priority, std::move(buf), size, stats);
+}
+
 // [relink cache handoff, RDMA pull] Destination half of the pull transport:
 // the receiver hands over each payload it RDMA-READ into its pinned pool and
 // this admits it through the very same unit the streamed path uses. Default
@@ -1222,6 +1287,25 @@ IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlock(
   return InsertWarmupDataBlockWithLimits(
       key, priority, data, size, CacheWarmupOptions{},
       stats != nullptr ? stats : &warmup_stats_);
+}
+
+// [relink cache handoff, zero-copy landing, 2026-09-23] Same gate and
+// admission as InsertWarmupDataBlock, but the buffer is the caller's (an
+// arena slot the RDMA bytes landed in) and is never copied. The gate runs
+// before ownership moves; on a gate failure the buffer is released here so
+// the caller's pointer is null on every return, as the header promises.
+IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockOwned(
+    const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+    size_t size, CacheWarmupTransferStats* stats) {
+  CacheWarmupTransferStats* s = stats != nullptr ? stats : &warmup_stats_;
+  IOStatus io_s = CheckWarmupUnitLimits(
+      key, size, buf != nullptr, CacheWarmupOptions{}, s->entries_received,
+      s->payload_bytes, s);
+  if (!io_s.ok()) {
+    buf.reset();
+    return io_s;
+  }
+  return AdmitWarmupBlock(key, priority, std::move(buf), size, s);
 }
 
 // Read and copy the dump unit metadata to std::string data, decode and create
