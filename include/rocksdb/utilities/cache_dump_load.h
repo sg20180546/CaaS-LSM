@@ -9,7 +9,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "rocksdb/cache.h"
 #include "rocksdb/env.h"
@@ -142,6 +145,39 @@ struct CacheWarmupTransferStats {
 // warmup vertical-slice drop.
 using CacheWarmupStats = CacheWarmupTransferStats;
 
+// [relink cache handoff, RDMA pull] One resident data block exposed for a
+// destination-driven, one-sided pull. The streamed (TCP push) transport costs
+// the SOURCE ~15 us of CPU per 4 KiB block (lookup + lease + copy + CRC + send)
+// and tops out at 200-270 MB/s on a 100 GbE link, while the source is the
+// node that is already overloaded. With a pull transport the source only
+// catalogs {key, priority, payload address, length} and keeps a no-touch
+// lease on each block until the destination has read the payload straight
+// out of this process's heap (RDMA READ against an implicit-ODP region). No
+// per-block copy, CRC or socket send happens on the source.
+struct CacheWarmupPulledBlock {
+  std::string key;          // exactly kCacheKeySize (16) bytes
+  Cache::Priority priority;  // effective LRU class at catalog time
+  const void* data;          // Block::data() of the cached value, valid
+                             // while the lease is held by the catalog
+  size_t size;               // Block::size(); what the dump path would write
+};
+
+// Owns the warmup leases taken by CacheDumper::CatalogWarmupDataBlocksForPull.
+// Every block in blocks() stays resident (eviction skips a leased entry) and
+// its `data` pointer stays valid until Release() runs. Release() is
+// idempotent and the destructor calls it. The caller must Release() (or
+// destroy the catalog) BEFORE closing the DB / dropping the last reference to
+// the block cache: the implementation keeps the cache alive via shared_ptr,
+// but a leased Block pinned across DB close would keep that memory resident
+// and the LRU shard would report the pins as leaked handles.
+class CacheWarmupPullCatalog {
+ public:
+  virtual ~CacheWarmupPullCatalog() = default;
+  virtual const std::vector<CacheWarmupPulledBlock>& blocks() const = 0;
+  virtual size_t payload_bytes() const = 0;
+  virtual void Release() = 0;
+};
+
 // NOTE that: this class is EXPERIMENTAL! May be changed in the future!
 // This the class to dump out the block in the block cache, store/transfer them
 // via CacheDumpWriter. In order to dump out the blocks belonging to a certain
@@ -210,6 +246,30 @@ class CacheDumper {
     return IOStatus::NotSupported(
         "DumpWarmupCacheEntriesToWriter is not supported");
   }
+  // [relink cache handoff, RDMA pull] Same selection as
+  // DumpWarmupCacheEntriesToWriter (prefix filter from SetDumpFilterPrefixes,
+  // kDataBlock entries only, HIGH -> LOW -> BOTTOM order, options.max_entries
+  // / max_total_bytes / max_entry_bytes honoured, identical skipped_* and
+  // per-class accounting), but instead of copying and writing each block it
+  // takes ONE no-touch lease per block and records {key, priority,
+  // Block::data(), Block::size()} in *catalog. The leases live until
+  // catalog->Release(). No I/O, no copy, no cache-key re-derivation. A block
+  // whose lease fails or whose effective class/charge/type changed since the
+  // catalog pass is skipped exactly as the dump path skips it. stats->
+  // entries_staged counts leased blocks; entries_written stays 0 because
+  // nothing is written here (the transport reports what was pulled).
+  virtual Status CatalogWarmupDataBlocksForPull(
+      const CacheWarmupOptions& options,
+      std::unique_ptr<CacheWarmupPullCatalog>* catalog,
+      CacheWarmupTransferStats* stats) {
+    (void)options;
+    (void)stats;
+    if (catalog != nullptr) {
+      catalog->reset();
+    }
+    return Status::NotSupported(
+        "CatalogWarmupDataBlocksForPull is not supported");
+  }
   virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
     static const CacheWarmupTransferStats kEmptyStats;
     return kEmptyStats;
@@ -251,6 +311,29 @@ class CacheDumpedLoader {
       CacheWarmupTransferStats* warmup_stats = nullptr) {
     return RestoreWarmupCacheEntriesToPrimaryCache(CacheWarmupOptions{},
                                                    warmup_stats);
+  }
+  // [relink cache handoff, RDMA pull] Exactly one unit of
+  // RestoreWarmupCacheEntriesToPrimaryCache, for a payload that arrived by
+  // some transport other than the framed stream (e.g. an RDMA READ into a
+  // pinned receive buffer): validate the 16-byte key and the default
+  // CacheWarmupOptions size limits, copy `size` bytes from `data` into a
+  // fresh CacheAllocationPtr, build the Block, and admit it with the
+  // priority-aware InsertForCacheWarmup. Counts entries_received / inserted /
+  // duplicate / rejected_no_space / payload_bytes per class in *stats (or in
+  // the loader's own stats when null) exactly like the streamed path, which
+  // is implemented on top of this same function so both transports admit
+  // identically. A non-OK return means the unit was invalid (skipped_invalid
+  // / skipped_too_large already bumped); the caller decides whether to go on.
+  virtual IOStatus InsertWarmupDataBlock(const Slice& key,
+                                         Cache::Priority priority,
+                                         const char* data, size_t size,
+                                         CacheWarmupTransferStats* stats) {
+    (void)key;
+    (void)priority;
+    (void)data;
+    (void)size;
+    (void)stats;
+    return IOStatus::NotSupported("InsertWarmupDataBlock is not supported");
   }
   virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
     static const CacheWarmupTransferStats kEmptyStats;

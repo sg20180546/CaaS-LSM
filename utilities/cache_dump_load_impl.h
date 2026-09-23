@@ -6,6 +6,9 @@
 #pragma once
 #ifndef ROCKSDB_LITE
 
+#include <array>
+#include <chrono>
+#include <memory>
 #include <unordered_map>
 #include <vector>
 
@@ -115,6 +118,79 @@ struct CacheWarmupDumpUnit {
   void* value = nullptr;
 };
 
+// Monotonic per-call deadline shared by the warmup dump, the pull catalog
+// and the streamed restore. Zero duration means "never expires".
+class WarmupCallDeadline {
+ public:
+  explicit WarmupCallDeadline(uint64_t duration_micros)
+      : duration_micros_(duration_micros),
+        start_(std::chrono::steady_clock::now()) {}
+
+  bool Expired() const {
+    if (duration_micros_ == 0) {
+      return false;
+    }
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - start_)
+                             .count();
+    return elapsed >= 0 && static_cast<uint64_t>(elapsed) >= duration_micros_;
+  }
+
+ private:
+  uint64_t duration_micros_;
+  std::chrono::steady_clock::time_point start_;
+};
+
+// One data-block entry recorded by the warmup catalog pass (under the shard
+// lock, metadata only). The charge and effective priority are re-checked
+// after the per-block lease so a concurrently replaced or re-classed entry is
+// skipped rather than mislabeled.
+struct CacheWarmupCandidate {
+  std::array<char, kCacheKeySize> key;
+  size_t charge;
+  Cache::Priority priority;
+};
+
+// [relink cache handoff, RDMA pull] Lease holder returned by
+// CacheDumperImpl::CatalogWarmupDataBlocksForPull. It keeps the Cache alive
+// (shared_ptr) so Release() can always reach the shard that owns each handle,
+// and releases every lease with ReleaseForCacheWarmup(handle,
+// effective_priority) - the same no-touch release the dump path uses - so a
+// pulled block keeps its exact recency and class on the source. Caller
+// contract: Release() (or destroy) before closing the DB; see the public
+// header.
+class CacheWarmupPullCatalogImpl : public CacheWarmupPullCatalog {
+ public:
+  explicit CacheWarmupPullCatalogImpl(const std::shared_ptr<Cache>& cache)
+      : cache_(cache) {}
+  ~CacheWarmupPullCatalogImpl() override { Release(); }
+
+  CacheWarmupPullCatalogImpl(const CacheWarmupPullCatalogImpl&) = delete;
+  CacheWarmupPullCatalogImpl& operator=(const CacheWarmupPullCatalogImpl&) =
+      delete;
+
+  const std::vector<CacheWarmupPulledBlock>& blocks() const override {
+    return blocks_;
+  }
+  size_t payload_bytes() const override { return payload_bytes_; }
+  void Release() override;
+
+  // Takes ownership of one already-held lease. `data`/`size` are the leased
+  // Block's data()/size().
+  void Add(Cache::Handle* handle, Cache::Priority effective_priority,
+           const Slice& key, const char* data, size_t size);
+
+ private:
+  struct Lease {
+    Cache::Handle* handle;
+    Cache::Priority priority;
+  };
+  std::shared_ptr<Cache> cache_;
+  std::vector<CacheWarmupPulledBlock> blocks_;
+  std::vector<Lease> leases_;  // parallel to blocks_
+  size_t payload_bytes_ = 0;
+};
+
 // The default implementation of the Cache Dumper
 class CacheDumperImpl : public CacheDumper {
  public:
@@ -134,11 +210,38 @@ class CacheDumperImpl : public CacheDumper {
   IOStatus DumpWarmupCacheEntriesToWriter(
       const CacheWarmupOptions& warmup_options,
       CacheWarmupTransferStats* warmup_stats) override;
+  Status CatalogWarmupDataBlocksForPull(
+      const CacheWarmupOptions& warmup_options,
+      std::unique_ptr<CacheWarmupPullCatalog>* catalog,
+      CacheWarmupTransferStats* warmup_stats) override;
   const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const override {
     return warmup_stats_;
   }
 
  private:
+  // Shared first phase of DumpWarmupCacheEntriesToWriter and
+  // CatalogWarmupDataBlocksForPull: validate the options, then walk the cache
+  // under at most one shard lock at a time and bucket matching data-block
+  // candidates by effective class. Fills the cataloged_entries /
+  // data_candidates / skipped_unsupported counters of warmup_stats_.
+  IOStatus ValidateWarmupOptions(const CacheWarmupOptions& warmup_options);
+  IOStatus CatalogWarmupCandidates(
+      const WarmupCallDeadline& deadline,
+      std::vector<CacheWarmupCandidate>* high_candidates,
+      std::vector<CacheWarmupCandidate>* low_candidates,
+      std::vector<CacheWarmupCandidate>* bottom_candidates);
+  // Shared second phase, one candidate at a time: take the no-touch lease,
+  // re-check priority/charge/role/value against the catalog, apply the
+  // per-entry and aggregate byte limits. On success *handle is the held lease
+  // (caller releases it) and *data/*size are Block::data()/size(). On a skip
+  // *handle is nullptr, the lease (if any) has already been released and the
+  // matching skipped_* / priority_changed_after_catalog counter was bumped.
+  // Non-OK only for a cache-level failure.
+  IOStatus LeaseWarmupDataBlock(const CacheWarmupCandidate& candidate,
+                                const CacheWarmupOptions& warmup_options,
+                                Cache::Handle** handle,
+                                Cache::Priority* effective_priority,
+                                const char** data, size_t* size);
   IOStatus WriteBlock(CacheDumpUnitType type, const Slice& key,
                       const Slice& value);
   IOStatus WriteHeader();
@@ -197,11 +300,26 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   IOStatus RestoreWarmupCacheEntriesToPrimaryCache(
       const CacheWarmupOptions& warmup_options,
       CacheWarmupTransferStats* warmup_stats) override;
+  // Public per-unit admission with the default CacheWarmupOptions limits.
+  // A null `stats` accumulates into the loader's own warmup_stats_ (never
+  // reset here, unlike the streamed call).
+  IOStatus InsertWarmupDataBlock(const Slice& key, Cache::Priority priority,
+                                 const char* data, size_t size,
+                                 CacheWarmupTransferStats* stats) override;
   const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const override {
     return warmup_stats_;
   }
 
  private:
+  // The one admission unit both transports share (streamed restore and the
+  // pull receiver). Validates key size and the per-entry / aggregate limits
+  // of `warmup_options` against the cumulative counters in *stats, copies
+  // the payload into cache-owned memory, builds the Block and admits it with
+  // InsertForCacheWarmup. All counters are updated in *stats.
+  IOStatus InsertWarmupDataBlockWithLimits(
+      const Slice& key, Cache::Priority priority, const char* data,
+      size_t size, const CacheWarmupOptions& warmup_options,
+      CacheWarmupTransferStats* stats);
   IOStatus ReadDumpUnitMeta(std::string* data, DumpUnitMeta* unit_meta);
   IOStatus ReadDumpUnit(size_t len, std::string* data, DumpUnit* unit);
   IOStatus ReadHeader(std::string* data, DumpUnit* dump_unit);

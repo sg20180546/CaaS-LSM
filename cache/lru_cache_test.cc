@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <map>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -3393,6 +3394,275 @@ TEST_F(DBSecondaryCacheTest, LRUCacheDumpLoadWithFilter) {
   delete db2;
   ASSERT_OK(DestroyDB(dbname1, options));
   ASSERT_OK(DestroyDB(dbname2, options));
+}
+
+// [relink cache handoff, RDMA pull] Engine-side contract of the pull
+// transport, without any DB, network or cluster: the catalog leases the
+// selected data blocks in place (no copy), the leases survive eviction
+// pressure, Release() makes the blocks evictable again, and the per-unit
+// loader entry point admits a block straight from a catalog pointer into a
+// second cache with duplicate detection.
+namespace {
+
+// A minimal well-formed kDataBlockBinarySearch block: `size - 8` random
+// payload bytes, one restart offset (0) and num_restarts = 1, so Block's
+// constructor accepts it and reports size() == size.
+std::string MakeWarmupPullTestBlock(Random* rnd, size_t size) {
+  std::string block =
+      rnd->RandomString(static_cast<int>(size - 2 * sizeof(uint32_t)));
+  PutFixed32(&block, 0);  // restart[0]
+  PutFixed32(&block, 1);  // num_restarts
+  return block;
+}
+
+// 16-byte cache key = stable 8-byte prefix + 8-byte offset, the shape the
+// warmup prefix filter expects.
+std::string MakeWarmupPullTestKey(const std::string& prefix8,
+                                  uint64_t offset) {
+  std::string key = prefix8;
+  PutFixed64(&key, offset);
+  EXPECT_EQ(static_cast<size_t>(kCacheKeySize), key.size());
+  return key;
+}
+
+// Inserts a Block with the real kData/kIndex helper deleter (so the dumper's
+// role map classifies it) and returns the live Block::data() pointer the
+// cache now owns, i.e. the address an RDMA READ would target.
+const char* InsertWarmupPullTestBlock(Cache* cache, const std::string& key,
+                                      const std::string& bytes,
+                                      Cache::Priority priority,
+                                      BlockType block_type) {
+  CacheAllocationPtr buf = AllocateBlock(bytes.size(), nullptr);
+  memcpy(buf.get(), bytes.data(), bytes.size());
+  BlockContents contents(std::move(buf), bytes.size());
+  std::unique_ptr<Block> block(new Block(std::move(contents)));
+  EXPECT_EQ(bytes.size(), block->size());
+  Cache::CacheItemHelper* helper =
+      BlocklikeTraits<Block>::GetCacheItemHelper(block_type);
+  EXPECT_NE(nullptr, helper);
+  const char* data = block->data();
+  EXPECT_OK(cache->Insert(key, block.get(), block->ApproximateMemoryUsage(),
+                          helper->del_cb, nullptr /*handle*/, priority));
+  block.release();  // owned by the cache now
+  return data;
+}
+
+// No-touch enumeration of resident keys (does not record hits or promote).
+std::set<std::string> ResidentWarmupPullTestKeys(Cache* cache) {
+  std::set<std::string> keys;
+  Cache::ApplyToAllEntriesOptions opts;
+  EXPECT_OK(cache->ApplyToAllEntriesForCacheWarmup(
+      [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
+          Cache::Priority /*priority*/) { keys.insert(key.ToString()); },
+      opts));
+  return keys;
+}
+
+}  // namespace
+
+TEST(CacheWarmupPullTest, CatalogLeasesAndInsertRoundTrip) {
+  Random rnd(301);
+  const size_t kBlockSize = 4096;
+  const std::string kPrefix("\x01\x02\x03\x04\x05\x06\x07\x08", 8);
+  const std::string kOtherPrefix("\x11\x12\x13\x14\x15\x16\x17\x18", 8);
+
+  // Every test block has the same size, hence the same cache charge; size the
+  // caches in whole blocks so the eviction arithmetic below is exact.
+  size_t block_charge = 0;
+  {
+    std::string probe = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+    CacheAllocationPtr buf = AllocateBlock(probe.size(), nullptr);
+    memcpy(buf.get(), probe.data(), probe.size());
+    Block block(BlockContents(std::move(buf), probe.size()));
+    block_charge = block.ApproximateMemoryUsage();
+  }
+  ASSERT_GT(block_charge, kBlockSize);
+  const size_t kCapacityBlocks = 12;
+  LRUCacheOptions cache_opts(
+      kCapacityBlocks * block_charge, 0 /*num_shard_bits*/,
+      false /*strict_capacity_limit*/, 0.5 /*high_pri_pool_ratio*/,
+      nullptr /*memory_allocator*/, kDefaultToAdaptiveMutex,
+      kDontChargeCacheMetadata, 0.5 /*low_pri_pool_ratio*/);
+  std::shared_ptr<Cache> src = NewLRUCache(cache_opts);
+  ASSERT_NE(nullptr, src);
+
+  // 8 data blocks under the migrated prefix: 4 HIGH, 4 LOW.
+  const size_t kBlocks = 8;
+  std::vector<std::string> keys(kBlocks);
+  std::vector<std::string> bytes(kBlocks);
+  std::vector<const char*> src_data(kBlocks);
+  for (size_t i = 0; i < kBlocks; ++i) {
+    keys[i] = MakeWarmupPullTestKey(kPrefix, i);
+    bytes[i] = MakeWarmupPullTestBlock(&rnd, kBlockSize);
+    src_data[i] = InsertWarmupPullTestBlock(
+        src.get(), keys[i], bytes[i],
+        i < 4 ? Cache::Priority::HIGH : Cache::Priority::LOW,
+        BlockType::kData);
+  }
+  // A data block of another file set (silently filtered by prefix) and an
+  // index block of the migrated set (skipped_unsupported: data blocks only).
+  InsertWarmupPullTestBlock(src.get(), MakeWarmupPullTestKey(kOtherPrefix, 0),
+                            MakeWarmupPullTestBlock(&rnd, kBlockSize),
+                            Cache::Priority::LOW, BlockType::kData);
+  InsertWarmupPullTestBlock(src.get(), MakeWarmupPullTestKey(kPrefix, 99),
+                            MakeWarmupPullTestBlock(&rnd, kBlockSize),
+                            Cache::Priority::HIGH, BlockType::kIndex);
+  ASSERT_EQ(kBlocks + 2, ResidentWarmupPullTestKeys(src.get()).size());
+
+  // Catalog: the pull path never touches the writer, so none is needed.
+  CacheDumpOptions cd_options;
+  cd_options.clock = SystemClock::Default().get();
+  std::unique_ptr<CacheDumper> dumper;
+  ASSERT_OK(NewDefaultCacheDumper(cd_options, src, nullptr /*writer*/,
+                                  &dumper));
+  ASSERT_OK(dumper->SetDumpFilterPrefixes({kPrefix}));
+  CacheWarmupOptions warmup_options;
+  warmup_options.max_entry_bytes = kBlockSize;  // exactly fits
+  std::unique_ptr<CacheWarmupPullCatalog> catalog;
+  CacheWarmupTransferStats stats;
+  ASSERT_OK(
+      dumper->CatalogWarmupDataBlocksForPull(warmup_options, &catalog, &stats));
+  ASSERT_NE(nullptr, catalog);
+  EXPECT_EQ(kBlocks, stats.cataloged_entries);
+  EXPECT_EQ(kBlocks, stats.data_candidates);
+  EXPECT_EQ(kBlocks, stats.entries_staged);
+  EXPECT_EQ(0U, stats.entries_written);  // nothing is written on this path
+  EXPECT_EQ(kBlocks * kBlockSize, stats.payload_bytes);
+  EXPECT_EQ(1U, stats.skipped_unsupported);  // the index block
+  EXPECT_EQ(0U, stats.skipped_disappeared);
+  EXPECT_EQ(0U, stats.skipped_replaced);
+  EXPECT_EQ(0U, stats.skipped_too_large);
+  EXPECT_EQ(0U, stats.priority_changed_after_catalog);
+  EXPECT_EQ(4U, stats.high.entries_staged);
+  EXPECT_EQ(4U, stats.low.entries_staged);
+  EXPECT_EQ(0U, stats.bottom.entries_staged);
+  EXPECT_EQ(4U * kBlockSize, stats.high.payload_bytes);
+  EXPECT_EQ(4U * kBlockSize, stats.low.payload_bytes);
+  EXPECT_EQ(kBlocks, dumper->GetCacheWarmupTransferStats().entries_staged);
+
+  const std::vector<CacheWarmupPulledBlock>& blocks = catalog->blocks();
+  ASSERT_EQ(kBlocks, blocks.size());
+  EXPECT_EQ(kBlocks * kBlockSize, catalog->payload_bytes());
+  std::set<std::string> cataloged_keys;
+  for (size_t n = 0; n < blocks.size(); ++n) {
+    const CacheWarmupPulledBlock& b = blocks[n];
+    // HIGH -> LOW order, as the streamed transport emits it.
+    EXPECT_EQ(n < 4 ? Cache::Priority::HIGH : Cache::Priority::LOW,
+              b.priority);
+    ASSERT_EQ(static_cast<size_t>(kCacheKeySize), b.key.size());
+    ASSERT_EQ(kBlockSize, b.size);
+    ASSERT_NE(nullptr, b.data);
+    size_t i = 0;
+    for (; i < kBlocks; ++i) {
+      if (keys[i] == b.key) {
+        break;
+      }
+    }
+    ASSERT_LT(i, kBlocks) << "cataloged key is not one of the inserted keys";
+    // No copy: the catalog exposes the cache-owned Block's own bytes.
+    EXPECT_EQ(src_data[i], static_cast<const char*>(b.data));
+    EXPECT_EQ(0, memcmp(b.data, bytes[i].data(), kBlockSize));
+    cataloged_keys.insert(b.key);
+  }
+  EXPECT_EQ(kBlocks, cataloged_keys.size());
+
+  // Eviction pressure while leased: 20 HIGH fillers of one block charge each
+  // into a 12-block cache. A leased entry is skipped by eviction, so all 8
+  // stay resident and their bytes stay readable at the cataloged address.
+  auto insert_fillers = [&](const char* tag) {
+    for (int k = 0; k < 20; ++k) {
+      std::string key = std::string(tag) + std::to_string(k);
+      ASSERT_OK(src->Insert(key, nullptr /*value*/, block_charge,
+                            nullptr /*deleter*/, nullptr /*handle*/,
+                            Cache::Priority::HIGH));
+    }
+  };
+  insert_fillers("filler-leased-");
+  {
+    std::set<std::string> resident = ResidentWarmupPullTestKeys(src.get());
+    for (size_t i = 0; i < kBlocks; ++i) {
+      EXPECT_EQ(1U, resident.count(keys[i])) << "leased block " << i
+                                              << " was evicted";
+    }
+  }
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    for (size_t i = 0; i < kBlocks; ++i) {
+      if (keys[i] == b.key) {
+        EXPECT_EQ(0, memcmp(b.data, bytes[i].data(), kBlockSize));
+      }
+    }
+  }
+
+  // Destination: admit each block from the catalog pointer, as the RDMA
+  // receiver does after its READ lands, through the shared per-unit path.
+  std::shared_ptr<Cache> dst = NewLRUCache(cache_opts);
+  ASSERT_NE(nullptr, dst);
+  BlockBasedTableOptions toptions;
+  std::unique_ptr<CacheDumpedLoader> loader;
+  ASSERT_OK(NewDefaultCacheDumpedLoaderToPrimary(
+      cd_options, toptions, dst, nullptr /*reader*/, &loader));
+  CacheWarmupTransferStats lstats;
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    ASSERT_OK(loader->InsertWarmupDataBlock(
+        Slice(b.key), b.priority, static_cast<const char*>(b.data), b.size,
+        &lstats));
+  }
+  EXPECT_EQ(kBlocks, lstats.entries_received);
+  EXPECT_EQ(kBlocks, lstats.entries_inserted);
+  EXPECT_EQ(0U, lstats.entries_duplicate);
+  EXPECT_EQ(0U, lstats.entries_rejected_no_space);
+  EXPECT_EQ(kBlocks * kBlockSize, lstats.payload_bytes);
+  EXPECT_EQ(4U, lstats.high.entries_inserted);
+  EXPECT_EQ(4U, lstats.low.entries_inserted);
+  // A second pass is all duplicates; the destination keeps its own copies.
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    ASSERT_OK(loader->InsertWarmupDataBlock(
+        Slice(b.key), b.priority, static_cast<const char*>(b.data), b.size,
+        &lstats));
+  }
+  EXPECT_EQ(2 * kBlocks, lstats.entries_received);
+  EXPECT_EQ(kBlocks, lstats.entries_inserted);
+  EXPECT_EQ(kBlocks, lstats.entries_duplicate);
+  EXPECT_EQ(4U, lstats.high.entries_duplicate);
+  EXPECT_EQ(4U, lstats.low.entries_duplicate);
+  // A malformed unit is refused and counted, never admitted.
+  EXPECT_TRUE(loader
+                  ->InsertWarmupDataBlock(Slice("short-key"),
+                                          Cache::Priority::LOW,
+                                          bytes[0].data(), bytes[0].size(),
+                                          &lstats)
+                  .IsCorruption());
+  EXPECT_EQ(1U, lstats.skipped_invalid);
+  EXPECT_EQ(2 * kBlocks, lstats.entries_received);
+  // The destination holds byte-identical, independently owned copies.
+  for (size_t i = 0; i < kBlocks; ++i) {
+    Cache::Handle* h = dst->Lookup(keys[i]);
+    ASSERT_NE(nullptr, h) << "block " << i << " not admitted";
+    const Block* blk = static_cast<const Block*>(dst->Value(h));
+    ASSERT_EQ(kBlockSize, blk->size());
+    EXPECT_EQ(0, memcmp(blk->data(), bytes[i].data(), kBlockSize));
+    EXPECT_NE(src_data[i], blk->data());
+    dst->Release(h);
+  }
+
+  // Release() ends the leases (idempotently); the same pressure now evicts
+  // every previously resident entry, the 8 pulled blocks included.
+  catalog->Release();
+  catalog->Release();
+  for (const CacheWarmupPulledBlock& b : catalog->blocks()) {
+    EXPECT_EQ(nullptr, b.data);  // dangling pointers are nulled on release
+  }
+  insert_fillers("filler-released-");
+  {
+    std::set<std::string> resident = ResidentWarmupPullTestKeys(src.get());
+    for (size_t i = 0; i < kBlocks; ++i) {
+      EXPECT_EQ(0U, resident.count(keys[i])) << "released block " << i
+                                              << " is still resident";
+    }
+  }
+  catalog.reset();  // destructor after Release() must be a no-op
+  dumper.reset();
+  loader.reset();
 }
 
 // Test the option not to use the secondary cache in a certain DB.
