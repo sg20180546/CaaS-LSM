@@ -210,17 +210,36 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
   SuperVersionContext sv_ctx(/*create_superversion=*/true);
   {
     InstrumentedMutexLock l(&mutex_);
-    // ---- 2. Stop writes on both queues. Writers read and advance the last
-    // sequence under write-thread leadership, not under mutex_, so the
-    // sequence bump below must not race an in-flight write group (same
-    // pattern as IngestExternalFiles / FlushMemTable).
+    // ---- 2. Stop writes on both queues ONLY when the sequence must be
+    // raised (the block's largest seqno lies above everything the DB has
+    // handed out) or the window is multi-seqno. Writers read and advance the
+    // last sequence under write-thread leadership, not under mutex_, so a
+    // bump must not race an in-flight write group (IngestExternalFiles /
+    // FlushMemTable pattern). But EnterUnbatched queues behind the current
+    // write leader, and on a live destination under an L0 write stop that
+    // leader sleeps for seconds (measured 2026-09-24: a 21 s install for a
+    // 21 MB block whose seqno the destination's own writes had long passed).
+    // A width-1 block at or below the current sequence needs no bump, and
+    // imm()->Add + InstallSuperVersionAndScheduleWork are mutex_-only
+    // operations (flush and compaction completion do exactly this without
+    // the write thread), so that common case skips the write thread.
     WriteThread::Writer w;
-    write_thread_.EnterUnbatched(&w, &mutex_);
     WriteThread::Writer nonmem_w;
-    if (two_write_queues_) {
-      nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+    bool entered_write_thread = false;
+    {
+      const SequenceNumber db_seq_now =
+          std::max({versions_->LastSequence(),
+                    versions_->LastPublishedSequence(),
+                    versions_->LastAllocatedSequence()});
+      if (smallest != largest || largest > db_seq_now) {
+        write_thread_.EnterUnbatched(&w, &mutex_);
+        if (two_write_queues_) {
+          nonmem_write_thread_.EnterUnbatched(&nonmem_w, &mutex_);
+        }
+        WaitForPendingWrites();
+        entered_write_thread = true;
+      }
     }
-    WaitForPendingWrites();
 
     const MutableCFOptions* mopts = cfd->GetLatestMutableCFOptions();
     seq_before = versions_->LastSequence();
@@ -332,10 +351,12 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       }
     }
 
-    if (two_write_queues_) {
-      nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+    if (entered_write_thread) {
+      if (two_write_queues_) {
+        nonmem_write_thread_.ExitUnbatched(&nonmem_w);
+      }
+      write_thread_.ExitUnbatched(&w);
     }
-    write_thread_.ExitUnbatched(&w);
   }
   // Outside mutex_: free the old SuperVersion and any history memtables the
   // list trimmed (never the block: it is the newest entry).
