@@ -241,6 +241,11 @@ class DBImplSecondary : public DBImpl {
       const IngestExternalFileOptions& /*ingestion_options*/) override {
     return Status::NotSupported("Not supported operation in secondary mode.");
   }
+  // [external memtable 2026-09-23] a secondary DB has no flush path.
+  Status InstallExternalMemTable(ColumnFamilyHandle* /*column_family*/,
+                                 ExternalMemTableBlock&& /*block*/) override {
+    return Status::NotSupported("Not supported operation in secondary mode.");
+  }
 
   // Try to catch up with the primary by reading as much as possible from the
   // log files until there is nothing more to read or encounters an error. If

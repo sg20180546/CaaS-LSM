@@ -132,6 +132,12 @@ class DBImplReadOnly : public DBImpl {
       const IngestExternalFileOptions& /*ingestion_options*/) override {
     return Status::NotSupported("Not supported operation in read only mode.");
   }
+  // [external memtable 2026-09-23] a read-only DB has no flush path.
+  virtual Status InstallExternalMemTable(
+      ColumnFamilyHandle* /*column_family*/,
+      ExternalMemTableBlock&& /*block*/) override {
+    return Status::NotSupported("Not supported operation in read only mode.");
+  }
 
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(

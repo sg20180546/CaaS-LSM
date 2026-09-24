@@ -119,6 +119,12 @@ class CompactedDBImpl : public DBImpl {
       const IngestExternalFileOptions& /*ingestion_options*/) override {
     return Status::NotSupported("Not supported in compacted db mode.");
   }
+  // [external memtable 2026-09-23] a compacted (read-only) DB has no flush path.
+  virtual Status InstallExternalMemTable(
+      ColumnFamilyHandle* /*column_family*/,
+      ExternalMemTableBlock&& /*block*/) override {
+    return Status::NotSupported("Not supported in compacted db mode.");
+  }
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(
       const ColumnFamilyOptions& /*options*/,
