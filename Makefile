@@ -1538,6 +1538,9 @@ error_handler_fs_test: $(OBJ_DIR)/db/error_handler_fs_test.o $(TEST_LIBRARY) $(L
 external_sst_file_basic_test: $(OBJ_DIR)/db/external_sst_file_basic_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
+external_memtable_test: $(OBJ_DIR)/db/external_memtable_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
 external_sst_file_test: $(OBJ_DIR)/db/external_sst_file_test.o $(TEST_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 

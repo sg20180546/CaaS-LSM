@@ -25,12 +25,14 @@
 #include "logging/logging.h"
 #include "memory/arena.h"
 #include "memory/memory_usage.h"
+#include "memtable/sorted_block_rep.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
 #include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"
+#include "rocksdb/external_memtable.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/merge_operator.h"
 #include "rocksdb/slice_transform.h"
@@ -148,6 +150,104 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
 MemTable::~MemTable() {
   mem_tracker_.FreeMem();
   assert(refs_ == 0);
+}
+
+// [external memtable 2026-09-23] Tag constructor: identical initializer list
+// to the stock ctor except that table_ is a read-only SortedBlockMemTableRep
+// over the caller's block (zero-copy) and earliest/creation seqno start at
+// the block's smallest seqno. comparator_ is declared (and therefore
+// constructed) before table_, so passing it by reference to the rep is safe
+// (SkipListRep gets the same reference through the factory).
+MemTable::MemTable(ExternalSortedBlockTag, const InternalKeyComparator& cmp,
+                   const ImmutableOptions& ioptions,
+                   const MutableCFOptions& mutable_cf_options,
+                   WriteBufferManager* write_buffer_manager,
+                   uint32_t column_family_id,
+                   SequenceNumber block_smallest_seqno,
+                   ExternalMemTableBlock&& block)
+    : comparator_(cmp),
+      moptions_(ioptions, mutable_cf_options),
+      refs_(0),
+      kArenaBlockSize(Arena::OptimizeBlockSize(moptions_.arena_block_size)),
+      mem_tracker_(write_buffer_manager),
+      arena_(moptions_.arena_block_size,
+             (write_buffer_manager != nullptr &&
+              (write_buffer_manager->enabled() ||
+               write_buffer_manager->cost_to_cache()))
+                 ? &mem_tracker_
+                 : nullptr,
+             mutable_cf_options.memtable_huge_page_size),
+      table_(new SortedBlockMemTableRep(comparator_, std::move(block))),
+      range_del_table_(SkipListFactory().CreateMemTableRep(
+          comparator_, &arena_, nullptr /* transform */, ioptions.logger,
+          column_family_id)),
+      is_range_del_table_empty_(true),
+      data_size_(0),
+      num_entries_(0),
+      num_deletes_(0),
+      write_buffer_size_(mutable_cf_options.write_buffer_size),
+      flush_in_progress_(false),
+      flush_completed_(false),
+      file_number_(0),
+      first_seqno_(0),
+      earliest_seqno_(block_smallest_seqno),
+      creation_seq_(block_smallest_seqno),
+      mem_next_logfile_number_(0),
+      min_prep_log_referenced_(0),
+      locks_(moptions_.inplace_update_support
+                 ? moptions_.inplace_update_num_locks
+                 : 0),
+      prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
+      flush_state_(FLUSH_NOT_REQUESTED),
+      clock_(ioptions.clock),
+      insert_with_hint_prefix_extractor_(
+          ioptions.memtable_insert_with_hint_prefix_extractor.get()),
+      oldest_key_time_(std::numeric_limits<uint64_t>::max()),
+      atomic_flush_seqno_(kMaxSequenceNumber),
+      approximate_memory_usage_(0) {
+  // No UpdateFlushState(): flush_state_ is only consulted for the ACTIVE
+  // memtable, and ShouldFlushNow() would trip on a block larger than the
+  // write buffer. No bloom_filter_: it could never be populated.
+  const auto* rep = static_cast<const SortedBlockMemTableRep*>(table_.get());
+  const ExternalMemTableBlock& b = rep->block();
+  // Counters the flush path (FlushJob::WriteLevel0Table: num_entries /
+  // num_deletes / get_data_size / ApproximateMemoryUsage, the
+  // flush_verify_memtable_count check) and the stats read.
+  data_size_.store(b.data_size, std::memory_order_relaxed);
+  num_entries_.store(b.count, std::memory_order_relaxed);
+  // The block does not carry a delete count (stats-only field); the relink
+  // driver ships no deletions (DBIter walk, tombstones hidden).
+  num_deletes_.store(0, std::memory_order_relaxed);
+  // first_seqno_ != 0 => !IsEmpty() (MemTable::Get returns early on empty).
+  first_seqno_.store(b.smallest_seqno, std::memory_order_relaxed);
+  UpdateOldestKeyTime();  // read by FlushJob for oldest_ancester_time
+  ApproximateMemoryUsage();  // refresh approximate_memory_usage_
+  // Same cached range-tombstone init as the stock ctor (read before any
+  // range-del lookup; the table stays empty for an external block).
+  auto new_cache = std::make_shared<FragmentedRangeTombstoneListCache>();
+  size_t size = cached_range_tombstone_.Size();
+  for (size_t i = 0; i < size; ++i) {
+    std::shared_ptr<FragmentedRangeTombstoneListCache>* local_cache_ref_ptr =
+        cached_range_tombstone_.AccessAtCore(i);
+    auto new_local_cache_ref = std::make_shared<
+        const std::shared_ptr<FragmentedRangeTombstoneListCache>>(new_cache);
+    std::atomic_store_explicit(
+        local_cache_ref_ptr,
+        std::shared_ptr<FragmentedRangeTombstoneListCache>(new_local_cache_ref,
+                                                           new_cache.get()),
+        std::memory_order_relaxed);
+  }
+}
+
+MemTable* MemTable::NewFromExternalSortedBlock(
+    const InternalKeyComparator& comparator, const ImmutableOptions& ioptions,
+    const MutableCFOptions& mutable_cf_options,
+    WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
+    ExternalMemTableBlock&& block) {
+  const SequenceNumber smallest = block.smallest_seqno;
+  return new MemTable(ExternalSortedBlockTag(), comparator, ioptions,
+                      mutable_cf_options, write_buffer_manager,
+                      column_family_id, smallest, std::move(block));
 }
 
 size_t MemTable::ApproximateMemoryUsage() {

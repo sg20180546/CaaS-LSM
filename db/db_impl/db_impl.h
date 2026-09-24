@@ -577,6 +577,11 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family,
       const std::vector<std::pair<int, uint64_t>>& level_and_file) override;
 
+  // [external memtable 2026-09-23] install a caller-owned sorted KV-block as
+  // an immutable memtable (db/db_impl/db_impl_external_memtable.cc).
+  virtual Status InstallExternalMemTable(ColumnFamilyHandle* column_family,
+                                         ExternalMemTableBlock&& block) override;
+
   // [BucketLSM Phase 7] install new dynamic L0-bucket boundaries (split/merge).
   virtual Status SetBucketBoundaries(
       ColumnFamilyHandle* column_family,

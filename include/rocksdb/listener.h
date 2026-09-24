@@ -172,6 +172,8 @@ enum class FlushReason : int {
   // will not be called to avoid many small immutable memtables.
   kErrorRecoveryRetryFlush = 0xc,
   kWalFull = 0xd,
+  // [external memtable 2026-09-23] flush queued by DB::InstallExternalMemTable
+  kExternalMemTable = 0xe,
 };
 
 // TODO: In the future, BackgroundErrorReason will only be used to indicate

@@ -162,6 +162,11 @@ class StackableDB : public DB {
                                        uint64_t file_number) override {
     return db_->UnregisterFileInPlace(column_family, level, file_number);
   }
+  // [external memtable 2026-09-23]
+  virtual Status InstallExternalMemTable(ColumnFamilyHandle* column_family,
+                                         ExternalMemTableBlock&& block) override {
+    return db_->InstallExternalMemTable(column_family, std::move(block));
+  }
 
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(

@@ -47,6 +47,7 @@ LIB_SOURCES =                                                   \
   db/db_impl/db_impl_compaction_flush.cc                        \
   db/db_impl/db_impl_debug.cc                                   \
   db/db_impl/db_impl_experimental.cc                            \
+  db/db_impl/db_impl_external_memtable.cc                       \
   db/db_impl/db_impl_files.cc                                   \
   db/db_impl/db_impl_open.cc                                    \
   db/db_impl/db_impl_readonly.cc                                \
@@ -130,7 +131,9 @@ LIB_SOURCES =                                                   \
   memtable/alloc_tracker.cc                                     \
   memtable/hash_linklist_rep.cc                                 \
   memtable/hash_skiplist_rep.cc                                 \
+  memtable/external_memtable.cc                                 \
   memtable/skiplistrep.cc                                       \
+  memtable/sorted_block_rep.cc                                  \
   memtable/vectorrep.cc                                         \
   memtable/write_buffer_manager.cc                              \
   monitoring/histogram.cc                                       \
@@ -489,6 +492,7 @@ TEST_MAIN_SOURCES =                                                     \
   db/deletefile_test.cc                                                 \
   db/error_handler_fs_test.cc                                           \
   db/external_sst_file_basic_test.cc                                    \
+  db/external_memtable_test.cc                                          \
   db/external_sst_file_test.cc                                          \
   db/fault_injection_test.cc                                            \
   db/file_indexer_test.cc                                               \

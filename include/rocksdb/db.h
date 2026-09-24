@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "rocksdb/block_cache_trace_writer.h"
+#include "rocksdb/external_memtable.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/listener.h"
 #include "rocksdb/metadata.h"
@@ -1874,6 +1875,59 @@ class DB {
       const std::vector<std::pair<int, uint64_t>>& /*level_and_file*/) {
     return Status::NotSupported(
         "UnregisterFilesInPlace is not supported in this DB implementation");
+  }
+
+  // [external memtable 2026-09-23] Install a caller-owned, pointer-free,
+  // sorted KV-block (the unflushed memtable slice of a migrated key range,
+  // built by ExternalMemTableBlockBuilder on the source and landed here e.g.
+  // by RDMA) AS AN IMMUTABLE MEMTABLE of `column_family`: no per-entry
+  // re-insertion, no per-entry lock, no write-buffer consumption; the block
+  // is binary-searched by reads (active memtable -> immutable list, incl.
+  // this block -> SSTs, as usual) and flushed later by the normal flush path
+  // into an L0 file whose seqno bounds are the block's window. The engine
+  // NEVER copies `block.data`/`block.offsets`; `block.release` is called
+  // exactly once when the memtable is destroyed (after its flush has been
+  // committed to the MANIFEST and the last reader dropped it), and never if
+  // this call returns a non-OK status (the caller then still owns the
+  // buffer; on success the engine has taken over `block`).
+  //
+  // PRECONDITIONS (the coordinator's GSN-window discipline):
+  //  * KEY DISJOINTNESS (what keeps Get and iterators consistent, since Get
+  //    consults active -> immutables -> SSTs while iterators merge by
+  //    seqno): at install time no memtable of this column family (active or
+  //    immutable) holds any version of a block user key, and every SST
+  //    carrying older versions of those keys has been registered
+  //    (RegisterExternalFilesInPlace) with global seqnos < smallest_seqno.
+  //    Other keys may carry any seqno, including one equal to
+  //    smallest_seqno (the relink gsn_base shape). The DB's latest sequence
+  //    is raised to max(current, largest_seqno) so every later write shadows
+  //    the block (post-cutover writes land in the active memtable and win by
+  //    seqno and by consult order);
+  //  * one column family per DB (multi-CF DBs are refused: the block reuses
+  //    the active memtable's id and has no WAL record);
+  //  * entries are unique (user key, seqno) pairs in InternalKeyComparator
+  //    order (user key asc, seq desc), types Value / Deletion /
+  //    SingleDeletion only; no range tombstones, no merge operands, no
+  //    per-entry checksums (memtable_protection_bytes_per_key must be 0);
+  //  * 1 <= smallest_seqno <= largest_seqno. A multi-seqno window
+  //    (smallest != largest) is only accepted when the column family has no
+  //    unflushed data (empty active memtable, no immutable memtables) and
+  //    smallest_seqno > GetLatestSequenceNumber(): RocksDB's L0 ordering
+  //    check (force_consistency_checks, on by default) requires every newer
+  //    L0 file's smallest seqno to exceed an older non-external file's, so
+  //    a multi-seqno block flushed ahead of older unflushed writes would make
+  //    the NEXT flush fail with Corruption. A width-1 window
+  //    (smallest == largest) is the "external file" shape that check exempts
+  //    and is what the relink driver ships (all entries at seq = gsn_base,
+  //    user keys deduplicated);
+  //  * atomic_flush is off. WAL: the memtable has no WAL record (the DB runs
+  //    the migration with disableWAL); a WAL-enabled deployment would have
+  //    to log the block before installing it (not implemented).
+  // Default implementation: NotSupported.
+  virtual Status InstallExternalMemTable(ColumnFamilyHandle* /*column_family*/,
+                                         ExternalMemTableBlock&& /*block*/) {
+    return Status::NotSupported(
+        "InstallExternalMemTable is not supported in this DB implementation");
   }
 
   // [BucketLSM Phase 7] Install a new dynamic L0-bucket boundary list for this

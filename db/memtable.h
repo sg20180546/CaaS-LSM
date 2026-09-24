@@ -26,6 +26,7 @@
 #include "monitoring/instrumented_mutex.h"
 #include "options/cf_options.h"
 #include "rocksdb/db.h"
+#include "rocksdb/external_memtable.h"
 #include "rocksdb/memtablerep.h"
 #include "table/multiget_context.h"
 #include "util/dynamic_bloom.h"
@@ -115,6 +116,21 @@ class MemTable {
 
   // Do not delete this MemTable unless Unref() indicates it not in use.
   ~MemTable();
+
+  // [external memtable 2026-09-23] Build an ALREADY-IMMUTABLE MemTable whose
+  // rep is a read-only SortedBlockMemTableRep over a caller-owned sorted
+  // KV-block (DB::InstallExternalMemTable). Nothing from the block is copied;
+  // block.release runs exactly once from ~MemTable. Counters the flush path
+  // and stats read (num_entries, data size, first/earliest/creation seqno,
+  // oldest key time) are set from the block; no bloom filter is built (it
+  // could never be populated and would give false negatives) and
+  // write_buffer_manager may be nullptr so the block is not charged to the
+  // write buffer. Refcount starts at 0 like the stock ctor.
+  static MemTable* NewFromExternalSortedBlock(
+      const InternalKeyComparator& comparator, const ImmutableOptions& ioptions,
+      const MutableCFOptions& mutable_cf_options,
+      WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
+      ExternalMemTableBlock&& block);
 
   // Increase reference count.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -540,6 +556,16 @@ class MemTable {
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;
   friend class MemTableList;
+
+  // [external memtable 2026-09-23] tag constructor used only by
+  // NewFromExternalSortedBlock: same initializer list as the stock ctor
+  // except table_ = SortedBlockMemTableRep(block) and no bloom filter.
+  struct ExternalSortedBlockTag {};
+  MemTable(ExternalSortedBlockTag, const InternalKeyComparator& comparator,
+           const ImmutableOptions& ioptions,
+           const MutableCFOptions& mutable_cf_options,
+           WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
+           SequenceNumber block_smallest_seqno, ExternalMemTableBlock&& block);
 
   KeyComparator comparator_;
   const ImmutableMemTableOptions moptions_;

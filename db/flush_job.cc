@@ -77,6 +77,8 @@ const char* GetFlushReasonString(FlushReason flush_reason) {
       return "Error Recovery";
     case FlushReason::kWalFull:
       return "WAL Full";
+    case FlushReason::kExternalMemTable:
+      return "External MemTable";
     default:
       return "Invalid";
   }
