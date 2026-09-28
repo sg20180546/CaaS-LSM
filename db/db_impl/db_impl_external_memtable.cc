@@ -20,6 +20,7 @@
 // SuperVersion / iterator reference is gone.
 
 #include <algorithm>
+#include <cassert>
 #include <cinttypes>
 #include <limits>
 
@@ -320,7 +321,34 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       // cannot be declared obsolete (review 2026-09-24; only matters with a
       // WAL and several column families, which the driver never runs). A
       // co-flush with real memtables takes the max of their log numbers.
-      mem->SetNextLogNumber(cfd->GetLogNumber());
+      //
+      // [relink memtable 2026-09-27] ...but never stamp 0. A column family
+      // that has not committed a flush since the DB was created (NewDB writes
+      // log number 0 and no WAL was recovered, i.e. an empty relink
+      // destination) has log number 0, and a block-only flush copies it into
+      // its VersionEdit. PrecomputeMinLogNumberToKeepNon2PC reads 0 as "no log
+      // info", falls back to the CF log number (0 again) and, with one CF,
+      // returns the other-CF minimum = UINT64_MAX; that lands in the MANIFEST
+      // as MinLogNumberToKeep, and FindObsoleteFiles then pops every alive WAL
+      // including the current one and reads begin() of the empty deque
+      // (SIGSEGV in the release .so: s1/s2 of the 0927 push-source cells).
+      // Stock RocksDB never hits this: an immutable memtable always comes out
+      // of SwitchMemtable with a real WAL number. Fall back to the OLDEST
+      // alive WAL, not logfile_number_: every WAL that can still hold
+      // unflushed data is alive and >= it (e.g. WALs recovered with
+      // avoid_flush_during_recovery), so the block's flush still declares no
+      // WAL obsolete. A non-zero CF log number is used exactly as before.
+      uint64_t block_next_log = cfd->GetLogNumber();
+      if (block_next_log == 0) {
+        // Lock order mutex_ -> log_write_mutex_ (db_impl.h); both are held by
+        // every writer of alive_log_files_ / logfile_number_.
+        InstrumentedMutexLock wl(&log_write_mutex_);
+        block_next_log = alive_log_files_.empty()
+                             ? logfile_number_
+                             : alive_log_files_.front().number;
+      }
+      assert(block_next_log != 0);
+      mem->SetNextLogNumber(block_next_log);
       // ID = the ACTIVE memtable's id (mempurge precedent). IDs are only
       // minted by ColumnFamilyData::SetMemtable for the active memtable; a
       // fresh id larger than the active's would be skipped by

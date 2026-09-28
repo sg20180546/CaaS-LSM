@@ -248,7 +248,18 @@ TEST_F(ExternalMemTableTest, InstallReadsIteratorsAndManualFlush) {
 
   // (c) manual flush: block + active memtable go to L0; release exactly once
   // afterwards; reads unchanged.
-  ASSERT_OK(Flush());
+  // [relink memtable 2026-09-27] allow_write_stall: a request_flush=false
+  // block is an unflushed immutable memtable with NO queued flush, so with the
+  // default max_write_buffer_number=2 DB::Flush's pre-wait
+  // (WaitUntilFlushWouldNotStallWrites) sleeps on bg_cv_ forever (the test
+  // hung before and after the 0927 WAL fix; lldb stack in
+  // exp_out/_scratch/pushsrc_0927/crash/fixcheck). The relink driver installs
+  // with request_flush=1.
+  {
+    FlushOptions fo;
+    fo.allow_write_stall = true;
+    ASSERT_OK(db_->Flush(fo));
+  }
   { FlushOptions fo; fo.wait = true; ASSERT_OK(db_->Flush(fo)); }  // NDEBUG-safe wait (TEST_WaitForFlushMemTable is debug-only)
   ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
   WaitForRelease(&released, 1);
@@ -329,6 +340,113 @@ TEST_F(ExternalMemTableTest, AutoFlushOnInstallAndInBlockVersions) {
   ASSERT_EQ(Get("x"), "x-newer");
   ASSERT_EQ(Get("y"), "NOT_FOUND");
   ASSERT_EQ(Get(Key(999)), Val(999));
+}
+
+// [relink memtable 2026-09-27] Regression: an EMPTY relink destination
+// (fresh DB, nothing flushed yet) crashed in FindObsoleteFiles right after the
+// block's flush (s1/s2 of the 0927 push-source cells; SIGSEGV in release,
+// assert(alive_log_files_.size()) in debug). A DB that never committed a
+// flush has column-family log number 0 (NewDB writes 0, no WAL recovered); the
+// block used to carry that 0 into its flush's VersionEdit,
+// PrecomputeMinLogNumberToKeepNon2PC turned it into UINT64_MAX (one CF), and
+// FindObsoleteFiles popped the current WAL. The flush must also keep the WAL
+// that holds the still-unflushed Put.
+TEST_F(ExternalMemTableTest, BlockOnlyFlushOnNeverFlushedDB) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+
+  // WAL-backed write that stays in the active memtable: it lives only in the
+  // current WAL, so that WAL must survive the block's flush.
+  ASSERT_OK(Put("pre", "p"));
+  ASSERT_EQ(cfd->GetLogNumber(), 0u);  // precondition: never flushed
+
+  // Width-1 window above the DB's sequence with the default auto flush
+  // request: the shape of the crashed destinations (seq 1, request_flush=1).
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(SequentialEntries(100, g, /*width_one=*/true), &released);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk)));
+  // Only the requested background flush runs. No db_->Flush(): it would
+  // switch the active memtable and co-flush it with a real log number,
+  // hiding the block-only case.
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  // The WAL floor is a real WAL number and never passes the current WAL.
+  const uint64_t min_log = dbfull()->MinLogNumberToKeep();
+  ASSERT_GT(min_log, 0u);
+  ASSERT_LE(min_log, dbfull()->TEST_LogfileNumber());
+  ASSERT_LE(cfd->GetLogNumber(), dbfull()->TEST_LogfileNumber());
+
+  ASSERT_OK(Put("post", "q"));
+  ASSERT_EQ(Get(Key(42)), Val(42));
+  // Both WAL-only writes survive recovery; the block's L0 file is intact.
+  Reopen(options);
+  ASSERT_EQ(Get("pre"), "p");
+  ASSERT_EQ(Get("post"), "q");
+  ASSERT_EQ(Get(Key(0)), Val(0));
+  ASSERT_EQ(Get(Key(99)), Val(99));
+}
+
+// [relink memtable 2026-09-27] Why the log-number fallback is the OLDEST alive
+// WAL and not logfile_number_: a reopen with avoid_flush_during_recovery keeps
+// the recovered writes in the active memtable, leaves the CF log number at 0
+// and keeps their WAL alive next to the newly created one. Stamping the block
+// with logfile_number_ (the new WAL) would let the block-only flush declare the
+// recovered WAL obsolete and lose its write on the next reopen.
+TEST_F(ExternalMemTableTest, BlockOnlyFlushKeepsRecoveredWal) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_recovery = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("pre", "p"));
+  Reopen(options);  // replays the WAL into the memtable without a flush
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+  ASSERT_EQ(cfd->GetLogNumber(), 0u);  // precondition: never flushed
+  uint64_t recovered_wal = 0;
+  {
+    // GetSortedWalFiles lists non-empty WALs only (WalManager skips a WAL
+    // with no record): the recovered one, not the empty WAL opened after it.
+    VectorLogPtr wals;
+    ASSERT_OK(db_->GetSortedWalFiles(wals));
+    ASSERT_EQ(wals.size(), 1u);
+    ASSERT_EQ(wals[0]->Type(), kAliveLogFile);
+    recovered_wal = wals[0]->LogNumber();
+  }
+  ASSERT_LT(recovered_wal, dbfull()->TEST_LogfileNumber());
+
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(SequentialEntries(10, g, /*width_one=*/true), &released);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk)));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  // The recovered WAL is still the floor and still alive on disk.
+  ASSERT_EQ(dbfull()->MinLogNumberToKeep(), recovered_wal);
+  {
+    VectorLogPtr wals;
+    ASSERT_OK(db_->GetSortedWalFiles(wals));
+    ASSERT_EQ(wals.size(), 1u);
+    ASSERT_EQ(wals[0]->LogNumber(), recovered_wal);
+    ASSERT_EQ(wals[0]->Type(), kAliveLogFile);
+  }
+  Reopen(options);
+  ASSERT_EQ(Get("pre"), "p");
+  ASSERT_EQ(Get(Key(0)), Val(0));
+  ASSERT_EQ(Get(Key(9)), Val(9));
 }
 
 // (f) L0 seqno rule: width-1 window at the DB's latest sequence coexists with
@@ -507,7 +625,13 @@ TEST_F(ExternalMemTableTest, StackableDBPassthrough) {
                                           std::move(blk)));
     ASSERT_EQ(Get(Key(3)), Val(3));
   }
-  ASSERT_OK(Flush());
+  // [relink memtable 2026-09-27] allow_write_stall: request_flush=false
+  // leaves no queued flush; see InstallReadsIteratorsAndManualFlush.
+  {
+    FlushOptions fo;
+    fo.allow_write_stall = true;
+    ASSERT_OK(db_->Flush(fo));
+  }
   ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
   WaitForRelease(&released, 1);
   ASSERT_EQ(released.load(), 1);
