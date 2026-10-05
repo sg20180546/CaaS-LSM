@@ -208,6 +208,14 @@ struct ExternalTableCacheEntry {
   // Stable public SST ID (exactly 16 binary bytes), when available.
   std::string unique_id;
   std::vector<ExternalTableCacheRange> ranges;
+  // [sst access stats 2026-10-04] The SOURCE's foreground data-block lookup rate
+  // on this file in lookups per second (hits + misses -- every lookup needs the
+  // reader -- as (lookups - 1 + 0.5) / reader age; see sst_access_stats.h), or
+  // negative when unknown. When every entry carries one and this process counts
+  // its own per-SST lookups (SetSstAccessStatsCounting),
+  // InstallExternalTableCacheEntries ranks reader slots by lookup rate instead
+  // of by level (see DBImpl::InstallExternalTableCacheEntries).
+  double source_lookups_per_sec = -1.0;
 };
 
 // Source-side immutable view of a resident TableReader's retained metadata.
@@ -242,8 +250,14 @@ struct TableCacheWarmupTransferStats {
   uint64_t skipped_unavailable = 0;
   uint64_t skipped_too_large = 0;
   uint64_t skipped_not_current = 0;
-  uint64_t skipped_lower_level = 0;
+  uint64_t skipped_lower_level = 0;  // lost the per-shard ranking (level, or rate)
   uint64_t failed = 0;
+  // [sst access stats 2026-10-04] InstallExternalTableCacheEntries ran in rate
+  // mode (see ExternalTableCacheEntry::source_lookups_per_sec): rate_mode = 1;
+  // resident_mean_lookups_per_sec is a diagnostic (mean finite lookup rate of
+  // this CF's resident readers), not a decision input.
+  uint64_t rate_mode = 0;
+  double resident_mean_lookups_per_sec = 0.0;
 };
 
 using TableCacheWarmupEntryCallback =
@@ -1844,6 +1858,9 @@ class DB {
   // Combines received entries with the destination's current resident table
   // cache, ranks the union by the destination Version's CURRENT LSM level
   // (L0 first), and keeps only capacity winners. Existing entries win ties.
+  // [sst access stats 2026-10-04] In rate mode (every entry carries
+  // source_lookups_per_sec and this process counts per-SST lookups) the union
+  // ranks by foreground lookup rate instead, resident readers winning ties.
   // Selected incoming readers are reconstructed from the supplied memory
   // ranges without opening or reading shared storage.
   virtual Status InstallExternalTableCacheEntries(

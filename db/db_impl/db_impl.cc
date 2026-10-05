@@ -14,6 +14,8 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <cinttypes>
 #include <cstdio>
 #include <map>
@@ -50,6 +52,7 @@
 #include "db/periodic_task_scheduler.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/table_cache.h"
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "db/table_properties_collector.h"
 #include "db/transaction_log_impl.h"
 #include "db/version_set.h"
@@ -6073,12 +6076,73 @@ Status DBImpl::InstallExternalTableCacheEntries(
   std::unordered_set<uint64_t> resident_set(resident_numbers.begin(),
                                             resident_numbers.end());
 
+  // [sst access stats 2026-10-04] Rate mode: when every incoming entry carries
+  // the source's lookup rate and this process counts its own per-SST lookups,
+  // a reader slot is ranked by its lookup rate (foreground data-block lookups
+  // per second -- every lookup needs the file's reader) instead of by level:
+  //   * per shard, every reader -- resident or incoming -- ranks by rate
+  //     (resident wins ties); the top `available` keep / take a slot. A shard
+  //     with room therefore admits every incoming reader (nobody is displaced),
+  //     and a full shard replaces only resident readers slower than the
+  //     incoming one, slowest first;
+  //   * an incoming file that is already resident here (opened by a foreground
+  //     lookup after the redirect) ranks by the faster of its two rates;
+  //   * no level policy: no level promotion of resident winners, no switch of
+  //     the table cache to level priority, and admitted readers are inserted
+  //     the way a foreground open inserts them.
+  // A reader's rate is the posterior mean (k + 0.5) / T of a Poisson rate under
+  // the standard non-informative (Jeffreys) prior, k = lookups - 1 observed in
+  // T = its age: the lookup that opened it on demand is not an observation, and
+  // a reader without observations is not "rate 0" -- one opened a millisecond
+  // ago (just demanded) ranks high, one idle for an hour ranks low. Without
+  // rates (the default) the level policy below is unchanged.
+  bool rate_mode = SstAccessStatsCounting();
+  for (const auto& entry : entries) {
+    if (!(entry.source_lookups_per_sec >= 0.0)) {
+      rate_mode = false;
+      break;
+    }
+  }
+  std::unordered_map<uint64_t, double> resident_rate;
+  if (rate_mode) {
+    std::vector<SstAccessStats> access;
+    table_cache->GetSstAccessStatsOfResidentTables(&access);
+    const uint64_t now_us = immutable_db_options_.clock->NowMicros();
+    for (const SstAccessStats& a : access) {
+      const uint64_t lookups = a.fg_data_block_hits + a.fg_data_block_misses;
+      const double observed = lookups > 0 ? static_cast<double>(lookups - 1) : 0.0;
+      resident_rate[a.file_number] =
+          now_us > a.open_time_micros
+              ? (observed + 0.5) /
+                    (static_cast<double>(now_us - a.open_time_micros) * 1e-6)
+              : std::numeric_limits<double>::infinity();  // opened this tick
+    }
+    local_stats.rate_mode = 1;
+  }
+  // Source rates of the incoming files, keyed by THIS DB's file number, so a
+  // resident reader of an incoming file ranks by the faster of the two rates.
+  std::unordered_map<uint64_t, double> incoming_rate;
+  if (rate_mode) {
+    for (const auto& entry : entries) {
+      auto it = by_external_file.find(entry.external_file);
+      if (it != by_external_file.end()) {
+        double& r = incoming_rate[it->second.metadata->fd.GetNumber()];
+        r = std::max(r, entry.source_lookups_per_sec);
+      }
+    }
+  }
+  auto rate_of_resident = [&](uint64_t file_number) {
+    auto it = resident_rate.find(file_number);
+    return it == resident_rate.end() ? 0.0 : it->second;
+  };
+
   struct Candidate {
     uint64_t file_number;
     int level;
     bool existing;
     size_t incoming_index;
     size_t shard;
+    double rate;  // lookups per second (rate mode only; 0 otherwise)
   };
   const size_t shard_count = table_cache->GetCacheWarmupShardCount();
   if (shard_count == 0) {
@@ -6097,8 +6161,33 @@ Status DBImpl::InstallExternalTableCacheEntries(
       continue;
     }
     ++known_resident_by_shard[shard];
+    double rate = 0.0;
+    if (rate_mode) {
+      rate = rate_of_resident(file_number);
+      auto in = incoming_rate.find(file_number);
+      if (in != incoming_rate.end()) {
+        rate = std::max(rate, in->second);
+      }
+    }
     candidates_by_shard[shard].push_back(
-        {file_number, current->second.level, true, entries.size(), shard});
+        {file_number, current->second.level, true, entries.size(), shard,
+         rate});
+  }
+  // [sst access stats 2026-10-04] Diagnostics only (not a decision input): the
+  // mean finite rate of this CF's resident CURRENT readers.
+  if (rate_mode) {
+    size_t n = 0;
+    double sum = 0.0;
+    for (const auto& shard_candidates : candidates_by_shard) {
+      for (const Candidate& c : shard_candidates) {
+        if (std::isfinite(c.rate)) {
+          sum += c.rate;
+          ++n;
+        }
+      }
+    }
+    local_stats.resident_mean_lookups_per_sec =
+        n == 0 ? 0.0 : sum / static_cast<double>(n);
   }
 
   Status first_error;
@@ -6186,7 +6275,8 @@ Status DBImpl::InstallExternalTableCacheEntries(
       continue;
     }
     candidates_by_shard[shard].push_back(
-        {file_number, current->second.level, false, i, shard});
+        {file_number, current->second.level, false, i, shard,
+         rate_mode ? entry.source_lookups_per_sec : 0.0});
   }
 
   // Destination CURRENT levels are authoritative. L0 wins L1, and so on;
@@ -6235,7 +6325,16 @@ Status DBImpl::InstallExternalTableCacheEntries(
   for (size_t shard = 0; shard < shard_count; ++shard) {
     auto& candidates = candidates_by_shard[shard];
     std::sort(candidates.begin(), candidates.end(),
-              [](const Candidate& lhs, const Candidate& rhs) {
+              [rate_mode](const Candidate& lhs, const Candidate& rhs) {
+                if (rate_mode) {
+                  if (lhs.rate != rhs.rate) {
+                    return lhs.rate > rhs.rate;  // faster reader first
+                  }
+                  if (lhs.existing != rhs.existing) {
+                    return lhs.existing;  // the resident reader keeps a tie
+                  }
+                  return lhs.file_number < rhs.file_number;
+                }
                 if (lhs.level != rhs.level) {
                   return lhs.level < rhs.level;
                 }
@@ -6280,7 +6379,13 @@ Status DBImpl::InstallExternalTableCacheEntries(
     // Try the least valuable destination reader first when an explicit victim
     // is needed. Failed (for example, pinned) victims are left untouched.
     std::sort(victims_by_shard[shard].begin(), victims_by_shard[shard].end(),
-              [](const Candidate& lhs, const Candidate& rhs) {
+              [rate_mode](const Candidate& lhs, const Candidate& rhs) {
+                if (rate_mode) {
+                  if (lhs.rate != rhs.rate) {
+                    return lhs.rate < rhs.rate;  // slowest reader first
+                  }
+                  return lhs.file_number > rhs.file_number;
+                }
                 if (lhs.level != rhs.level) {
                   return lhs.level > rhs.level;
                 }
@@ -6292,13 +6397,21 @@ Status DBImpl::InstallExternalTableCacheEntries(
   // constructed only from the received immutable ranges before any explicit
   // victim can be removed.
   std::sort(incoming_winners.begin(), incoming_winners.end(),
-            [](const Candidate& lhs, const Candidate& rhs) {
+            [rate_mode](const Candidate& lhs, const Candidate& rhs) {
+              if (rate_mode) {
+                if (lhs.rate != rhs.rate) {
+                  return lhs.rate > rhs.rate;
+                }
+                return lhs.file_number < rhs.file_number;
+              }
               if (lhs.level != rhs.level) {
                 return lhs.level < rhs.level;
               }
               return lhs.file_number < rhs.file_number;
             });
-  table_cache->SetLevelPriority(true);
+  if (!rate_mode) {
+    table_cache->SetLevelPriority(true);
+  }
 
   // Admission is deliberately separated from reader construction, which can
   // be expensive. Re-check the immutable identity and destination level under
@@ -6358,8 +6471,11 @@ Status DBImpl::InstallExternalTableCacheEntries(
         if (!*incoming_current) {
           return Status::OK();
         }
+        // The level argument only picks the insertion priority (HIGH for L0).
+        // Rate mode inserts like a foreground open (no level priority).
         return table_cache->InsertPreparedTableReaderForWarmupNoEvict(
-            winner.file_number, winner.level, table_reader, result);
+            winner.file_number, rate_mode ? 1 : winner.level, table_reader,
+            result);
       };
 
   auto replace_if_current = [&](const Candidate& winner,
@@ -6371,19 +6487,24 @@ Status DBImpl::InstallExternalTableCacheEntries(
     *incoming_current = matches_latest_current_locked(winner, true);
     *victim_current = *incoming_current &&
                       matches_latest_current_locked(victim, false) &&
-                      winner.level < victim.level;
+                      (rate_mode ? winner.rate > victim.rate
+                                 : winner.level < victim.level);
     if (!*victim_current) {
       return Status::OK();
     }
     return table_cache->ReplacePreparedTableReaderForWarmup(
-        victim.file_number, winner.file_number, winner.level, table_reader,
-        result);
+        victim.file_number, winner.file_number,
+        rate_mode ? 1 : winner.level /* priority only, see above */,
+        table_reader, result);
   };
 
   // Existing shallow readers might predate level-aware insertion. Promote
   // winners in place. Keep the CURRENT check atomic with promotion so an
   // obsolete reader cannot be promoted using a stale level.
   for (const Candidate& winner : existing_winners) {
+    if (rate_mode) {
+      break;  // level promotion is level policy; rate mode keeps stock LRU
+    }
     InstrumentedMutexLock lock(&mutex_);
     if (matches_latest_current_locked(winner, false)) {
       table_cache->PromoteFileForCacheWarmup(winner.file_number, winner.level)
@@ -6509,6 +6630,12 @@ Status DBImpl::InstallExternalTableCacheEntries(
       local_stats.received, local_stats.selected, local_stats.installed,
       local_stats.duplicate, local_stats.evicted_existing,
       local_stats.skipped_lower_level, local_stats.failed);
+  if (local_stats.rate_mode != 0) {
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[relink] table-cache warmup rate_mode=1 "
+                   "resident-mean-lookups/s=%.3f",
+                   local_stats.resident_mean_lookups_per_sec);
+  }
   if (stats != nullptr) {
     *stats = local_stats;
   }

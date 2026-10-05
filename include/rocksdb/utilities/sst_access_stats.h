@@ -28,12 +28,15 @@
 // counter. Neither changes what the DB does.
 //
 // Exactness: hits are exact for synchronous Get, MultiGet and iterators.
-// Misses are exact for synchronous Get and iterators; known gaps (none used by
-// the relink cache transfer, which ranks files by hits): an async_io iterator
-// can count one miss twice (the lookup is repeated after TryAgain), a MultiGet
-// with fill_cache=false (non-mmap) does not count its misses, a secondary-cache handle
-// that is still pending counts as a hit, and paranoid_file_checks verification
-// reads and BlockBasedTable::Prefetch count as foreground.
+// Misses are exact for synchronous Get and iterators. Known gaps: an async_io
+// iterator can count one miss twice (the lookup is repeated after TryAgain), a
+// MultiGet with fill_cache=false (non-mmap) does not count its misses, a
+// secondary-cache handle that is still pending counts as a hit, and
+// paranoid_file_checks verification reads and BlockBasedTable::Prefetch count
+// as foreground. The relink block-cache transfer ranks files by hits only; the
+// table-cache install (DBImpl::InstallExternalTableCacheEntries rate mode)
+// ranks readers by hits + misses, so the miss gaps can shift a reader's rate
+// there (none of them occurs in the driver's Get / iterator workloads).
 
 #pragma once
 

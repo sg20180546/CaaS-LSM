@@ -24,8 +24,10 @@
 #include "rocksdb/trace_record_result.h"
 #include "rocksdb/unique_id.h"
 #include "rocksdb/utilities/replayer.h"
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/fault_injection_env.h"
 
@@ -7968,6 +7970,204 @@ TEST_F(DBTest2, RelinkTableCacheWarmupUsesMemoryAndCurrentLevels) {
       &probe_stats));
   ASSERT_EQ(probed, 1);
   ASSERT_EQ(probe_stats.copied, 1);
+
+  destination.reset();
+  ASSERT_OK(DestroyDB(destination_name, destination_options));
+}
+
+TEST_F(DBTest2, RelinkTableCacheWarmupRateModeRanksByLookupRate) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  // The TableCache capacity is max_open_files - 10, so this gives the
+  // destination exactly ten reader slots.
+  options.max_open_files = 20;
+  options.table_cache_numshardbits = 0;
+  BlockBasedTableOptions table_options;
+  // Exercise capture/replay with independently populated metadata block
+  // caches. Reopen retains the source cache, so capture must not silently rely
+  // on a cache hit; the destination gets a distinct cache and missing SST
+  // paths, so replay can succeed only from the transferred table bundle.
+  table_options.block_cache = NewLRUCache(8u << 20, 0);
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.cache_warmup_metadata_transfer = true;
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("source-key", "source-value"));
+  ASSERT_OK(Flush());
+  // Reopen so the next Get constructs an evictable TableReader through
+  // TableCache and records its complete bounded metadata-read plan.
+  Reopen(options);
+  std::string value;
+  ASSERT_OK(db_->Get(ReadOptions(), "source-key", &value));
+  ASSERT_EQ(value, "source-value");
+
+  ColumnFamilyMetaData source_metadata;
+  db_->GetColumnFamilyMetaData(&source_metadata);
+  ASSERT_EQ(source_metadata.file_count, 1);
+  const SstFileMetaData& source_file = source_metadata.levels[0].files[0];
+  ASSERT_EQ(source_file.unique_id.size(), 16);
+  const std::string source_path =
+      source_file.directory + "/" + source_file.relative_filename;
+  TablePropertiesCollection source_properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&source_properties));
+  ASSERT_EQ(source_properties.size(), 1);
+  const auto& source_table_properties = *source_properties.begin()->second;
+
+  constexpr size_t kMaxEntryBytes = 8u << 20;
+  std::vector<TableCacheWarmupSnapshotEntry> snapshots;
+  TableCacheWarmupTransferStats source_stats;
+  ASSERT_OK(db_->SnapshotTableCacheWarmupEntries(
+      db_->DefaultColumnFamily(), {{source_file.file_number, source_path}},
+      kMaxEntryBytes, &snapshots, &source_stats));
+  ASSERT_EQ(source_stats.requested, 1);
+  ASSERT_EQ(source_stats.resident, 1);
+  ASSERT_EQ(source_stats.copied, 1);
+  ASSERT_EQ(snapshots.size(), 1);
+  ASSERT_EQ(snapshots[0].unique_id, source_file.unique_id);
+  ASSERT_FALSE(snapshots[0].ranges.empty());
+
+  // Snapshot byte strings own the resident metadata bundle independently of
+  // the source DB/TableCache. Reopen first, then copy the wire representation
+  // from the aliases to exercise the async migration lifetime boundary.
+  Reopen(options);
+  std::vector<ExternalTableCacheEntry> captured;
+  ExternalTableCacheEntry captured_entry;
+  captured_entry.external_file = snapshots[0].external_file;
+  captured_entry.file_size = snapshots[0].file_size;
+  captured_entry.unique_id = snapshots[0].unique_id;
+  for (const auto& range : snapshots[0].ranges) {
+    ASSERT_NE(range.data, nullptr);
+    captured_entry.ranges.push_back({range.offset, *range.data});
+  }
+  captured.emplace_back(std::move(captured_entry));
+  ASSERT_EQ(captured.size(), 1);
+  ASSERT_FALSE(captured[0].ranges.empty());
+
+  const std::string destination_name =
+      test::PerThreadDBPath(env_, "relink_table_cache_rate_destination");
+  Options destination_options = options;
+  BlockBasedTableOptions destination_table_options = table_options;
+  destination_table_options.block_cache = NewLRUCache(8u << 20, 0);
+  destination_options.table_factory.reset(
+      NewBlockBasedTableFactory(destination_table_options));
+  ASSERT_OK(DestroyDB(destination_name, destination_options));
+  DB* destination_raw = nullptr;
+  ASSERT_OK(
+      DB::Open(destination_options, destination_name, &destination_raw));
+  std::unique_ptr<DB> destination(destination_raw);
+
+  // Register eleven deep files and one L0 file. None of these paths exists. The
+  // metadata-complete registration and warmup must therefore succeed without
+  // opening or reading an SST.
+  std::vector<std::string> external_paths;
+  std::vector<ExternalFileForRegister> registrations;
+  external_paths.reserve(12);
+  registrations.reserve(12);
+  for (size_t i = 0; i < 12; ++i) {
+    external_paths.emplace_back(destination_name + "/missing-external-" +
+                                std::to_string(i) + ".sst");
+    ExternalFileForRegister registration;
+    registration.external_file = external_paths.back();
+    registration.level = i == 0 ? 0 : 6;
+    registration.global_seqno = 100 + i;
+    registration.smallest_user = i == 0 ? "l0" : Key(100 + static_cast<int>(i));
+    registration.largest_user = registration.smallest_user;
+    registration.file_size = captured[0].file_size;
+    registration.unique_id = source_file.unique_id;
+    registration.num_entries = 1;
+    registration.raw_key_size = source_table_properties.raw_key_size;
+    registration.raw_value_size = source_table_properties.raw_value_size;
+    registrations.emplace_back(std::move(registration));
+  }
+  ASSERT_OK(destination->RegisterExternalFilesInPlace(
+      destination->DefaultColumnFamily(), registrations));
+
+  auto warmup_entry = [&](size_t index) {
+    ExternalTableCacheEntry entry = captured[0];
+    entry.external_file = external_paths[index];
+    return entry;
+  };
+
+  // [sst access stats 2026-10-04] Rate mode: every entry carries the source's
+  // lookup rate and this process counts per-SST lookups. Resident readers here
+  // were installed by warmup and never looked up: each ranks by the Jeffreys
+  // posterior 0.5 / age, i.e. at least 0.05/s for any age below 10 s. Incoming
+  // rates of 1e-9/s therefore lose to every resident, 1e9/s beats every one.
+  SetSstAccessStatsCounting(true);
+  Defer counting_off([]() { SetSstAccessStatsCounting(false); });
+  constexpr double kSlow = 1e-9;
+  constexpr double kFast = 1e9;
+  auto rated_entry = [&](size_t index, double lookups_per_sec) {
+    ExternalTableCacheEntry entry = warmup_entry(index);
+    entry.source_lookups_per_sec = lookups_per_sec;
+    return entry;
+  };
+  auto install = [&](std::vector<ExternalTableCacheEntry> batch,
+                     TableCacheWarmupTransferStats* st) {
+    ASSERT_OK(destination->InstallExternalTableCacheEntries(
+        destination->DefaultColumnFamily(), std::move(batch), kMaxEntryBytes,
+        st));
+  };
+
+  // Room for everyone: even slow readers are admitted -- nobody is displaced.
+  std::vector<ExternalTableCacheEntry> first;
+  for (size_t i = 1; i <= 10; ++i) {
+    first.emplace_back(rated_entry(i, kSlow));
+  }
+  TableCacheWarmupTransferStats first_stats;
+  ASSERT_NO_FATAL_FAILURE(install(std::move(first), &first_stats));
+  ASSERT_EQ(first_stats.rate_mode, 1);
+  ASSERT_EQ(first_stats.installed, 10);
+  ASSERT_EQ(first_stats.evicted_existing, 0);
+
+  // The cache is full (10 slots, all L6). A slower L6 reader displaces nobody.
+  std::vector<ExternalTableCacheEntry> slow;
+  slow.emplace_back(rated_entry(11, kSlow));
+  TableCacheWarmupTransferStats slow_stats;
+  ASSERT_NO_FATAL_FAILURE(install(std::move(slow), &slow_stats));
+  ASSERT_EQ(slow_stats.installed, 0);
+  ASSERT_EQ(slow_stats.skipped_lower_level, 1);
+  ASSERT_EQ(slow_stats.evicted_existing, 0);
+
+  // A faster L6 reader replaces the slowest resident -- a victim at the same
+  // level, which the level policy never takes.
+  std::vector<ExternalTableCacheEntry> fast;
+  fast.emplace_back(rated_entry(11, kFast));
+  TableCacheWarmupTransferStats fast_stats;
+  ASSERT_NO_FATAL_FAILURE(install(std::move(fast), &fast_stats));
+  ASSERT_EQ(fast_stats.installed, 1);
+  ASSERT_EQ(fast_stats.evicted_existing, 1);
+
+  // Activation needs BOTH conditions. (i) One unrated entry in the batch: the
+  // level policy runs, and the unrated L0 file displaces an L6 reader.
+  std::vector<ExternalTableCacheEntry> mixed;
+  mixed.emplace_back(warmup_entry(0));          // L0, unrated
+  mixed.emplace_back(rated_entry(11, kFast));   // already resident
+  TableCacheWarmupTransferStats mixed_stats;
+  ASSERT_NO_FATAL_FAILURE(install(std::move(mixed), &mixed_stats));
+  ASSERT_EQ(mixed_stats.rate_mode, 0);
+  ASSERT_EQ(mixed_stats.installed, 1);
+  ASSERT_EQ(mixed_stats.evicted_existing, 1);
+  ASSERT_EQ(mixed_stats.duplicate, 1);
+
+  // (ii) Counting off: rated entries still run the level policy, under which
+  // an L6 reader cannot displace the full cache's residents.
+  SetSstAccessStatsCounting(false);
+  ColumnFamilyMetaData metadata;
+  destination->GetColumnFamilyMetaData(&metadata);
+  ASSERT_EQ(metadata.levels[6].files.size(), 11);
+  std::vector<ExternalTableCacheEntry> rated_off;
+  for (size_t i = 1; i <= 11; ++i) {
+    rated_off.emplace_back(rated_entry(i, kFast));
+  }
+  TableCacheWarmupTransferStats rated_off_stats;
+  ASSERT_NO_FATAL_FAILURE(install(std::move(rated_off), &rated_off_stats));
+  ASSERT_EQ(rated_off_stats.rate_mode, 0);
+  ASSERT_EQ(rated_off_stats.installed, 0);
+  ASSERT_EQ(rated_off_stats.evicted_existing, 0);
+  ASSERT_EQ(rated_off_stats.duplicate + rated_off_stats.skipped_lower_level, 11);
 
   destination.reset();
   ASSERT_OK(DestroyDB(destination_name, destination_options));
