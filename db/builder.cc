@@ -42,6 +42,7 @@
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
+#include "util/sst_creation_trace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -76,6 +77,9 @@ Status BuildTable(
     BlobFileCompletionCallback* blob_callback, uint64_t* num_input_entries,
     uint64_t* memtable_payload_bytes, uint64_t* memtable_garbage_bytes,
     std::vector<FileMetaData>* extra_metas) {
+  sst_creation_trace::Scope creation_scope(
+      tboptions.reason == TableFileCreationReason::kFlush
+          ? "flush" : "build_table_other", job_id);
   assert((tboptions.column_family_id ==
           TablePropertiesCollectorFactory::Context::kUnknownColumnFamily) ==
          tboptions.column_family_name.empty());
@@ -191,6 +195,7 @@ Status BuildTable(
         *io_status = io_s;
       }
       if (!open_s.ok()) {
+        sst_creation_trace::BuildResult(fname, 0, false, true);
         return open_s;
       }
       table_file_created = true;
@@ -231,6 +236,7 @@ Status BuildTable(
           tboptions.column_family_name, fname, job_id, meta->fd,
           kInvalidBlobFileNumber, tp, tboptions.reason, s, file_checksum,
           file_checksum_func_name);
+      creation_scope.SetResult(false);
       return s;
     }
 
@@ -386,6 +392,7 @@ Status BuildTable(
           }
         }
       }
+      sst_creation_trace::BuildResult(fname, m->fd.GetFileSize(), s.ok(), empty);
     };
 
     // Allocate the next output file's metadata, copying the per-flush fields
@@ -603,6 +610,7 @@ Status BuildTable(
       tboptions.reason, status_for_listener, file_checksum,
       file_checksum_func_name);
 
+  creation_scope.SetResult(s.ok());
   return s;
 }
 
