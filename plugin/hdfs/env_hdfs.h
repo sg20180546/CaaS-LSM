@@ -17,6 +17,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/status.h"
+#include "plugin/hdfs/storage_cp_publication.h"
 
 // [relink/Storage-CP] Forward-declare the generated gRPC client stub so this
 // header does not need to pull in the generated proto headers. The concrete
@@ -109,12 +110,17 @@ class HdfsFileSystem : public FileSystemWrapper {
   // via StorageCpNotifyLink() at the moment the reference is installed, so the
   // increment cannot be lost by building the migration driver without gRPC
   // (the 2026-08-08 dangling-reference bug). No-op when Storage-CP is disabled.
-  void NotifyRelinkLink(const std::string& path) const;
+  Status NotifyRelinkLink(const std::string& path) const;
   // [batch 2026-09-09] Same claim for N paths in ONE RPC (NotifyLinkBatch) —
   // the per-file loop was the last O(#files) term in relink's stop window.
-  // Falls back to N NotifyRelinkLink calls when the CP predates the RPC
-  // (UNIMPLEMENTED). No-op when Storage-CP is disabled.
-  void NotifyRelinkLinkBatch(const std::vector<std::string>& paths) const;
+  // Durable, idempotent batch ACK required before MANIFEST. No-op when disabled.
+  Status NotifyRelinkLinkBatch(const std::vector<std::string>& paths) const;
+  Status PrepareOutputs(const std::vector<std::string>& paths) const;
+  Status AbortOutputs(const std::vector<std::string>& paths) const;
+  Status RecoverReferences(const std::vector<std::string>& paths) const;
+  Status TrackUnpublishedOutput(const std::string& path) const;
+  void MarkOutputsPublished(const std::vector<std::string>& paths) const;
+  void PreserveOutputs(const std::vector<std::string>& paths) const;
 
   IOStatus IsDirectory(const std::string& /*path*/,
                        const IOOptions& /*options*/, bool* /*is_dir*/,
@@ -140,17 +146,12 @@ class HdfsFileSystem : public FileSystemWrapper {
   // Shard id from getenv("STORAGE_CP_SHARD") (default 0); cached at init.
   mutable uint32_t storage_cp_shard_ = 0;
 
-  // [multi-mig 2026-08-26] SST paths whose delete the Storage-CP proxied as
-  // "OK but keep the bytes" (another shard still references them). A later
-  // forced full scan can re-collect such still-present files as garbage and
-  // would burn another shard's refcount with a second RequestDelete — repeats
-  // from this process are short-circuited to OK instead. In-process only; the
-  // CP's (path, shard) dup guard remains the authoritative layer. Entries are
-  // erased if the same path is ever re-created (NewWritableFile / rename
-  // target), though MANIFEST-monotonic file numbers make that near-impossible
-  // within one DB lifetime.
-  mutable std::mutex released_paths_mu_;
-  mutable std::unordered_set<std::string> released_paths_;
+  mutable storage_cp::PublicationTracker publication_;
+
+  // Batched operations are idempotent, have a bounded deadline, and retry
+  // only transport errors. No fallback to pre-publication-protocol servers.
+  Status CallStorageBatch(const char* operation,
+                         const std::vector<std::string>& paths) const;
 
   // Returns the opaque client iff Storage-CP is enabled, else nullptr.
   // Performs the one-time lazy init (reads STORAGE_CP_ADDR / STORAGE_CP_SHARD,

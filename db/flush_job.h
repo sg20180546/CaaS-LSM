@@ -87,6 +87,10 @@ class FlushJob {
              FileMetaData* file_meta = nullptr,
              bool* switched_to_mempurge = nullptr);
   void Cancel();
+  // Requires db_mutex_. Releases it while asking the CP to abort outputs that
+  // are known not to have been submitted to MANIFEST. Used by atomic flush when
+  // another CF fails or the group is cancelled before installation.
+  void AbortUnpublishedOutputs();
   const autovector<MemTable*>& GetMemTables() const { return mems_; }
 
 #ifndef ROCKSDB_LITE
@@ -102,6 +106,8 @@ class FlushJob {
   void ReportFlushInputSize(const autovector<MemTable*>& mems);
   void RecordFlushIOStats();
   Status WriteLevel0Table();
+
+  std::vector<std::string> storage_cp_output_paths_;
 
   // [BucketLSM C2 — G5 only, gated parallel_split_flush && l0_bucket_count>1]
   // Parallel BucketFlush: build this flush's N bucket-pure L0 SST files

@@ -44,6 +44,7 @@
 #include "options/configurable_helper.h"
 #include "options/options_helper.h"
 #include "port/port.h"
+#include "plugin/hdfs/storage_cp_hook.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
@@ -804,6 +805,37 @@ Status CompactionJob::Run() {
   RecordCompactionIOStats();
   LogFlush(db_options_.info_log);
   TEST_SYNC_POINT("CompactionJob::Run():End");
+
+  // All remote outputs have their final CN names, and every subcompaction has
+  // finished verification. Run() executes outside db_mutex_: require ownership
+  // ACK before Install() can make these files reachable through the MANIFEST.
+  storage_cp_output_paths_.clear();
+  for (const auto& state : compact_->sub_compact_states) {
+    for (const auto& output : state.GetOutputs()) {
+      storage_cp_output_paths_.push_back(TableFileName(
+          state.compaction->immutable_options()->cf_paths,
+          output.meta.fd.GetNumber(), output.meta.fd.GetPathId()));
+    }
+  }
+  if (status.ok()) {
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::StorageCpPrepare:Paths",
+                             &storage_cp_output_paths_);
+    status = StorageCpPrepareOutputs(fs_.get(), storage_cp_output_paths_);
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::StorageCpPrepare:Status", &status);
+  }
+  if (!status.ok()) {
+    // No MANIFEST attempt has happened. This also handles a partially applied
+    // ownership batch whose ACK was lost. Abort is idempotent and CP-owned.
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::StorageCpAbort:Paths",
+                             &storage_cp_output_paths_);
+    Status abort_status =
+        StorageCpAbortOutputs(fs_.get(), storage_cp_output_paths_);
+    if (!abort_status.ok()) {
+      ROCKS_LOG_WARN(db_options_.info_log,
+                     "[JOB %d] Ownership output abort failed: %s", job_id_,
+                     abort_status.ToString().c_str());
+    }
+  }
 
   compact_->status = status;
   return status;
@@ -1728,9 +1760,22 @@ Status CompactionJob::InstallCompactionResults(
     }
   }
 
-  return versions_->LogAndApply(compaction->column_family_data(),
-                                mutable_cf_options, edit, db_mutex_,
-                                db_directory_);
+  Status status = versions_->LogAndApply(compaction->column_family_data(),
+                                         mutable_cf_options, edit, db_mutex_,
+                                         db_directory_);
+  if (status.ok() && !compaction->column_family_data()->IsDropped()) {
+    StorageCpMarkOutputsPublished(fs_.get(), storage_cp_output_paths_);
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::StorageCpPublished:Paths",
+                             &storage_cp_output_paths_);
+  } else {
+    // A failed MANIFEST append/sync can still be durable. Do not release its
+    // outputs during the subsequent obsolete-file scan; recovery must decide.
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(),
+                                              storage_cp_output_paths_);
+    TEST_SYNC_POINT_CALLBACK("CompactionJob::StorageCpPreserved:Paths",
+                             &storage_cp_output_paths_);
+  }
+  return status;
 }
 
 void CompactionJob::RecordCompactionIOStats() {

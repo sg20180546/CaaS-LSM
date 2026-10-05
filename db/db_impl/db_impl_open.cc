@@ -25,6 +25,9 @@
 #include "rocksdb/wal_filter.h"
 #include "test_util/sync_point.h"
 #include "util/rate_limiter.h"
+#ifdef HDFS
+#include "plugin/hdfs/storage_cp_hook.h"
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 Options SanitizeOptions(const std::string& dbname, const Options& src,
@@ -536,6 +539,34 @@ Status DBImpl::Recover(
   if (!s.ok()) {
     return s;
   }
+#ifdef HDFS
+  if (!read_only) {
+    // A recovered MANIFEST is authoritative about references, but absence from
+    // it does not establish that another CN/CSA has stopped producing a file.
+    // Validate durable CP ownership before any WAL replay or obsolete-file
+    // purge. Never recreate unknown CP entries or sweep orphan directories here:
+    // HDFS LockFile currently provides no exclusive producer fence.
+    std::vector<LiveFileMetaData> live_metadata;
+    versions_->GetLiveFilesMetaData(&live_metadata);
+    std::vector<std::string> live_paths;
+    live_paths.reserve(live_metadata.size());
+    for (const auto& file : live_metadata) {
+      live_paths.push_back(file.external_path.empty()
+          ? file.directory + "/" + file.relative_filename
+          : file.external_path);
+    }
+    std::sort(live_paths.begin(), live_paths.end());
+    live_paths.erase(std::unique(live_paths.begin(), live_paths.end()),
+                     live_paths.end());
+    mutex_.Unlock();
+    TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpRecover:Paths", &live_paths);
+    s = StorageCpRecoverReferences(fs_.get(), live_paths);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpRecover:Status", &s);
+    if (s.ok()) StorageCpMarkOutputsPublished(fs_.get(), live_paths);
+    mutex_.Lock();
+    if (!s.ok()) return s;
+  }
+#endif
   s = SetupDBId(read_only, recovery_ctx);
   ROCKS_LOG_INFO(immutable_db_options_.info_log, "DB ID: %s\n", db_id_.c_str());
   if (s.ok() && !read_only) {
@@ -829,9 +860,51 @@ Status DBImpl::InitPersistStatsColumnFamily() {
 Status DBImpl::LogAndApplyForRecovery(const RecoveryContext& recovery_ctx) {
   mutex_.AssertHeld();
   assert(versions_->descriptor_log_ == nullptr);
+#ifdef HDFS
+  // WAL replay can create new SSTs too. Prepare every final output as one
+  // batch before the recovery MANIFEST edit, outside the DB mutex.
+  std::vector<std::string> output_paths;
+  for (size_t i = 0; i < recovery_ctx.edit_lists_.size(); ++i) {
+    const auto& paths = recovery_ctx.cfds_[i]->ioptions()->cf_paths;
+    for (const auto* edit : recovery_ctx.edit_lists_[i]) {
+      for (const auto& addition : edit->GetNewFiles()) {
+        const auto& fd = addition.second.fd;
+        output_paths.push_back(fd.external_path.empty()
+            ? TableFileName(paths, fd.GetNumber(), fd.GetPathId())
+            : fd.external_path);
+      }
+    }
+  }
+  std::sort(output_paths.begin(), output_paths.end());
+  output_paths.erase(std::unique(output_paths.begin(), output_paths.end()),
+                     output_paths.end());
+  mutex_.Unlock();
+  TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpPrepare:Paths", &output_paths);
+  Status prepare = StorageCpPrepareOutputs(fs_.get(), output_paths);
+  TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpPrepare:Status", &prepare);
+  if (!prepare.ok()) {
+    // The MANIFEST has not been attempted. The CP abort fences even a Prepare
+    // whose ACK was lost, so a later retry cannot resurrect a discarded path.
+    TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpAbort:Paths", &output_paths);
+    StorageCpAbortOutputs(fs_.get(), output_paths).PermitUncheckedError();
+  }
+  mutex_.Lock();
+  if (!prepare.ok()) return prepare;
+#endif
   Status s = versions_->LogAndApply(
       recovery_ctx.cfds_, recovery_ctx.mutable_cf_opts_,
       recovery_ctx.edit_lists_, &mutex_, directories_.GetDbDir());
+#ifdef HDFS
+  if (s.ok()) {
+    StorageCpMarkOutputsPublished(fs_.get(), output_paths);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpPublished:Paths", &output_paths);
+  } else {
+    // A failed MANIFEST sync can still have persisted the edit. Recovery or
+    // explicit offline maintenance must resolve this; never release it here.
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), output_paths);
+    TEST_SYNC_POINT_CALLBACK("DBImpl::Recovery:StorageCpPreserved:Paths", &output_paths);
+  }
+#endif
   if (s.ok() && !(recovery_ctx.files_to_delete_.empty())) {
     mutex_.Unlock();
     for (const auto& fname : recovery_ctx.files_to_delete_) {

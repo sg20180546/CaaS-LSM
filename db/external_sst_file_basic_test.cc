@@ -238,6 +238,74 @@ TEST_F(ExternalSSTFileBasicTest, Basic) {
   DestroyAndRecreateExternalSSTFilesDir();
 }
 
+TEST_F(ExternalSSTFileBasicTest, OwnershipAckRequiredBeforeIngestManifest) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const std::string source = sst_files_dir_ + "ownership.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(source));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+  std::vector<std::string> prepared, aborted;
+  size_t published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPrepare:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPrepare:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("lost own ACK");
+  });
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpAbort:Paths", [&](void* arg) {
+    aborted = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_NOK(db_->IngestExternalFile({source}, IngestExternalFileOptions()));
+  sync->DisableProcessing();
+  ASSERT_EQ(1U, prepared.size());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  ASSERT_EQ("NOT_FOUND", Get("key"));
+  ASSERT_OK(env_->FileExists(source));
+  ASSERT_OK(db_->IngestExternalFile({source}, IngestExternalFileOptions()));
+  ASSERT_EQ("value", Get("key"));
+}
+
+TEST_F(ExternalSSTFileBasicTest, OwnershipIngestManifestErrorPreservesOutputs) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  const std::string source = sst_files_dir_ + "ownership-uncertain.sst";
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(source));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+  std::vector<std::string> prepared, preserved;
+  size_t aborted = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPrepare:Paths", [&](void* arg) {
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest", [](void* arg) {
+    *static_cast<IOStatus*>(arg) = IOStatus::IOError("uncertain MANIFEST sync");
+  });
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPreserved:Paths", [&](void* arg) {
+    preserved = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpAbort:Paths", [&](void*) { ++aborted; });
+  sync->EnableProcessing();
+  ASSERT_NOK(db_->IngestExternalFile({source}, IngestExternalFileOptions()));
+  sync->DisableProcessing();
+  ASSERT_EQ(1U, prepared.size());
+  ASSERT_EQ(prepared, preserved);
+  ASSERT_EQ(0U, aborted);
+}
+
 class ChecksumVerifyHelper {
  private:
   Options options_;

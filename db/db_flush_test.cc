@@ -9,6 +9,10 @@
 
 #include <atomic>
 #include <limits>
+#include <map>
+#include <mutex>
+#include <set>
+#include <thread>
 
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
@@ -46,6 +50,346 @@ class DBAtomicFlushTest : public DBFlushTest,
  public:
   DBAtomicFlushTest() : DBFlushTest() {}
 };
+
+#ifndef ROCKSDB_LITE
+#ifdef HDFS
+TEST_F(DBFlushTest, OwnershipRecoveryMissingOwnerPreventsOpen) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "persisted"));
+  ASSERT_OK(Flush());
+  Close();
+  std::vector<std::string> recovered;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("DBImpl::Recovery:StorageCpRecover:Paths", [&](void* arg) {
+    recovered = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpRecover:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("missing durable CP owner");
+  });
+  sync->EnableProcessing();
+  ASSERT_NOK(TryReopen(options));
+  sync->DisableProcessing();
+  ASSERT_EQ(1U, recovered.size());
+  ASSERT_OK(env_->FileExists(recovered.front()));
+  Reopen(options);
+  ASSERT_EQ("persisted", Get("key"));
+}
+
+TEST_F(DBFlushTest, OwnershipRecoveryWalOwnFailurePreventsManifest) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+  ASSERT_OK(Put("key", "wal-value"));
+  Close();
+  std::vector<std::string> prepared, aborted;
+  size_t published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("DBImpl::Recovery:StorageCpPrepare:Paths", [&](void* arg) {
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpPrepare:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("lost ownership ACK");
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpAbort:Paths", [&](void* arg) {
+    aborted = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpPublished:Paths", [&](void*) { ++published; });
+  sync->EnableProcessing();
+  ASSERT_NOK(TryReopen(options));
+  sync->DisableProcessing();
+  ASSERT_FALSE(prepared.empty());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  Reopen(options);
+  ASSERT_EQ("wal-value", Get("key"));
+}
+
+TEST_F(DBFlushTest, OwnershipRecoveryManifestErrorPreservesWalOutputs) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.avoid_flush_during_recovery = false;
+  Reopen(options);
+  ASSERT_OK(Put("key", "wal-value"));
+  Close();
+  std::vector<std::string> prepared, preserved;
+  size_t aborted = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("DBImpl::Recovery:StorageCpPrepare:Paths", [&](void* arg) {
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest", [](void* arg) {
+    *static_cast<IOStatus*>(arg) = IOStatus::IOError("uncertain MANIFEST sync");
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpPreserved:Paths", [&](void* arg) {
+    preserved = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("DBImpl::Recovery:StorageCpAbort:Paths", [&](void*) { ++aborted; });
+  sync->EnableProcessing();
+  ASSERT_NOK(TryReopen(options));
+  sync->DisableProcessing();
+  ASSERT_FALSE(prepared.empty());
+  ASSERT_EQ(prepared, preserved);
+  ASSERT_EQ(0U, aborted);
+  for (const auto& path : preserved) ASSERT_OK(env_->FileExists(path));
+  Reopen(options);
+  ASSERT_EQ("wal-value", Get("key"));
+}
+#endif  // HDFS
+
+TEST_F(DBFlushTest, OwnershipFlushAckFailurePreventsManifest) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  std::vector<std::string> prepared, aborted;
+  size_t published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Paths", [&](void* arg) {
+    // Both prepare and abort must execute without the DB mutex held.
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("injected own ACK failure");
+  });
+  sync->SetCallBack("FlushJob::StorageCpAbort:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    aborted = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("MemTableList::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_OK(Put("key", "value"));
+  ASSERT_NOK(Flush());
+  ASSERT_NOK(dbfull()->TEST_WaitForCompact());
+  sync->DisableProcessing();
+  ASSERT_EQ(1U, prepared.size());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  ASSERT_EQ(0, TotalTableFiles());
+  ASSERT_EQ("value", Get("key"));
+}
+
+TEST_F(DBFlushTest, OwnershipConcurrentFlushTracksActualCommitter) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_background_flushes = 2;
+  Reopen(options);
+  std::mutex observed_mu;
+  std::map<std::string, std::thread::id> prepared, published;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Paths", [&](void* arg) {
+    std::lock_guard<std::mutex> lock(observed_mu);
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      prepared[path] = std::this_thread::get_id();
+    }
+  });
+  sync->SetCallBack("MemTableList::StorageCpPublished:Paths", [&](void* arg) {
+    std::lock_guard<std::mutex> lock(observed_mu);
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      ASSERT_EQ(1U, prepared.count(path));
+      published[path] = std::this_thread::get_id();
+    }
+  });
+  sync->LoadDependency(
+      {{"VersionSet::LogAndApply:WriteManifest", "OwnershipConcurrent:First"},
+       {"MemTableList::TryInstallMemtableFlushResults:InProgress",
+        "VersionSet::LogAndApply:WriteManifestDone"}});
+  sync->EnableProcessing();
+  FlushOptions no_wait;
+  no_wait.wait = false;
+  no_wait.allow_write_stall = true;
+  ASSERT_OK(Put("first", "value"));
+  ASSERT_OK(db_->Flush(no_wait));
+  TEST_SYNC_POINT("OwnershipConcurrent:First");
+  ASSERT_OK(Put("second", "value"));
+  ASSERT_OK(db_->Flush(no_wait));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  sync->DisableProcessing();
+  ASSERT_EQ(2U, prepared.size());
+  ASSERT_EQ(prepared.size(), published.size());
+  bool different_committer = false;
+  for (const auto& entry : prepared) {
+    ASSERT_EQ(1U, published.count(entry.first));
+    different_committer |= entry.second != published.at(entry.first);
+  }
+  ASSERT_TRUE(different_committer);
+  ASSERT_EQ(2, TotalTableFiles());
+}
+
+TEST_F(DBFlushTest, OwnershipAtomicFlushAbortsWholeUncommittedGroup) {
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"other"}, options);
+  std::set<std::string> prepared, aborted;
+  size_t attempts = 0, published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Paths", [&](void* arg) {
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      prepared.insert(path);
+    }
+  });
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Status", [&](void* arg) {
+    if (++attempts == 2) {
+      *static_cast<Status*>(arg) = Status::IOError("second CF own failed");
+    }
+  });
+  sync->SetCallBack("FlushJob::StorageCpAbort:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      aborted.insert(path);
+    }
+  });
+  sync->SetCallBack("MemTableList::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_OK(Put(0, "key", "first"));
+  ASSERT_OK(Put(1, "key", "second"));
+  ASSERT_NOK(db_->Flush(FlushOptions(), handles_));
+  ASSERT_NOK(dbfull()->TEST_WaitForCompact());
+  sync->DisableProcessing();
+  ASSERT_EQ(2U, prepared.size());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  ASSERT_EQ(0, TotalTableFiles(0));
+  ASSERT_EQ(0, TotalTableFiles(1));
+}
+
+TEST_F(DBFlushTest, OwnershipAtomicManifestErrorPreservesAllOutputs) {
+  Options options = CurrentOptions();
+  options.atomic_flush = true;
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"other"}, options);
+  std::set<std::string> prepared, preserved;
+  size_t aborted = 0, published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("FlushJob::StorageCpPrepare:Paths", [&](void* arg) {
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      prepared.insert(path);
+    }
+  });
+  // Inject after the actual sync: a non-OK return does not prove the MANIFEST
+  // edit is absent from durable storage.
+  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest",
+                    [](void* arg) {
+    *static_cast<IOStatus*>(arg) = IOStatus::IOError("ambiguous MANIFEST sync");
+  });
+  sync->SetCallBack("MemTableList::StorageCpPreserved:Paths", [&](void* arg) {
+    for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
+      preserved.insert(path);
+    }
+  });
+  sync->SetCallBack("FlushJob::StorageCpAbort:Paths", [&](void*) { ++aborted; });
+  sync->SetCallBack("MemTableList::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_OK(Put(0, "key", "first"));
+  ASSERT_OK(Put(1, "key", "second"));
+  ASSERT_NOK(db_->Flush(FlushOptions(), handles_));
+  ASSERT_NOK(dbfull()->TEST_WaitForCompact());
+  sync->DisableProcessing();
+  ASSERT_EQ(2U, prepared.size());
+  ASSERT_EQ(prepared, preserved);
+  ASSERT_EQ(0U, aborted);
+  ASSERT_EQ(0U, published);
+}
+
+TEST_F(DBFlushTest, OwnershipCompactionAckFailureKeepsInputVersion) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "first"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "second"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  ASSERT_EQ(2U, inputs.size());
+  std::vector<std::string> prepared, aborted;
+  size_t published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("CompactionJob::StorageCpPrepare:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("CompactionJob::StorageCpPrepare:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("injected own ACK failure");
+  });
+  sync->SetCallBack("CompactionJob::StorageCpAbort:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    aborted = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("CompactionJob::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_NOK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+  sync->DisableProcessing();
+  ASSERT_FALSE(prepared.empty());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  ASSERT_EQ(2, NumTableFilesAtLevel(0));
+  ASSERT_EQ(0, NumTableFilesAtLevel(1));
+  ASSERT_EQ("second", Get("key"));
+}
+
+TEST_F(DBFlushTest, OwnershipCompactionManifestErrorPreservesOutputs) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  Reopen(options);
+  ASSERT_OK(Put("key", "first"));
+  ASSERT_OK(Flush());
+  ASSERT_OK(Put("key", "second"));
+  ASSERT_OK(Flush());
+  ColumnFamilyMetaData metadata;
+  db_->GetColumnFamilyMetaData(&metadata);
+  std::vector<std::string> inputs;
+  for (const auto& file : metadata.levels[0].files) {
+    inputs.push_back(file.name);
+  }
+  std::vector<std::string> prepared, preserved;
+  size_t aborted = 0, published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("CompactionJob::StorageCpPrepare:Paths", [&](void* arg) {
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest",
+                    [](void* arg) {
+    *static_cast<IOStatus*>(arg) = IOStatus::IOError("ambiguous MANIFEST sync");
+  });
+  sync->SetCallBack("CompactionJob::StorageCpPreserved:Paths", [&](void* arg) {
+    preserved = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("CompactionJob::StorageCpAbort:Paths", [&](void*) {
+    ++aborted;
+  });
+  sync->SetCallBack("CompactionJob::StorageCpPublished:Paths", [&](void*) {
+    ++published;
+  });
+  sync->EnableProcessing();
+  ASSERT_NOK(db_->CompactFiles(CompactionOptions(), inputs, 1));
+  sync->DisableProcessing();
+  ASSERT_FALSE(prepared.empty());
+  ASSERT_EQ(prepared, preserved);
+  ASSERT_EQ(0U, aborted);
+  ASSERT_EQ(0U, published);
+}
+#endif  // ROCKSDB_LITE
 
 // We had issue when two background threads trying to flush at the same time,
 // only one of them get committed. The test verifies the issue is fixed.

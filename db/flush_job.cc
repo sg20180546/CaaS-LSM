@@ -34,6 +34,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
+#include "plugin/hdfs/storage_cp_hook.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/statistics.h"
@@ -293,6 +294,9 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   }
 
   if (!s.ok()) {
+    // WriteLevel0Table can succeed before a concurrent drop/shutdown is seen.
+    // No flush edit has been offered to another committing thread yet.
+    AbortUnpublishedOutputs();
     cfd_->imm()->RollbackMemtableFlush(mems_, meta_.fd.GetNumber());
   } else if (write_manifest_) {
     TEST_SYNC_POINT("FlushJob::InstallResults");
@@ -1100,6 +1104,25 @@ Status FlushJob::BuildBucketTablesParallel(
   return Status::OK();
 }
 
+void FlushJob::AbortUnpublishedOutputs() {
+  db_mutex_->AssertHeld();
+  if (storage_cp_output_paths_.empty()) {
+    return;
+  }
+  db_mutex_->Unlock();
+  TEST_SYNC_POINT_CALLBACK("FlushJob::StorageCpAbort:Paths",
+                           &storage_cp_output_paths_);
+  Status s = StorageCpAbortOutputs(db_options_.fs.get(),
+                                    storage_cp_output_paths_);
+  if (!s.ok()) {
+    ROCKS_LOG_WARN(db_options_.info_log,
+                   "[JOB %d] Ownership flush abort failed: %s",
+                   job_context_->job_id, s.ToString().c_str());
+  }
+  storage_cp_output_paths_.clear();
+  db_mutex_->Lock();
+}
+
 Status FlushJob::WriteLevel0Table() {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_FLUSH_WRITE_L0);
@@ -1328,6 +1351,27 @@ Status FlushJob::WriteLevel0Table() {
       s = output_file_directory_->FsyncWithDirOptions(
           IOOptions(), nullptr,
           DirFsyncOptions(DirFsyncOptions::FsyncReason::kNewFileSynced));
+    }
+    // Include every bucket output in the same ownership batch. This must
+    // precede both reacquiring db_mutex_ and exposing flush_completed_: another
+    // flush thread may write this job's edit into the MANIFEST.
+    storage_cp_output_paths_.clear();
+    if (meta_.fd.GetFileSize() > 0) {
+      storage_cp_output_paths_.push_back(TableFileName(
+          cfd_->ioptions()->cf_paths, meta_.fd.GetNumber(), meta_.fd.GetPathId()));
+    }
+    for (const auto& meta : extra_metas_) {
+      if (meta.fd.GetFileSize() > 0) {
+        storage_cp_output_paths_.push_back(TableFileName(
+            cfd_->ioptions()->cf_paths, meta.fd.GetNumber(), meta.fd.GetPathId()));
+      }
+    }
+    if (s.ok()) {
+      TEST_SYNC_POINT_CALLBACK("FlushJob::StorageCpPrepare:Paths",
+                               &storage_cp_output_paths_);
+      s = StorageCpPrepareOutputs(db_options_.fs.get(),
+                                    storage_cp_output_paths_);
+      TEST_SYNC_POINT_CALLBACK("FlushJob::StorageCpPrepare:Status", &s);
     }
     TEST_SYNC_POINT_CALLBACK("FlushJob::WriteLevel0Table", &mems_);
     db_mutex_->Lock();

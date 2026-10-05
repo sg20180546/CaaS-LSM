@@ -17,6 +17,7 @@
 #include <chrono>  // [heartbeat] steady_clock for per-task liveness timestamps
 #include <vector>
 #include "hdfs.h"  // [relink/Storage-CP] libhdfs C API: the CP now owns the physical SST delete
+#include "storage_ownership_registry.h"
 
 ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
 std::unordered_map<uint64_t, compactionservice::AddTaskArgs> task_args_map_;
@@ -67,30 +68,10 @@ std::priority_queue<uint64_t, std::vector<uint64_t>, TaskCmp>
 std::mutex monitor_latch_;
 std::mutex scheduler_latch_;
 
-// [relink/Storage-CP] Per-file refcount over shared SSTs on HDFS.
-// path(bare HDFS path, e.g. /kg/s0/000123.sst) -> {count, owning shard ids}.
-// Eager: NotifyCreate(=1)/NotifyLink(++)/RequestDelete(--). When refcount reaches 0 no live
-// shard references the file anymore, so the CP (which now links libhdfs) OWNS the physical
-// delete: RequestDelete queues the path on storage_pending_delete_ and the periodic GC thread
-// (RunStorageGC, every STORAGE_GC_INTERVAL_S, default 60s) batch-hdfsDeletes it; the CN never
-// hdfsDeletes a tracked file. refcount==0 is definitive (every reference released => no live
-// MANIFEST points at it), so the batch delete needs NO MANIFEST scan. A MANIFEST mark-sweep is
-// only a *future* backstop for files leaked by a lost RequestDelete (CN crash), out of scope here.
-struct RefEntry {
-  int count = 0;
-  std::set<uint32_t> owners;
-  // [multi-mig 2026-08-25] shards whose RequestDelete already decremented this entry.
-  // Guards against the same shard double-decrementing (see RequestDelete).
-  std::set<uint32_t> deleted_by;
-};
-std::unordered_map<std::string, RefEntry> storage_refcount_map_;
-std::vector<std::string> storage_pending_delete_;  // refcount-0 paths awaiting the CP's batch hdfsDelete
-std::mutex storage_latch_;                          // guards storage_refcount_map_ + storage_pending_delete_
-// [diag 2026-08-08] Deletes requested for a path the CP never saw created. Any
-// non-zero value means the refcount is not fully armed (a NotifyCreate is being
-// lost), which is the precondition for the relink dangling-reference bug — so
-// it is reported every GC tick and a relink run should be gated on it staying 0.
-uint64_t storage_untracked_deletes_ = 0;  // guarded by storage_latch_
+// Initialized and replayed before the server starts accepting Storage RPCs.
+// Remote-compaction-only baselines may leave this disabled; Storage handlers
+// then fail closed instead of silently creating a volatile reference table.
+std::unique_ptr<ownership_cp::Registry> storage_registry_;
 
 class ProCPImpl final : public compactionservice::ProCPService::Service {
  public:
@@ -212,161 +193,136 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
 };
 
 // [relink/Storage-CP] Distributed refcount registry for shared SSTs on HDFS.
-// CN/CSA notify the CP when a shared (aligned/relinked) .sst is physically
-// created or logically linked into another shard, and ask the CP before
-// deleting one. The CP owns the authoritative refcount keyed by full HDFS URI;
-// it never touches HDFS itself this milestone -- the CN performs the actual
-// hdfsDelete iff RequestDelete returns deleted=true (refcount reached 0).
-// ISOLATION: this service only ever runs for files registered via these RPCs.
-// When the relink feature is disabled, FileDescriptor::external_path is empty,
-// CN/CSA never call NotifyCreate/NotifyLink/RequestDelete, storage_refcount_map_
-// stays empty, and librocksdb/serverclient behavior is bit-identical to today.
+// Storage publication is acknowledged only after durable ownership journaling.
+// Every final path has one immutable birth; logical links add references.
+// Physical deletion is exclusively performed by the CP after a durable claim.
+template <typename Function>
+grpc::Status StorageCall(Function function) {
+  if (!storage_registry_) {
+    return grpc::Status(grpc::StatusCode::FAILED_PRECONDITION,
+                        "durable ownership disabled: set STORAGE_CP_STATE_DIR");
+  }
+  try {
+    function(*storage_registry_);
+    return grpc::Status::OK;
+  } catch (const ownership_cp::Error& error) {
+    grpc::StatusCode code = grpc::StatusCode::FAILED_PRECONDITION;
+    if (error.code() == ownership_cp::ErrorCode::InvalidArgument) code = grpc::StatusCode::INVALID_ARGUMENT;
+    else if (error.code() == ownership_cp::ErrorCode::IOError) code = grpc::StatusCode::UNAVAILABLE;
+    else if (error.code() == ownership_cp::ErrorCode::Corruption) code = grpc::StatusCode::DATA_LOSS;
+    std::cerr << GetTime() << "[storage] RPC rejected: " << error.what() << std::endl;
+    return grpc::Status(code, error.what());
+  } catch (const std::exception& error) {
+    std::cerr << GetTime() << "[storage] RPC failed: " << error.what() << std::endl;
+    return grpc::Status(grpc::StatusCode::INTERNAL, error.what());
+  }
+}
+
+std::vector<std::string> StoragePaths(const compactionservice::FileRefBatch& request) {
+  return std::vector<std::string>(request.path().begin(), request.path().end());
+}
+
 class StorageImpl final : public compactionservice::StorageService::Service {
  public:
-  // A new physical reference to a shared SST. PLAIN COUNT (++), NOT keyed by
-  // owner identity: with remote compaction the CSA (one shard_id) CREATES the
-  // aligned SST while the CN (a different shard_id) later DELETEs it, so gating
-  // the count on owner-set membership would miss the decrement. owners is kept
-  // for debug only. One NewWritableFile => one NotifyCreate per file.
-  grpc::Status NotifyCreate(grpc::ServerContext* context,
-                            const compactionservice::FileRef* request,
-                            google::protobuf::Empty* response) override {
-    std::lock_guard<std::mutex> lock(storage_latch_);
-    auto& e = storage_refcount_map_[request->path()];
-    e.count++;
-    e.owners.insert(request->shard_id());  // debug only
-    e.deleted_by.erase(request->shard_id());  // [multi-mig] re-create resets the dup-delete guard
-    std::cout << GetTime() << "[storage] NotifyCreate path=" << request->path()
-              << " shard=" << request->shard_id() << " refcount=" << e.count
-              << std::endl;
-    return grpc::Status::OK;
+  grpc::Status NotifyCreate(grpc::ServerContext*, const compactionservice::FileRef* request,
+                            google::protobuf::Empty*) override {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      registry.Create({request->path()}, request->shard_id());
+      std::cout << GetTime() << "[storage] NotifyCreate path=" << request->path()
+                << " shard=" << request->shard_id()
+                << " refcount=" << registry.Inspect(request->path()).count << std::endl;
+    });
   }
-
-  // Logical link of an already-existing shared SST into another shard (relink).
-  // PLAIN COUNT (++) like NotifyCreate.
-  grpc::Status NotifyLink(grpc::ServerContext* context,
-                          const compactionservice::FileRef* request,
-                          google::protobuf::Empty* response) override {
-    std::lock_guard<std::mutex> lock(storage_latch_);
-    auto& e = storage_refcount_map_[request->path()];
-    e.count++;
-    e.owners.insert(request->shard_id());  // debug only
-    std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path()
-              << " shard=" << request->shard_id() << " refcount=" << e.count
-              << std::endl;
-    return grpc::Status::OK;
+  grpc::Status NotifyCreateBatch(grpc::ServerContext*, const compactionservice::FileRefBatch* request,
+                                 google::protobuf::Empty*) override {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      registry.Create(StoragePaths(*request), request->shard_id(), request->operation_id());
+      for (const auto& path : request->path()) {
+        std::cout << GetTime() << "[storage] NotifyCreate path=" << path
+                  << " shard=" << request->shard_id() << " refcount=" << registry.Inspect(path).count
+                  << " (durable batch)\n";
+      }
+      std::cout << GetTime() << "[storage] create-batch n=" << request->path_size() << std::endl;
+    });
   }
-
-  // [relink/Storage-CP batch 2026-09-09] N links in ONE RPC under ONE latch acquisition
-  // (all-or-nothing). Per-path effect identical to NotifyLink. The per-path log lines are
-  // kept — one "NotifyLink   path=" line per path, which is what run_group's
-  // "NotifyLink xN (refcount armed)" gate counts — but the stream is flushed ONCE at the
-  // end: the per-call std::endl flush plus the latch round trip was most of the old
-  // ~3.7 ms/file. The summary line deliberately avoids the substring "NotifyLink".
-  grpc::Status NotifyLinkBatch(grpc::ServerContext* context,
-                               const compactionservice::FileRefBatch* request,
-                               google::protobuf::Empty* response) override {
-    std::lock_guard<std::mutex> lock(storage_latch_);
-    const int n = request->path_size();
-    for (int i = 0; i < n; i++) {
-      auto& e = storage_refcount_map_[request->path(i)];
-      e.count++;
-      e.owners.insert(request->shard_id());  // debug only
-      std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path(i)
-                << " shard=" << request->shard_id() << " refcount=" << e.count
-                << " (batch " << (i + 1) << "/" << n << ")\n";
+  grpc::Status NotifyLink(grpc::ServerContext*, const compactionservice::FileRef* request,
+                          google::protobuf::Empty*) override {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      registry.Link({request->path()}, request->shard_id());
+      std::cout << GetTime() << "[storage] NotifyLink path=" << request->path()
+                << " shard=" << request->shard_id()
+                << " refcount=" << registry.Inspect(request->path()).count << std::endl;
+    });
+  }
+  grpc::Status NotifyLinkBatch(grpc::ServerContext*, const compactionservice::FileRefBatch* request,
+                               google::protobuf::Empty*) override {
+    return LinkBatch(request, false);
+  }
+  grpc::Status PrepareReferences(grpc::ServerContext*, const compactionservice::FileRefBatch* request,
+                                 google::protobuf::Empty*) override {
+    if (request->operation_id().empty()) {
+      return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                          "PrepareReferences requires a stable operation_id");
     }
-    std::cout << GetTime() << "[storage] link-batch n=" << n
-              << " shard=" << request->shard_id() << std::endl;
-    return grpc::Status::OK;
+    return LinkBatch(request, true);
   }
-
-  // Drop a shard's reference. For a TRACKED file the CP owns deletion: when the
-  // refcount hits 0 the path is queued for the CP's batch GC (RunStorageGC) and the
-  // reply is deleted=false (the CN must NOT delete it).
-  //
-  // ★ 2026-08-08 UNTRACKED is now FAIL-SAFE. It used to answer deleted=true
-  // ("never saw a NotifyCreate => nobody shares it => delete normally"), which
-  // is only sound if every create is guaranteed to have been reported. It was
-  // not: in 0807_2 the CP received no NotifyCreate at all, so a relinked file
-  // looked unshared, the owning shard physically deleted it, and the migration
-  // destination was left with 56 dangling external_path references (its scans
-  // spun in HDFS retries and its compaction stopped for the rest of the run).
-  // "I have never heard of this file" is ignorance, not proof of exclusivity,
-  // so we keep the bytes and let the mark-sweep GC reclaim them later: a leak
-  // is recoverable, deleting a file another shard still reads is not. The
-  // untracked count is surfaced in the storage-gc line so a run can be gated on
-  // it being 0. STORAGE_CP_UNTRACKED_DELETE=1 restores the old behavior.
-  grpc::Status RequestDelete(grpc::ServerContext* context,
-                             const compactionservice::FileRef* request,
+  grpc::Status AbortUnpublished(grpc::ServerContext*, const compactionservice::FileRefBatch* request,
+                                google::protobuf::Empty*) override {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      // The engine/offline recovery caller must have proved these paths were
+      // never committed. Unknown ordinary releases do not grant this authority.
+      registry.AbortUnpublished(StoragePaths(*request), request->shard_id(), request->operation_id());
+      for (const auto& path : request->path()) {
+        std::cout << GetTime() << "[storage] AbortUnpublished path=" << path
+                  << " shard=" << request->shard_id() << '\n';
+      }
+      std::cout << GetTime() << "[storage] abort-batch n=" << request->path_size() << std::endl;
+    });
+  }
+  grpc::Status RecoverReferences(grpc::ServerContext*, const compactionservice::FileRefBatch* request,
+                                 google::protobuf::Empty*) override {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      registry.RecoverReferences(StoragePaths(*request), request->shard_id());
+      std::cout << GetTime() << "[storage] recover-verified n=" << request->path_size()
+                << " shard=" << request->shard_id() << std::endl;
+    });
+  }
+  grpc::Status RequestDelete(grpc::ServerContext*, const compactionservice::FileRef* request,
                              compactionservice::DeleteReply* reply) override {
-    std::lock_guard<std::mutex> lock(storage_latch_);
-    auto it = storage_refcount_map_.find(request->path());
-    if (it == storage_refcount_map_.end()) {
-      static const bool untracked_delete =
-          std::getenv("STORAGE_CP_UNTRACKED_DELETE") != nullptr;
-      storage_untracked_deletes_++;
-      reply->set_deleted(untracked_delete);
-      reply->set_refcount(0);
-      if (storage_untracked_deletes_ <= 5 ||
-          storage_untracked_deletes_ % 1000 == 0) {
-        std::cout << GetTime() << "[storage] ★UNTRACKED RequestDelete path="
-                  << request->path() << " shard=" << request->shard_id()
-                  << " -> " << (untracked_delete ? "ALLOW DELETE (unsafe mode)"
-                                                 : "KEEP (fail-safe)")
-                  << " (#" << storage_untracked_deletes_
-                  << "; refcount armed? tracked=" << storage_refcount_map_.size()
-                  << ")" << std::endl;
-      }
-    } else {
-      auto& e = it->second;
-      // [multi-mig 2026-08-25] Idempotent per (path, shard). A later migration's src-drop
-      // re-purges files an earlier drop already unregistered (the obsolete-file pass sees the
-      // still-shared bytes on HDFS outside the live version), sending a SECOND RequestDelete
-      // from the same shard. The double decrement zeroed a still-referenced file and the GC
-      // deleted it under the dst (0825_chsmk_2: /kg/s0/000032|46|49 -> 11k dst read failures).
-      // Same philosophy as the UNTRACKED fail-safe: swallowing a dup risks a recoverable
-      // leak; honoring it deletes a file another shard still reads. The CSA-create/CN-delete
-      // cross flow stays legal — only a REPEAT from the same shard is ignored.
-      if (!e.deleted_by.insert(request->shard_id()).second) {
-        reply->set_deleted(false);
-        reply->set_refcount(e.count);
-        std::cout << GetTime() << "[storage] ★DUP RequestDelete IGNORED path="
-                  << request->path() << " shard=" << request->shard_id()
-                  << " refcount stays " << e.count << std::endl;
-        return grpc::Status::OK;
-      }
-      e.count--;  // unconditional: the deleter need not be the creator (CSA vs CN)
-      e.owners.erase(request->shard_id());  // debug only
-      if (e.count <= 0) {
-        // No shard references it anymore. The CP owns the physical delete: queue it
-        // for the periodic batch GC and tell the CN NOT to delete. refcount==0 is
-        // definitive, so no MANIFEST check is needed.
-        storage_refcount_map_.erase(it);
-        storage_pending_delete_.push_back(request->path());
-        reply->set_deleted(false);
-        reply->set_refcount(0);
+    reply->set_deleted(false);  // No Storage RPC ever authorizes client-side HDFS deletion.
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      const auto result = registry.Release(request->path(), request->shard_id());
+      reply->set_refcount(static_cast<int>(std::min<uint64_t>(result.count, std::numeric_limits<int>::max())));
+      if (result.unknown) {
+        std::cout << GetTime() << "[storage] ★UNTRACKED RequestDelete path=" << request->path()
+                  << " shard=" << request->shard_id() << " -> KEEP (fail-safe)" << std::endl;
       } else {
-        reply->set_deleted(false);
-        reply->set_refcount(e.count);
+        std::cout << GetTime() << "[storage] RequestDelete path=" << request->path()
+                  << " shard=" << request->shard_id() << " deleted=false refcount=" << result.count
+                  << " duplicate=" << result.duplicate << std::endl;
       }
-    }
-    std::cout << GetTime() << "[storage] RequestDelete path=" << request->path()
-              << " shard=" << request->shard_id()
-              << " deleted=" << reply->deleted()
-              << " refcount=" << reply->refcount() << std::endl;
-    return grpc::Status::OK;
+    });
+  }
+
+ private:
+  grpc::Status LinkBatch(const compactionservice::FileRefBatch* request, bool prepared) {
+    return StorageCall([&](ownership_cp::Registry& registry) {
+      registry.Link(StoragePaths(*request), request->shard_id(), request->operation_id());
+      for (const auto& path : request->path()) {
+        std::cout << GetTime() << "[storage] NotifyLink path=" << path
+                  << " shard=" << request->shard_id() << " refcount=" << registry.Inspect(path).count
+                  << " (durable batch)\n";
+      }
+      std::cout << GetTime() << "[storage] " << (prepared ? "prepare" : "link")
+                << "-batch n=" << request->path_size() << std::endl;
+    });
   }
 };
 
-// [relink/Storage-CP] Lazy/batched physical delete owned by the CP.
-// Every STORAGE_GC_INTERVAL_S (default 60s) the CP drains the refcount-0 paths that
-// RequestDelete queued and hdfsDeletes them in one pass. This is the "Lazy GC": instead of
-// the CN deleting each obsolete SST inline, the CP accumulates them and reclaims in batch.
-// The CP connects to the NameNode EXPLICITLY (a bare path on the default fs would hit the
-// LOCAL fs -- fs.defaultFS is unset on this cluster). A failed delete is re-queued, never
-// leaked. (A MANIFEST mark-sweep for lost-RPC/crash leaks would slot in here as a later
-// backstop; refcount-0 reclamation needs no MANIFEST.) HDFS I/O is done outside storage_latch_.
+// Fenced deletion claims are fsynced before any HDFS operation. A crash after
+// physical deletion but before its completion record safely retries the same
+// immutable path. Unknown staging files enter this queue only through an
+// explicit AbortUnpublished; neither TTL nor MANIFEST absence grants deletion.
 [[noreturn]] void RunStorageGC() {
   int interval = 60;
   if (const char* s = getenv("STORAGE_GC_INTERVAL_S")) { int v = atoi(s); if (v > 0) interval = v; }
@@ -377,47 +333,43 @@ class StorageImpl final : public compactionservice::StorageService::Service {
   hdfsFS fs = nullptr;
   while (true) {
     sleep(interval);
-    std::vector<std::string> batch;
-    size_t tracked = 0, shared = 0;
-    {
-      std::lock_guard<std::mutex> lock(storage_latch_);
-      batch.swap(storage_pending_delete_);
-      tracked = storage_refcount_map_.size();
-      for (const auto& kv : storage_refcount_map_) if (kv.second.count > 1) shared++;
+    try {
+      const auto claims = storage_registry_->ClaimDeletes();
+      if (!claims.empty() && fs == nullptr) {
+        fs = hdfsConnectAsUser(nn_host, nn_port, user);
+        if (fs == nullptr) {
+          std::cerr << GetTime() << "[storage-gc] hdfsConnect FAILED " << nn_host << ':' << nn_port << std::endl;
+        }
+      }
+      size_t deleted = 0, requeued = 0;
+      for (const auto& claim : claims) {
+        bool reclaimed = false;
+        if (fs != nullptr) {
+          errno = 0;
+          reclaimed = hdfsDelete(fs, claim.path.c_str(), /*recursive=*/0) == 0;
+          if (!reclaimed) {
+            // Do not interpret an arbitrary HDFS error as 'already absent'.
+            errno = 0;
+            hdfsFileInfo* info = hdfsGetPathInfo(fs, claim.path.c_str());
+            if (info != nullptr) hdfsFreeFileInfo(info, 1);
+            else reclaimed = errno == ENOENT;
+          }
+        }
+        storage_registry_->CompleteDelete(claim, reclaimed);
+        if (reclaimed) ++deleted; else ++requeued;
+      }
+      const auto stats = storage_registry_->GetStats();
+      std::cout << GetTime() << "[storage-gc] interval=" << interval << "s tracked=" << stats.tracked
+                << " shared=" << stats.shared << " batch=" << claims.size() << " deleted=" << deleted
+                << " requeued=" << requeued << " pending=" << stats.pending
+                << " deleting=" << stats.deleting << " tombstones=" << stats.deleted
+                << " untracked_deletes=" << stats.unknown_releases
+                << " journal_sequence=" << stats.journal_sequence << std::endl;
+    } catch (const std::exception& error) {
+      // Journal failure poisons the registry: all subsequent mutation/claim
+      // attempts fail closed, and this loop performs no further physical I/O.
+      std::cerr << GetTime() << "[storage-gc] durable registry FAILED: " << error.what() << std::endl;
     }
-    if (!batch.empty() && fs == nullptr) {
-      fs = hdfsConnectAsUser(nn_host, nn_port, user);
-      if (fs == nullptr)
-        std::cout << GetTime() << "[storage-gc] hdfsConnect FAILED " << nn_host << ":" << nn_port
-                  << " (retry next cycle)" << std::endl;
-    }
-    int deleted = 0;
-    std::vector<std::string> requeue;
-    for (const auto& path : batch) {
-      if (fs == nullptr) { requeue.push_back(path); continue; }  // no fs yet -> retry
-      if (hdfsDelete(fs, path.c_str(), /*recursive=*/0) == 0) { deleted++; continue; }
-      // hdfsDelete failed. A path whose bytes were renamed AWAY (RenameFile transfers
-      // the refcount: RequestDelete(old key) queues a path that no longer exists) or a
-      // double-queued path is ALREADY gone -> count it reclaimed, do NOT requeue
-      // (requeueing a phantom forever would bloat the queue). Only a path that STILL
-      // exists is a real transient failure worth retrying.
-      if (hdfsExists(fs, path.c_str()) != 0) { deleted++; continue; }  // gone => reclaimed
-      requeue.push_back(path);  // still exists => transient failure, retry next cycle
-    }
-    if (!requeue.empty()) {
-      std::lock_guard<std::mutex> lock(storage_latch_);
-      for (auto& p : requeue) storage_pending_delete_.push_back(std::move(p));
-    }
-    uint64_t untracked;
-    {
-      std::lock_guard<std::mutex> lock(storage_latch_);
-      untracked = storage_untracked_deletes_;
-    }
-    std::cout << GetTime() << "[storage-gc] interval=" << interval << "s tracked=" << tracked
-              << " shared=" << shared << " batch=" << batch.size() << " deleted=" << deleted
-              << " requeued=" << requeue.size() << " untracked_deletes=" << untracked
-              << (tracked == 0 ? "  ★REFCOUNT NOT ARMED (no NotifyCreate ever received)" : "")
-              << std::endl;
   }
 }
 
@@ -600,6 +552,23 @@ int main() {
             << (pro_cp_addr_from_env ? " (from PRO_CP_ADDR)" : " (compiled default)")
             << std::endl;
   std::string server_address(compaction_service_options.pro_cp_address);
+  const char* state_directory = getenv("STORAGE_CP_STATE_DIR");
+  if (state_directory != nullptr && *state_directory != '\0') {
+    try {
+      storage_registry_.reset(new ownership_cp::Registry(state_directory));
+      const auto stats = storage_registry_->GetStats();
+      std::cout << GetTime() << "[storage] durable registry READY state_dir=" << state_directory
+                << " tracked=" << stats.tracked << " pending=" << stats.pending
+                << " deleting=" << stats.deleting << " tombstones=" << stats.deleted
+                << " journal_sequence=" << stats.journal_sequence << std::endl;
+    } catch (const std::exception& error) {
+      std::cerr << GetTime() << "FATAL: durable ownership startup failed: " << error.what() << std::endl;
+      return 2;
+    }
+  } else {
+    std::cout << GetTime() << "[storage] DISABLED: STORAGE_CP_STATE_DIR unset; Storage RPCs fail closed, GC disabled"
+              << std::endl;
+  }
   ProCPImpl service;
   StorageImpl storage_service;
 
@@ -626,8 +595,7 @@ int main() {
             << " (port=" << selected_port << ")" << std::endl;
   std::thread scheduler(ConsumeTask);
   std::thread monitor(UpdateCSAStatus);
-  std::thread storage_gc(RunStorageGC);
-  storage_gc.detach();
+  if (storage_registry_) std::thread(RunStorageGC).detach();
   scheduler.join();
   monitor.join();
   server->Wait();

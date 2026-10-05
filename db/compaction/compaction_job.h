@@ -215,6 +215,10 @@ class CompactionJob {
 
   IOStatus io_status_;
 
+  // Final CN paths, populated only by the primary's Run(). Remote workers use
+  // CompactionServiceCompactionJob::Run() and never publish temporary outputs.
+  std::vector<std::string> storage_cp_output_paths_;
+
   CompactionJobStats* compaction_job_stats_;
 
  private:

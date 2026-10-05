@@ -120,6 +120,12 @@ class ExternalSstFileIngestionJob {
   // REQUIRES: Mutex held
   Status Run();
 
+  // Register completed final paths after Run and before MANIFEST installation.
+  // PrepareOwnership may perform RPC and requires the DB mutex to be released.
+  Status PrepareOwnership();
+  // Call only after an actual LogAndApply attempt. Local state only.
+  void FinishOwnership(const Status& manifest_status);
+
   // Update column family stats.
   // REQUIRES: Mutex held
   void UpdateStats();
@@ -187,6 +193,8 @@ class ExternalSstFileIngestionJob {
   Directories* directories_;
   EventLogger* event_logger_;
   VersionEdit edit_;
+  std::vector<std::string> ownership_paths_;
+  bool ownership_manifest_attempted_ = false;
   uint64_t job_start_time_;
   int consumed_seqno_count_;
   // Set in ExternalSstFileIngestionJob::Prepare(), if true all files are

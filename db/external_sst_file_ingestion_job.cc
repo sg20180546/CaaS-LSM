@@ -25,6 +25,7 @@
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
+#include "plugin/hdfs/storage_cp_hook.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -477,6 +478,32 @@ Status ExternalSstFileIngestionJob::Run() {
   return status;
 }
 
+Status ExternalSstFileIngestionJob::PrepareOwnership() {
+  ownership_paths_.clear();
+  for (const auto& file : files_to_ingest_) {
+    if (!file.internal_file_path.empty()) ownership_paths_.push_back(file.internal_file_path);
+  }
+  TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::StorageCpPrepare:Paths",
+                           &ownership_paths_);
+  Status status = StorageCpPrepareOutputs(fs_.get(), ownership_paths_);
+  TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::StorageCpPrepare:Status",
+                           &status);
+  return status;
+}
+
+void ExternalSstFileIngestionJob::FinishOwnership(const Status& manifest_status) {
+  ownership_manifest_attempted_ = true;
+  if (manifest_status.ok() && !cfd_->IsDropped()) {
+    StorageCpMarkOutputsPublished(fs_.get(), ownership_paths_);
+    TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::StorageCpPublished:Paths",
+                             &ownership_paths_);
+  } else {
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), ownership_paths_);
+    TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::StorageCpPreserved:Paths",
+                             &ownership_paths_);
+  }
+}
+
 void ExternalSstFileIngestionJob::UpdateStats() {
   // Update internal stats for new ingested files
   uint64_t total_keys = 0;
@@ -539,6 +566,15 @@ void ExternalSstFileIngestionJob::UpdateStats() {
 
 void ExternalSstFileIngestionJob::Cleanup(const Status& status) {
   IOOptions io_opts;
+  if (!ownership_manifest_attempted_) {
+    std::vector<std::string> abandoned;
+    for (const auto& file : files_to_ingest_) {
+      if (!file.internal_file_path.empty()) abandoned.push_back(file.internal_file_path);
+    }
+    TEST_SYNC_POINT_CALLBACK("ExternalSstFileIngestionJob::StorageCpAbort:Paths",
+                             &abandoned);
+    StorageCpAbortOutputs(fs_.get(), abandoned).PermitUncheckedError();
+  }
   if (!status.ok()) {
     // We failed to add the files to the database
     // remove all the files we copied

@@ -5398,10 +5398,21 @@ Status DBImpl::IngestExternalFiles(
       }
     }
     if (status.ok()) {
+      // Network ACKs must not hold mutex_. The pending-output guard and the
+      // unbatched write thread continue protecting ingestion during this wait.
+      mutex_.Unlock();
+      for (auto& job : ingestion_jobs) {
+        status = job.PrepareOwnership();
+        if (!status.ok()) break;
+      }
+      mutex_.Lock();
+    }
+    if (status.ok()) {
       autovector<ColumnFamilyData*> cfds_to_commit;
       autovector<const MutableCFOptions*> mutable_cf_options_list;
       autovector<autovector<VersionEdit*>> edit_lists;
       uint32_t num_entries = 0;
+      std::vector<size_t> ownership_jobs_to_commit;
       for (size_t i = 0; i != num_cfs; ++i) {
         auto* cfd =
             static_cast<ColumnFamilyHandleImpl*>(args[i].column_family)->cfd();
@@ -5409,6 +5420,7 @@ Status DBImpl::IngestExternalFiles(
           continue;
         }
         cfds_to_commit.push_back(cfd);
+        ownership_jobs_to_commit.push_back(i);
         mutable_cf_options_list.push_back(cfd->GetLatestMutableCFOptions());
         autovector<VersionEdit*> edit_list;
         edit_list.push_back(ingestion_jobs[i].edit());
@@ -5427,6 +5439,9 @@ Status DBImpl::IngestExternalFiles(
       status =
           versions_->LogAndApply(cfds_to_commit, mutable_cf_options_list,
                                  edit_lists, &mutex_, directories_.GetDbDir());
+      for (const auto i : ownership_jobs_to_commit) {
+        ingestion_jobs[i].FinishOwnership(status);
+      }
       // It is safe to update VersionSet last seqno here after LogAndApply since
       // LogAndApply persists last sequence number from VersionEdits,
       // which are from file's largest seqno and not from VersionSet.
@@ -5646,10 +5661,25 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
   edit.SetColumnFamily(cfd->GetID());
   edit.AddFile(level, f_meta);
 
+#ifdef HDFS
+  // Pin the shared input at CP before publishing it in this MANIFEST. A
+  // transport error can have applied, so never release this possible pin here.
+  s = StorageCpNotifyLink(fs_.get(), external_file);
+  if (!s.ok()) {
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), {external_file});
+    return s;
+  }
+#endif
   {
     InstrumentedMutexLock l(&mutex_);
     s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                &mutex_, directories_.GetDbDir());
+#ifdef HDFS
+    if (s.ok() && !cfd->IsDropped())
+      StorageCpMarkOutputsPublished(fs_.get(), {external_file});
+    else
+      StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), {external_file});
+#endif
     if (s.ok()) {
       // The registered keys exist at seqno `global_seqno`; ensure the DB's
       // sequence covers it so reads can observe them (mirrors ingestion
@@ -5668,12 +5698,7 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
       sv_ctx.Clean();
     }
   }
-#ifdef HDFS
-  // [relink/Storage-CP] The reference is now durable in this shard's MANIFEST,
-  // so claim it at the CP before the owning shard's compaction can obsolete and
-  // delete the bytes underneath us.
-  if (s.ok()) StorageCpNotifyLink(fs_.get(), external_file);
-#endif
+
   return s;
 }
 
@@ -5821,10 +5846,26 @@ Status DBImpl::RegisterExternalFilesInPlace(
   }
 
   Status s;
+#ifdef HDFS
+  std::vector<std::string> ownership_paths;
+  ownership_paths.reserve(files.size());
+  for (const auto& fr : files) ownership_paths.push_back(fr.external_file);
+  s = StorageCpNotifyLinkBatch(fs_.get(), ownership_paths);
+  if (!s.ok()) {
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), ownership_paths);
+    return s;
+  }
+#endif
   {
     InstrumentedMutexLock l(&mutex_);
     s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                &mutex_, directories_.GetDbDir());
+#ifdef HDFS
+    if (s.ok() && !cfd->IsDropped())
+      StorageCpMarkOutputsPublished(fs_.get(), ownership_paths);
+    else
+      StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), ownership_paths);
+#endif
     if (s.ok()) {
       if (max_gsn != kDisableGlobalSequenceNumber &&
           max_gsn > versions_->LastSequence()) {
@@ -5838,20 +5879,7 @@ Status DBImpl::RegisterExternalFilesInPlace(
       sv_ctx.Clean();
     }
   }
-#ifdef HDFS
-  // [relink/Storage-CP] Batch variant of the same claim: every file in this
-  // edit is now referenced by this shard as well as by its owner, so each needs
-  // its refcount bumped or the owner's next compaction will delete it.
-  // [batch 2026-09-09] ONE RPC for the whole edit. The per-file loop here was
-  // serial (~3.7 ms/file unloaded, ~13 ms under load) and, after the single
-  // LogAndApply above, the last O(#files) term in relink's stop window.
-  if (s.ok()) {
-    std::vector<std::string> paths;
-    paths.reserve(files.size());
-    for (const auto& fr : files) paths.push_back(fr.external_file);
-    StorageCpNotifyLinkBatch(fs_.get(), paths);
-  }
-#endif
+
   return s;
 }
 
@@ -6873,12 +6901,18 @@ Status DBImpl::CreateColumnFamilyWithImport(
       num_running_ingest_file_++;
       assert(!cfd->IsDropped());
       status = import_job.Run();
+      if (status.ok()) {
+        mutex_.Unlock();
+        status = import_job.PrepareOwnership();
+        mutex_.Lock();
+      }
 
       // Install job edit [Mutex will be unlocked here]
       if (status.ok()) {
         auto cf_options = cfd->GetLatestMutableCFOptions();
         status = versions_->LogAndApply(cfd, *cf_options, import_job.edit(),
                                         &mutex_, directories_.GetDbDir());
+        import_job.FinishOwnership(status);
         if (status.ok()) {
           InstallSuperVersionAndScheduleWork(cfd, &sv_context, *cf_options);
         }
