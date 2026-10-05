@@ -44,6 +44,7 @@
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
 #include "rocksdb/trace_record.h"
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "table/block_based/binary_search_index_reader.h"
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_factory.h"
@@ -672,6 +673,12 @@ Status BlockBasedTable::Open(
   rep->cache_warmup_replay = cache_warmup_replay;
   rep->cache_warmup_capture = cache_warmup_capture;
   rep->table_reader_cache_res_mgr = table_reader_cache_res_mgr;
+  // [sst access stats 2026-10-04] Identity for GetSstAccessStats. The clock
+  // is the DB's (ImmutableDBOptions::clock), the same object
+  // SstAccessStatsNowMicros reads, so ages derived from open_time_micros are
+  // consistent with it.
+  rep->file_number = cur_file_num;
+  rep->open_time_micros = rep->ioptions.clock->NowMicros();
   rep->file = std::move(file);
   rep->footer = footer;
 
@@ -1292,6 +1299,38 @@ void BlockBasedTable::SetFileReadStats(Statistics* stats,
   rep_->file->SetStatistics(stats, file_read_hist);
 }
 
+std::atomic<bool> g_sst_access_stats_counting{false};
+
+// [sst access stats 2026-10-04] Relaxed loads: the counters are advisory
+// rates, and the caller reads them under the table-cache shard mutex from
+// ApplyToAllEntries, never in a lookup's hot path.
+bool BlockBasedTable::GetSstAccessStats(SstAccessStats* out) const {
+  if (out == nullptr || rep_ == nullptr) {
+    return false;
+  }
+  static_assert(sizeof(out->cache_key_prefix) ==
+                    OffsetableCacheKey::kCommonPrefixSize,
+                "SstAccessStats::cache_key_prefix must hold the 8-byte common "
+                "prefix of OffsetableCacheKey");
+  out->file_number = rep_->file_number;
+  if (rep_->base_cache_key.IsEmpty()) {
+    // Open() failed before SetupBaseCacheKey(); such a reader is never
+    // published to the table cache, but keep the contract total.
+    memset(out->cache_key_prefix, 0, sizeof(out->cache_key_prefix));
+  } else {
+    const Slice prefix = rep_->base_cache_key.CommonPrefixSlice();
+    assert(prefix.size() == sizeof(out->cache_key_prefix));
+    memcpy(out->cache_key_prefix, prefix.data(),
+           sizeof(out->cache_key_prefix));
+  }
+  out->fg_data_block_hits =
+      rep_->fg_data_block_hits.load(std::memory_order_relaxed);
+  out->fg_data_block_misses =
+      rep_->fg_data_block_misses.load(std::memory_order_relaxed);
+  out->open_time_micros = rep_->open_time_micros;
+  return true;
+}
+
 size_t BlockBasedTable::ApproximateMemoryUsage() const {
   size_t usage = 0;
   if (rep_) {
@@ -1674,6 +1713,14 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
   const bool bypass_cache_for_warmup =
       (rep_->cache_warmup_capture || rep_->cache_warmup_replay) &&
       block_type != BlockType::kData;
+  // [sst access stats 2026-10-04] Only foreground data-block lookups count:
+  // index/filter/meta blocks and compaction reads say nothing about how hot a
+  // file is to clients. bypass_cache_for_warmup never applies to kData (see
+  // its definition), so metadata capture/replay lookups are excluded by
+  // construction.
+  const bool count_fg_data_block_lookup =
+      block_type == BlockType::kData && !for_compaction &&
+      g_sst_access_stats_counting.load(std::memory_order_relaxed);
 
   // First, try to get the block from the cache
   //
@@ -1698,6 +1745,9 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
         // TODO(haoyu): Differentiate cache hit on uncompressed block cache and
         // compressed block cache.
         is_cache_hit = true;
+        if (count_fg_data_block_lookup) {
+          rep_->fg_data_block_hits.fetch_add(1, std::memory_order_relaxed);
+        }
         if (prefetch_buffer) {
           // Update the block details so that PrefetchBuffer can use the read
           // pattern to determine if reads are sequential or not for
@@ -1706,7 +1756,19 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
               handle.offset(), BlockSizeWithTrailer(handle),
               ro.adaptive_readahead /*decrease_readahead_size*/);
         }
+      } else if (count_fg_data_block_lookup && !no_io) {
+        // [sst access stats 2026-10-04] Missed, and the block will be read:
+        // below when ro.fill_cache is set, otherwise by RetrieveBlock. A
+        // kBlockCacheTier probe that misses reads nothing and is not a miss
+        // here; MultiGet's cache-only first pass relies on that (see the
+        // `contents` branch).
+        rep_->fg_data_block_misses.fetch_add(1, std::memory_order_relaxed);
       }
+    } else if (contents && count_fg_data_block_lookup) {
+      // [sst access stats 2026-10-04] RetrieveMultipleBlocks hands in a block
+      // it just read for a key whose cache-only probe missed; that probe was
+      // not counted (no_io), so this is the one miss of that lookup.
+      rep_->fg_data_block_misses.fetch_add(1, std::memory_order_relaxed);
     }
 
     // Can't find the block from the cache. If I/O is allowed, read from the

@@ -36,6 +36,7 @@ class GetContext;
 class MultiGetContext;
 class HistogramImpl;
 class Statistics;
+struct SstAccessStats;  // rocksdb/utilities/sst_access_stats.h
 
 // Immutable bytes captured while a resident TableReader was opened. Each
 // range is an exact slice of the SST file that was already read as table
@@ -222,6 +223,16 @@ class TableReader {
   virtual Status VerifyChecksum(const ReadOptions& /*read_options*/,
                                 TableReaderCaller /*caller*/) {
     return Status::NotSupported("VerifyChecksum() not supported");
+  }
+
+  // [sst access stats 2026-10-04] Foreground data-block hit/miss counters of
+  // this reader (see rocksdb/utilities/sst_access_stats.h). Returns false
+  // when the format does not count; only BlockBasedTable does. Declared LAST
+  // so the new vtable slot is appended: TableReader is internal, but a binary
+  // that was built against the previous layout keeps its existing slot
+  // indices this way.
+  virtual bool GetSstAccessStats(SstAccessStats* /*out*/) const {
+    return false;
   }
 };
 

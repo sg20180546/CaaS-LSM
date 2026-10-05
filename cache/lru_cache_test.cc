@@ -24,8 +24,11 @@
 #include "rocksdb/io_status.h"
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/utilities/cache_dump_load.h"
+#include "rocksdb/utilities/sst_access_stats.h"
+#include "test_util/sync_point.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/cache_dump_load_impl.h"
 #include "utilities/fault_injection_fs.h"
@@ -1249,6 +1252,137 @@ TEST_F(LRUCacheTest, CacheWarmupPriorityAdmissionRules) {
   EXPECT_TRUE(Lookup("bottom"));
   EXPECT_FALSE(Lookup("other-bottom"));
 }
+
+#ifndef NDEBUG  // the walk counter is a TEST_SYNC_POINT, compiled out under NDEBUG
+// [warmup O(1) reject 2026-10-04] The preflight walk of InsertForCacheWarmup
+// is reached only when the pool counters cannot already rule the insert out;
+// the sync point inside fires once per walk, so these tests count walks.
+TEST_F(LRUCacheTest, CacheWarmupBottomRejectSkipsPreflightWalk) {
+  NewCache(2, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.0);
+  Insert("bottom-a", Cache::Priority::BOTTOM);
+  Insert("bottom-b", Cache::Priority::BOTTOM);
+  ValidateLRUList({"bottom-a", "bottom-b"}, 0, 0, 2);
+
+  std::atomic<int> walks{0};
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "LRUCacheShard::InsertForCacheWarmup:PreflightWalk",
+      [&](void* /*arg*/) { walks++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The callback captures a local: clear it however the test exits.
+  Defer clear_sync_points([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  // Full shard, BOTTOM incoming: no class is strictly below BOTTOM, so the
+  // counters settle it and the LRU list is never walked. Nothing is evicted
+  // and the recency order is untouched.
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-bottom", 0 /*hash*/,
+                                         nullptr, 1 /*charge*/, nullptr,
+                                         Cache::Priority::BOTTOM, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_EQ(0, walks.load());
+  EXPECT_EQ(2U, cache_->GetUsage());
+  ValidateLRUList({"bottom-a", "bottom-b"}, 0, 0, 2);
+
+  // HIGH incoming into the same full shard: two BOTTOM bytes are strictly
+  // below HIGH, so the walk runs and the oldest BOTTOM entry is evicted --
+  // today's behaviour, unchanged.
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-high", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_EQ(1, walks.load());
+  EXPECT_EQ(2U, cache_->GetUsage());
+  ValidateLRUList({"bottom-b", "incoming-high"}, 1, 0, 1);
+  EXPECT_FALSE(Lookup("bottom-a"));
+  EXPECT_TRUE(Lookup("bottom-b"));
+  EXPECT_TRUE(Lookup("incoming-high"));
+}
+
+TEST_F(LRUCacheTest, CacheWarmupPoolCountersRejectExactlyLikeTheWalk) {
+  std::atomic<int> walks{0};
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  SyncPoint::GetInstance()->SetCallBack(
+      "LRUCacheShard::InsertForCacheWarmup:PreflightWalk",
+      [&](void* /*arg*/) { walks++; });
+  SyncPoint::GetInstance()->EnableProcessing();
+  // The callback captures a local: clear it however the test exits.
+  Defer clear_sync_points([]() {
+    SyncPoint::GetInstance()->DisableProcessing();
+    SyncPoint::GetInstance()->ClearAllCallBacks();
+  });
+
+  // Both optional pools configured and sized so nothing overflows: the
+  // shard holds two LOW and two HIGH bytes and no BOTTOM byte.
+  NewCache(4, /*high_pri_pool_ratio=*/0.5,
+           /*low_pri_pool_ratio=*/0.5);
+  Insert("low-a", Cache::Priority::LOW);
+  Insert("low-b", Cache::Priority::LOW);
+  Insert("high-a", Cache::Priority::HIGH);
+  Insert("high-b", Cache::Priority::HIGH);
+  ValidateLRUList({"low-a", "low-b", "high-a", "high-b"}, 2, 2, 0);
+
+  // LOW incoming may evict only BOTTOM, and the BOTTOM pool is empty: the
+  // walk would have found eligible == 0; the counters say so without it.
+  Cache::CacheWarmupInsertResult result;
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-low", 0 /*hash*/, nullptr,
+                                         1 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_EQ(0, walks.load());
+  ValidateLRUList({"low-a", "low-b", "high-a", "high-b"}, 2, 2, 0);
+
+  // HIGH incoming needing 3 bytes: LOW + BOTTOM hold only 2, so the walk
+  // would have ended at the list head with eligible == 2 < 3 and rejected;
+  // the counters give the same answer in O(1) and nothing is evicted.
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-high-3", 0 /*hash*/,
+                                         nullptr, 3 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_EQ(0, walks.load());
+  EXPECT_EQ(4U, cache_->GetUsage());
+  ValidateLRUList({"low-a", "low-b", "high-a", "high-b"}, 2, 2, 0);
+
+  // HIGH incoming needing exactly the 2 LOW bytes: the counters cannot rule
+  // it out (pinned entries would be counted but not evictable), so the walk
+  // runs and admits, evicting both LOW entries. The two older HIGH entries
+  // overflow into the LOW pool to make room in the HIGH pool.
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-high-2", 0 /*hash*/,
+                                         nullptr, 2 /*charge*/, nullptr,
+                                         Cache::Priority::HIGH, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted, result);
+  EXPECT_EQ(1, walks.load());
+  EXPECT_EQ(4U, cache_->GetUsage());
+  ValidateLRUList({"high-a", "high-b", "incoming-high-2"}, 1, 2, 0);
+
+  // A warmup-pinned victim is still counted in its pool, so the bound is not
+  // short and the walk decides: it sees one unpinned BOTTOM byte, not two,
+  // and rejects without evicting that one byte.
+  NewCache(2, /*high_pri_pool_ratio=*/0.0,
+           /*low_pri_pool_ratio=*/1.0);
+  Insert("bottom-a", Cache::Priority::BOTTOM);
+  Insert("bottom-b", Cache::Priority::BOTTOM);
+  Cache::Priority pinned_priority;
+  LRUHandle* pinned =
+      cache_->LookupForCacheWarmup("bottom-a", 0 /*hash*/, &pinned_priority);
+  ASSERT_NE(nullptr, pinned);
+  walks = 0;
+  ASSERT_OK(cache_->InsertForCacheWarmup("incoming-low-2", 0 /*hash*/,
+                                         nullptr, 2 /*charge*/, nullptr,
+                                         Cache::Priority::LOW, &result));
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace, result);
+  EXPECT_EQ(1, walks.load());
+  EXPECT_EQ(2U, cache_->GetUsage());
+  EXPECT_FALSE(cache_->ReleaseForCacheWarmup(pinned, pinned_priority));
+  EXPECT_TRUE(Lookup("bottom-a"));
+  EXPECT_TRUE(Lookup("bottom-b"));
+  EXPECT_FALSE(Lookup("incoming-low-2"));
+}
+#endif  // !NDEBUG
 
 TEST_F(LRUCacheTest, CacheWarmupAtomicRejectionWithPinnedVictim) {
   NewCache(2, /*high_pri_pool_ratio=*/0.0,

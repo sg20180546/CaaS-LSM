@@ -24,6 +24,7 @@
 #include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
 #include "rocksdb/table_properties.h"
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/unique_id_impl.h"
 #include "util/compression.h"
@@ -213,6 +214,189 @@ TEST_F(DBBlockCacheTest, IteratorBlockCacheUsage) {
   delete iter;
   iter = nullptr;
   ASSERT_EQ(0, cache->GetUsage());
+}
+
+// [sst access stats 2026-10-04] GetSstAccessStats reports, per open table
+// reader, the foreground data-block lookups split into block-cache hits and
+// misses, keyed by the file's block-cache key prefix (the same 8 bytes
+// GetBlockCacheKeyPrefixes derives from the MANIFEST unique id): a lookup that
+// misses and reads the block counts once whether or not it fills the cache, a
+// cache-only probe that misses reads nothing and does not count.
+// GetLRUCacheShardPoolStats reports one entry per block-cache shard whose
+// usages add up to the cache's, and refuses a cache that is not an LRUCache.
+TEST_F(DBBlockCacheTest, SstAccessStatsCountForegroundDataBlockLookups) {
+  SetSstAccessStatsCounting(true);
+  Defer counting_off([]() { SetSstAccessStatsCounting(false); });
+  BlockBasedTableOptions table_options = GetTableOptions();  // 1 key / block
+  // Index and filter blocks go through the block cache too, so an uncounted
+  // non-data lookup would show up in the exact assertions below.
+  table_options.cache_index_and_filter_blocks = true;
+  table_options.filter_policy.reset(NewBloomFilterPolicy(10));
+  LRUCacheOptions co;
+  co.capacity = 8 << 20;
+  co.num_shard_bits = 2;
+  co.metadata_charge_policy = kDontChargeCacheMetadata;
+  std::shared_ptr<Cache> cache = NewLRUCache(co);
+  table_options.block_cache = cache;
+  Options options = GetOptions(table_options);
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  InitTable(options);
+  ASSERT_OK(Flush());
+
+  std::vector<LiveFileMetaData> metas;
+  db_->GetLiveFilesMetaData(&metas);
+  ASSERT_EQ(1U, metas.size());
+  const uint64_t file_number = metas[0].file_number;
+
+  auto stats_of = [&](uint64_t fnum, SstAccessStats* out) {
+    std::vector<SstAccessStats> all;
+    ASSERT_OK(GetSstAccessStats(db_, nullptr, &all));
+    bool found = false;
+    for (const SstAccessStats& a : all) {
+      if (a.file_number == fnum) {
+        *out = a;
+        found = true;
+      }
+    }
+    ASSERT_TRUE(found);
+  };
+  // The flush already opened the reader (its verification iterator).
+  SstAccessStats base0;
+  ASSERT_NO_FATAL_FAILURE(stats_of(file_number, &base0));
+
+  // First Get of a key: one miss that reads (and caches) the block.
+  ASSERT_EQ(std::string(kValueSize, 'a'), Get("0"));
+  SstAccessStats base;
+  ASSERT_NO_FATAL_FAILURE(stats_of(file_number, &base));
+  EXPECT_EQ(base0.fg_data_block_hits, base.fg_data_block_hits);
+  EXPECT_EQ(base0.fg_data_block_misses + 1, base.fg_data_block_misses);
+
+  // A cached block: the next Get of the same key is one hit, no miss.
+  ASSERT_EQ(std::string(kValueSize, 'a'), Get("0"));
+  SstAccessStats s1;
+  ASSERT_NO_FATAL_FAILURE(stats_of(file_number, &s1));
+  EXPECT_EQ(base.fg_data_block_hits + 1, s1.fg_data_block_hits);
+  EXPECT_EQ(base.fg_data_block_misses, s1.fg_data_block_misses);
+
+  // An uncached block read without filling the cache: a miss every time.
+  ReadOptions no_fill;
+  no_fill.fill_cache = false;
+  std::string value;
+  ASSERT_OK(db_->Get(no_fill, "5", &value));
+  ASSERT_OK(db_->Get(no_fill, "5", &value));
+  SstAccessStats s2;
+  ASSERT_NO_FATAL_FAILURE(stats_of(file_number, &s2));
+  EXPECT_EQ(s1.fg_data_block_hits, s2.fg_data_block_hits);
+  EXPECT_EQ(s1.fg_data_block_misses + 2, s2.fg_data_block_misses);
+
+  // A cache-only probe of an uncached block reads nothing: not a miss.
+  ReadOptions cache_only;
+  cache_only.read_tier = kBlockCacheTier;
+  ASSERT_TRUE(db_->Get(cache_only, "7", &value).IsIncomplete());
+  SstAccessStats s3;
+  ASSERT_NO_FATAL_FAILURE(stats_of(file_number, &s3));
+  EXPECT_EQ(s2.fg_data_block_hits, s3.fg_data_block_hits);
+  EXPECT_EQ(s2.fg_data_block_misses, s3.fg_data_block_misses);
+
+  // The prefix is the file's block-cache key prefix; the clock is the DB's.
+  std::unordered_map<uint64_t, std::string> prefixes;
+  ASSERT_OK(db_->GetBlockCacheKeyPrefixes(db_->DefaultColumnFamily(),
+                                          {file_number}, &prefixes));
+  ASSERT_EQ(1U, prefixes.count(file_number));
+  EXPECT_EQ(prefixes[file_number],
+            std::string(s3.cache_key_prefix, sizeof(s3.cache_key_prefix)));
+  EXPECT_GE(SstAccessStatsNowMicros(db_), s3.open_time_micros);
+
+  // Compaction reads are not foreground: the inputs' counters do not move.
+  // An iterator pins the version, so the inputs' readers stay in the table
+  // cache across the compaction.
+  for (size_t i = 0; i < kNumBlocks; i++) {
+    ASSERT_OK(Put(std::to_string(i), std::string(kValueSize, 'b')));
+  }
+  ASSERT_OK(Flush());
+  metas.clear();  // GetLiveFilesMetaData appends
+  db_->GetLiveFilesMetaData(&metas);
+  ASSERT_EQ(2U, metas.size());
+  std::unique_ptr<Iterator> pin(db_->NewIterator(ReadOptions()));
+  std::vector<std::pair<uint64_t, SstAccessStats>> inputs;
+  for (const LiveFileMetaData& m : metas) {
+    SstAccessStats st;
+    ASSERT_NO_FATAL_FAILURE(stats_of(m.file_number, &st));
+    inputs.emplace_back(m.file_number, st);
+  }
+  ASSERT_OK(db_->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  for (const auto& in : inputs) {
+    SstAccessStats st;
+    ASSERT_NO_FATAL_FAILURE(stats_of(in.first, &st));
+    EXPECT_EQ(in.second.fg_data_block_hits, st.fg_data_block_hits);
+    EXPECT_EQ(in.second.fg_data_block_misses, st.fg_data_block_misses);
+  }
+  pin.reset();
+
+  // Counting switched off: lookups no longer move the counters.
+  metas.clear();
+  db_->GetLiveFilesMetaData(&metas);
+  ASSERT_EQ(1U, metas.size());
+  const uint64_t compacted = metas[0].file_number;
+  ASSERT_EQ(std::string(kValueSize, 'b'), Get("0"));  // opens + reads it
+  SstAccessStats s4;
+  ASSERT_NO_FATAL_FAILURE(stats_of(compacted, &s4));
+  SetSstAccessStatsCounting(false);
+  ASSERT_EQ(std::string(kValueSize, 'b'), Get("0"));
+  ASSERT_OK(db_->Get(no_fill, "5", &value));
+  SstAccessStats s5;
+  ASSERT_NO_FATAL_FAILURE(stats_of(compacted, &s5));
+  EXPECT_EQ(s4.fg_data_block_hits, s5.fg_data_block_hits);
+  EXPECT_EQ(s4.fg_data_block_misses, s5.fg_data_block_misses);
+
+  // Per-shard pool accounting.
+  std::vector<LRUCacheShardPoolStats> pools;
+  ASSERT_OK(GetLRUCacheShardPoolStats(cache.get(), &pools));
+  ASSERT_EQ(cache->GetCacheWarmupShardCount(), pools.size());
+  ASSERT_EQ(4U, pools.size());
+  size_t usage = 0, capacity = 0;
+  for (const LRUCacheShardPoolStats& ps : pools) {
+    usage += ps.usage;
+    capacity += ps.capacity;
+    EXPECT_LE(ps.lru_usage, ps.usage);
+    EXPECT_LE(ps.high_pri_pool_usage + ps.low_pri_pool_usage, ps.lru_usage);
+    EXPECT_LE(ps.warmup_pinned_usage, ps.lru_usage);
+  }
+  EXPECT_EQ(cache->GetUsage(), usage);
+  EXPECT_GE(capacity, co.capacity);
+
+  std::shared_ptr<Cache> clock_cache =
+      HyperClockCacheOptions(1 << 20, 4096).MakeSharedCache();
+  EXPECT_TRUE(
+      GetLRUCacheShardPoolStats(clock_cache.get(), &pools).IsNotSupported());
+}
+
+// [sst access stats 2026-10-04] The blob file cache shares the table cache's
+// Cache and stores BlobFileReader values; GetSstAccessStats must skip them
+// (calling the TableReader virtual on one would read a garbage vtable).
+TEST_F(DBBlockCacheTest, SstAccessStatsSkipBlobFileReaders) {
+  SetSstAccessStatsCounting(true);
+  Defer counting_off([]() { SetSstAccessStatsCounting(false); });
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.enable_blob_files = true;
+  options.min_blob_size = 0;
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("k1", std::string(100, 'v')));
+  ASSERT_OK(Flush());
+  ASSERT_EQ(std::string(100, 'v'), Get("k1"));  // opens the blob file reader
+
+  std::vector<LiveFileMetaData> metas;
+  db_->GetLiveFilesMetaData(&metas);
+  ASSERT_EQ(1U, metas.size());
+  // Both readers sit in the one Cache: the SST's and the blob file's.
+  ASSERT_EQ(2U, dbfull()->TEST_table_cache()->GetOccupancyCount());
+  std::vector<SstAccessStats> all;
+  ASSERT_OK(GetSstAccessStats(db_, nullptr, &all));
+  ASSERT_EQ(1U, all.size());
+  EXPECT_EQ(metas[0].file_number, all[0].file_number);
 }
 
 TEST_F(DBBlockCacheTest, TestWithoutCompressedBlockCache) {

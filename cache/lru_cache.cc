@@ -19,6 +19,8 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
 #include "port/lang.h"
+#include "rocksdb/utilities/sst_access_stats.h"
+#include "test_util/sync_point.h"
 #include "util/distributed_mutex.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -424,6 +426,29 @@ Cache::Priority LRUCacheShard::NormalizePriorityForPools(
     priority = Cache::Priority::BOTTOM;
   }
   return priority;
+}
+
+size_t LRUCacheShard::LinkedChargeStrictlyBelow(
+    Cache::Priority incoming) const {
+  // Linked entries are partitioned into exactly the three pools, and the pool
+  // counters track linked entries only (LRU_InsertInPriorityPool,
+  // MaintainPoolSize and LRU_Remove move them in step with lru_usage_), so the
+  // BOTTOM pool's charge is the remainder. The class order is taken from
+  // IsStrictlyLowerPriority itself rather than restated here.
+  const size_t pooled = high_pri_pool_usage_ + low_pri_pool_usage_;
+  assert(lru_usage_ >= pooled);
+  const size_t bottom_pri_pool_usage = lru_usage_ - std::min(lru_usage_, pooled);
+  size_t charge = 0;
+  if (IsStrictlyLowerPriority(Cache::Priority::HIGH, incoming)) {
+    charge += high_pri_pool_usage_;
+  }
+  if (IsStrictlyLowerPriority(Cache::Priority::LOW, incoming)) {
+    charge += low_pri_pool_usage_;
+  }
+  if (IsStrictlyLowerPriority(Cache::Priority::BOTTOM, incoming)) {
+    charge += bottom_pri_pool_usage;
+  }
+  return charge;
 }
 
 void LRUCacheShard::PromoteWarmupDuplicate(LRUHandle* resident,
@@ -1049,13 +1074,35 @@ Status LRUCacheShard::InsertForCacheWarmup(
       // needs, and the victim loop below re-walks the same prefix.
       size_t eligible = 0;
       if (required > 0) {
-        for (LRUHandle* candidate = lru_.next;
-             candidate != &lru_ && eligible < required;
-             candidate = candidate->next) {
-          if (!candidate->HasRefs() &&
-              IsStrictlyLowerPriority(GetEffectivePriority(candidate),
-                                      priority)) {
-            eligible += candidate->total_charge;
+        // [warmup O(1) reject 2026-10-04] Settle the hopeless case from the
+        // pool counters before walking. A victim must be linked, unpinned and
+        // of an effective class strictly below `priority`; a promotion marker
+        // only RAISES a class, so every victim sits in a pool that is itself
+        // strictly below `priority`, and the summed charge of those pools
+        // bounds the walk's `eligible` from above. When that bound is already
+        // short of `required`, the walk would reach the list head with
+        // eligible < required and reject -- so reject here in O(1) with the
+        // identical result. BOTTOM incoming has no lower class
+        // (IsStrictlyLowerPriority admits none), so its bound is 0 and it
+        // never walks. Why: a destination whose 2 GB cache was full took
+        // 32k-53k BOTTOM rejects per hand-off (measured 2026-10-03), each a
+        // whole-shard walk under mutex_ = 2.7-4.3 s of walking, during which
+        // foreground GET p99 rose x2-x14. Admission is unchanged: when the
+        // bound is not short, the walk below still decides, because pinned
+        // entries are counted in their pool but are not victims.
+        const size_t evictable_charge_upper_bound =
+            LinkedChargeStrictlyBelow(priority);
+        if (evictable_charge_upper_bound >= required) {
+          TEST_SYNC_POINT_CALLBACK(
+              "LRUCacheShard::InsertForCacheWarmup:PreflightWalk", &priority);
+          for (LRUHandle* candidate = lru_.next;
+               candidate != &lru_ && eligible < required;
+               candidate = candidate->next) {
+            if (!candidate->HasRefs() &&
+                IsStrictlyLowerPriority(GetEffectivePriority(candidate),
+                                        priority)) {
+              eligible += candidate->total_charge;
+            }
           }
         }
       }
@@ -1312,6 +1359,19 @@ size_t LRUCacheShard::GetTableAddressCount() const {
   return size_t{1} << table_.GetLengthBits();
 }
 
+void LRUCacheShard::GetPoolStats(LRUCacheShardPoolStats* out) const {
+  assert(out != nullptr);
+  // Only this shard's mutex, held for six loads; the warm-up insert path takes
+  // the same single mutex and nothing else, so the two cannot deadlock.
+  DMutexLock l(mutex_);
+  out->capacity = capacity_;
+  out->usage = usage_;
+  out->lru_usage = lru_usage_;
+  out->high_pri_pool_usage = high_pri_pool_usage_;
+  out->low_pri_pool_usage = low_pri_pool_usage_;
+  out->warmup_pinned_usage = lru_warmup_pinned_usage_;
+}
+
 void LRUCacheShard::AppendPrintableOptions(std::string& str) const {
   const int kBufferSize = 200;
   char buffer[kBufferSize];
@@ -1465,6 +1525,19 @@ size_t LRUCache::TEST_GetLRUSize() {
 
 double LRUCache::GetHighPriPoolRatio() {
   return GetShard(0).GetHighPriPoolRatio();
+}
+
+void LRUCache::GetShardPoolStats(
+    std::vector<LRUCacheShardPoolStats>* out) const {
+  assert(out != nullptr);
+  const uint32_t num_shards = GetNumShards();
+  out->clear();
+  out->resize(num_shards);
+  for (uint32_t i = 0; i < num_shards; i++) {
+    // GetShard(i) is shards_[i & shard_mask_] == shards_[i]: the shard that
+    // GetCacheWarmupShardIndex() reports for the keys hashing to it.
+    GetShard(i).GetPoolStats(&(*out)[i]);
+  }
 }
 
 void LRUCache::WaitAll(std::vector<Handle*>& handles) {

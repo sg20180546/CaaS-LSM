@@ -24,6 +24,7 @@
 #include "monitoring/perf_context_imp.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/statistics.h"
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "table/block_based/block_based_table_reader.h"
 #include "table/get_context.h"
 #include "table/internal_iterator.h"
@@ -1139,6 +1140,31 @@ Status TableCache::GetPropertiesOfResidentTables(
     properties->emplace(entry.first, std::move(entry.second));
   }
   return Status::OK();
+}
+
+void TableCache::GetSstAccessStatsOfResidentTables(
+    std::vector<SstAccessStats>* out) const {
+  assert(out != nullptr);
+  out->clear();
+  const size_t occupancy = cache_->GetOccupancyCount();
+  if (occupancy != SIZE_MAX) {
+    out->reserve(occupancy);
+  }
+  Cache::ApplyToAllEntriesOptions opts;
+  opts.average_entries_per_lock = 64;
+  cache_->ApplyToAllEntries(
+      [&](const Slice& key, void* value, size_t /*charge*/,
+          Cache::DeleterFn deleter) {
+        if (key.size() != sizeof(uint64_t) || value == nullptr ||
+            deleter != &DeleteEntry<TableReader>) {
+          return;  // not a TableReader (e.g. a BlobFileReader)
+        }
+        SstAccessStats stats;
+        if (static_cast<TableReader*>(value)->GetSstAccessStats(&stats)) {
+          out->push_back(stats);
+        }
+      },
+      opts);
 }
 
 Status TableCache::StreamTableCacheWarmupEntries(

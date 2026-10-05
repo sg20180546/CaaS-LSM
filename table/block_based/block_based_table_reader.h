@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -17,6 +18,7 @@
 #include "cache/cache_reservation_manager.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "file/filename.h"
+#include "port/port.h"
 #include "rocksdb/slice_transform.h"
 #include "rocksdb/table_properties.h"
 #include "table/block_based/block.h"
@@ -194,6 +196,8 @@ class BlockBasedTable : public TableReader {
       const override;
   void SetFileReadStats(Statistics* stats,
                         HistogramImpl* file_read_hist) override;
+  // [sst access stats 2026-10-04] See TableReader::GetSstAccessStats.
+  bool GetSstAccessStats(SstAccessStats* out) const override;
 
   size_t ApproximateMemoryUsage() const override;
 
@@ -556,8 +560,16 @@ class BlockBasedTable::PartitionedIndexIteratorState
   UnorderedMap<uint64_t, CachableEntry<Block>>* block_map_;
 };
 
+// [sst access stats 2026-10-04] Process-wide switch for the per-reader
+// foreground data-block counters in Rep (SetSstAccessStatsCounting in
+// rocksdb/utilities/sst_access_stats.h). Off by default: a lookup then pays one
+// relaxed load of this read-mostly flag and touches no per-reader counter, so
+// a process that never asks for the counters runs exactly as before.
+extern std::atomic<bool> g_sst_access_stats_counting;
+
 // Stores all the properties associated with a BlockBasedTable.
-// These are immutable.
+// These are immutable after Open(), except the access counters
+// fg_data_block_hits / fg_data_block_misses at the end.
 struct BlockBasedTable::Rep {
   Rep(const ImmutableOptions& _ioptions, const EnvOptions& _env_options,
       const BlockBasedTableOptions& _table_opt,
@@ -672,6 +684,23 @@ struct BlockBasedTable::Rep {
 
   std::unique_ptr<CacheReservationManager::CacheReservationHandle>
       table_reader_cache_res_handle = nullptr;
+
+  // [sst access stats 2026-10-04] Identity and foreground data-block counters
+  // reported through TableReader::GetSstAccessStats. file_number and
+  // open_time_micros are set once in Open(); the counters are bumped in
+  // MaybeReadBlockAndLoadToCache for kData lookups that are not
+  // for_compaction. Why: the relink block-cache transfer ranks a migrated
+  // file by hits / seconds open / resident bytes -- a rate, comparable
+  // across nodes, unlike an LRU class. The counters are the only Rep fields
+  // written after Open(), so they get their own cache line (ALIGN_AS on the
+  // first, and they are the last data members, so the trailing padding is
+  // theirs); otherwise every lookup's increment would invalidate the hot
+  // read-only fields (ioptions, table_options, base_cache_key) for other
+  // cores.
+  uint64_t file_number = 0;
+  uint64_t open_time_micros = 0;
+  ALIGN_AS(CACHE_LINE_SIZE) std::atomic<uint64_t> fg_data_block_hits{0};
+  std::atomic<uint64_t> fg_data_block_misses{0};
 
   SequenceNumber get_global_seqno(BlockType block_type) const {
     return (block_type == BlockType::kFilterPartitionIndex ||

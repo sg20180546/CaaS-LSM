@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cache/sharded_cache.h"
 #include "port/lang.h"
@@ -20,6 +21,12 @@
 #include "util/distributed_mutex.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+// [sst access stats 2026-10-04] Defined in rocksdb/utilities/sst_access_stats.h
+// (public). Forward-declared so this header does not pull a utilities header
+// into every cache translation unit.
+struct LRUCacheShardPoolStats;
+
 namespace lru_cache {
 
 // Internal marker used for entries that account for an object retained only
@@ -451,6 +458,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   size_t GetOccupancyCount() const;
   size_t GetTableAddressCount() const;
 
+  // [sst access stats 2026-10-04] Copies capacity_, usage_, lru_usage_, the
+  // two pool usages and lru_warmup_pinned_usage_ under mutex_. Why: a warm-up
+  // planner needs per-shard room without walking the LRU list, and these are
+  // exactly the counters InsertForCacheWarmup reasons with (see
+  // LinkedChargeStrictlyBelow).
+  void GetPoolStats(LRUCacheShardPoolStats* out) const;
+
   void ApplyToSomeEntries(
       const std::function<void(const Slice& key, void* value, size_t charge,
                                DeleterFn deleter)>& callback,
@@ -512,6 +526,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShardBase {
   // Maps a wire/source priority to a pool configured on this destination.
   // mutex_ must be held.
   Cache::Priority NormalizePriorityForPools(Cache::Priority priority) const;
+
+  // [warmup O(1) reject 2026-10-04] Charge of the LRU-linked entries whose
+  // pool is strictly lower than `incoming` (already normalized), summed from
+  // the pool counters. Every victim the InsertForCacheWarmup preflight walk
+  // can find is linked and sits in such a pool, so this is a sound (never
+  // too small) upper bound of the walk's eligible charge. mutex_ must be held.
+  size_t LinkedChargeStrictlyBelow(Cache::Priority incoming) const;
 
   // Applies a strictly higher normalized priority to a duplicate without
   // changing its value ownership. mutex_ must be held.
@@ -612,7 +633,12 @@ class LRUCache
            CacheMetadataChargePolicy metadata_charge_policy =
                kDontChargeCacheMetadata,
            std::shared_ptr<SecondaryCache> secondary_cache = nullptr);
-  const char* Name() const override { return "LRUCache"; }
+  // [sst access stats 2026-10-04] The Name() string, so a caller holding a
+  // Cache* can recognise this class without RTTI (release builds have none).
+  // Caveat: the experimental FastLRUCache (NewFastLRUCache only) reports the
+  // same string; nothing in this project constructs one.
+  static const char* kClassName() { return "LRUCache"; }
+  const char* Name() const override { return kClassName(); }
   void* Value(Handle* handle) override;
   size_t GetCharge(Handle* handle) const override;
   DeleterFn GetDeleter(Handle* handle) const override;
@@ -641,6 +667,13 @@ class LRUCache
   size_t TEST_GetLRUSize();
   // Retrieves high pri pool ratio.
   double GetHighPriPoolRatio();
+
+  // [sst access stats 2026-10-04] One LRUCacheShardPoolStats per shard; the
+  // index of an entry is the GetCacheWarmupShardIndex() of the keys that map
+  // to it. Each shard is read under its own mutex (consistent per shard, not
+  // across shards). NON-virtual on purpose: the Cache vtable is public ABI
+  // and csa/procp/userclient link against it without being rebuilt.
+  void GetShardPoolStats(std::vector<LRUCacheShardPoolStats>* out) const;
 
   void AppendPrintableOptions(std::string& str) const override;
 

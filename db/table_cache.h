@@ -213,6 +213,15 @@ class TableCache {
       std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
           properties);
 
+  // [sst access stats 2026-10-04] Foreground data-block counters of every
+  // TableReader present in the backing cache (TableReader::GetSstAccessStats),
+  // enumerated like GetPropertiesOfResidentTables: no file I/O, no hits, no
+  // recency change. Only TableReader entries are read -- the blob file cache
+  // shares this Cache and stores non-polymorphic BlobFileReader values, so
+  // entries are filtered by key size and deleter exactly as above.
+  void GetSstAccessStatsOfResidentTables(
+      std::vector<SstAccessStats>* out) const;
+
   Status ApproximateKeyAnchors(const ReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
