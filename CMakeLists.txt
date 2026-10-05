@@ -88,6 +88,11 @@ endif()
 
 include(CMakeDependentOption)
 
+if(GRPC_FETCHCONTENT OR GRPC_AS_SUBMODULE)
+  # gRPC's bundled RE2 defaults to building its own tests. Its random_test
+  # target collides with RocksDB's util/random_test.cc when WITH_ALL_TESTS=ON.
+  option(RE2_BUILD_TESTING "Build bundled RE2 tests" OFF)
+endif()
 include(${PROJECT_SOURCE_DIR}/cmake/modules/grpc.cmake)
 
 if(MSVC)
@@ -1680,8 +1685,14 @@ endif()
 
 if(WITH_TOOLS)
   add_subdirectory(db_stress_tool)
-  add_custom_target(tools
+  # Embedded gRPC already defines an aggregate target named tools.
+  add_custom_target(rocksdb_tools
     DEPENDS ${tool_deps})
+  if(TARGET tools)
+    add_dependencies(tools rocksdb_tools)
+  else()
+    add_custom_target(tools DEPENDS rocksdb_tools)
+  endif()
 endif()
 
 option(WITH_EXAMPLES "build with examples" OFF)
