@@ -144,6 +144,44 @@ TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFiles) {
   ReopenWithColumnFamilies({"default", "koko", "yoyo"}, options);
 }
 
+TEST_F(ImportColumnFamilyTest, OwnershipAckRequiredBeforeImportManifest) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  const std::string name = "ownership-import.sst";
+  const std::string source = sst_files_dir_ + name;
+  SstFileWriter writer(EnvOptions(), options);
+  ASSERT_OK(writer.Open(source));
+  ASSERT_OK(writer.Put("key", "value"));
+  ASSERT_OK(writer.Finish());
+  ExportImportFilesMetaData metadata;
+  metadata.files.push_back(LiveFileMetaDataInit(name, sst_files_dir_, 0, 0, 0));
+  metadata.db_comparator_name = options.comparator->Name();
+  std::vector<std::string> prepared, aborted;
+  size_t published = 0;
+  auto* sync = SyncPoint::GetInstance();
+  sync->SetCallBack("ImportColumnFamilyJob::StorageCpPrepare:Paths", [&](void* arg) {
+    dbfull()->TEST_LockMutex();
+    dbfull()->TEST_UnlockMutex();
+    prepared = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("ImportColumnFamilyJob::StorageCpPrepare:Status", [](void* arg) {
+    *static_cast<Status*>(arg) = Status::IOError("lost own ACK");
+  });
+  sync->SetCallBack("ImportColumnFamilyJob::StorageCpAbort:Paths", [&](void* arg) {
+    aborted = *static_cast<std::vector<std::string>*>(arg);
+  });
+  sync->SetCallBack("ImportColumnFamilyJob::StorageCpPublished:Paths", [&](void*) { ++published; });
+  sync->EnableProcessing();
+  ASSERT_NOK(db_->CreateColumnFamilyWithImport(options, "own-import", ImportColumnFamilyOptions(),
+                                               metadata, &import_cfh_));
+  sync->DisableProcessing();
+  ASSERT_EQ(nullptr, import_cfh_);
+  ASSERT_EQ(1U, prepared.size());
+  ASSERT_EQ(prepared, aborted);
+  ASSERT_EQ(0U, published);
+  ASSERT_OK(env_->FileExists(source));
+}
+
 TEST_F(ImportColumnFamilyTest, ImportSSTFileWriterFilesWithOverlap) {
   Options options = CurrentOptions();
   CreateAndReopenWithCF({"koko"}, options);

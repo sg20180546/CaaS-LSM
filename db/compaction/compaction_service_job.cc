@@ -16,6 +16,7 @@
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
+#include "plugin/hdfs/storage_cp_hook.h"
 #include "rocksdb/utilities/options_type.h"
 
 #ifndef ROCKSDB_LITE
@@ -227,6 +228,13 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     auto src_file = compaction_result.output_path + "/" + file.file_name;
     auto tgt_file = TableFileName(compaction->immutable_options()->cf_paths,
                                   file_num, compaction->output_path_id());
+    // Completion of this remote job establishes that these are unpublished
+    // outputs. The filesystem must not infer that from an arbitrary rename.
+    s = StorageCpTrackUnpublishedOutput(fs_.get(), src_file);
+    if (!s.ok()) {
+      sub_compact->status = s;
+      return CompactionServiceJobStatus::kFailure;
+    }
     s = fs_->RenameFile(src_file, tgt_file, IOOptions(), nullptr);
     if (!s.ok()) {
       sub_compact->status = s;
@@ -237,6 +245,9 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
     uint64_t file_size;
     s = fs_->GetFileSize(tgt_file, IOOptions(), &file_size, nullptr);
     if (!s.ok()) {
+      // This moved file has not entered the output metadata list yet, so the
+      // parent compaction's normal output cleanup cannot discover it.
+      StorageCpAbortOutputs(fs_.get(), {tgt_file}).PermitUncheckedError();
       sub_compact->status = s;
       return CompactionServiceJobStatus::kFailure;
     }

@@ -15,9 +15,11 @@
 #include "db/memtable.h"
 #include "db/range_tombstone_fragmenter.h"
 #include "db/version_set.h"
+#include "file/filename.h"
 #include "logging/log_buffer.h"
 #include "logging/logging.h"
 #include "monitoring/thread_status_util.h"
+#include "plugin/hdfs/storage_cp_hook.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
@@ -26,6 +28,38 @@
 #include "util/coding.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+namespace {
+
+std::vector<std::string> FlushOutputPaths(
+    const ColumnFamilyData* cfd, const autovector<VersionEdit*>& edits) {
+  std::vector<std::string> paths;
+  for (const auto* edit : edits) {
+    for (const auto& entry : edit->GetNewFiles()) {
+      const auto& fd = entry.second.fd;
+      paths.push_back(TableFileName(cfd->ioptions()->cf_paths,
+                                     fd.GetNumber(), fd.GetPathId()));
+    }
+  }
+  return paths;
+}
+
+// Local tracker changes only: MANIFEST callbacks hold the DB mutex and must
+// never issue ownership RPCs. Observe the actual committing edit batch, which
+// can contain output prepared by a different flush thread.
+void FinishFlushOwnership(FileSystem* fs, const ColumnFamilyData* cfd,
+                          std::vector<std::string>* paths,
+                          const Status& status) {
+  if (status.ok() && !cfd->IsDropped()) {
+    StorageCpMarkOutputsPublished(fs, *paths);
+    TEST_SYNC_POINT_CALLBACK("MemTableList::StorageCpPublished:Paths", paths);
+  } else {
+    StorageCpPreserveOutputsOnUncertainCommit(fs, *paths);
+    TEST_SYNC_POINT_CALLBACK("MemTableList::StorageCpPreserved:Paths", paths);
+  }
+}
+
+}  // namespace
 
 class InternalKeyComparator;
 class Mutex;
@@ -575,8 +609,14 @@ Status MemTableList::TryInstallMemtableFlushResults(
       }
       edit_list.push_back(&wal_deletion);
 
+      auto ownership_paths = FlushOutputPaths(cfd, edit_list);
+      bool ownership_completed = false;
       const auto manifest_write_cb = [this, cfd, batch_count, log_buffer,
-                                      to_delete, mu](const Status& status) {
+                                      to_delete, mu, vset, &ownership_paths,
+                                      &ownership_completed](const Status& status) {
+        FinishFlushOwnership(vset->db_options()->fs.get(), cfd,
+                             &ownership_paths, status);
+        ownership_completed = true;
         RemoveMemTablesOrRestoreFlags(status, cfd, batch_count, log_buffer,
                                       to_delete, mu);
       };
@@ -586,6 +626,12 @@ Status MemTableList::TryInstallMemtableFlushResults(
                               db_directory, /*new_descriptor_log=*/false,
                               /*column_family_options=*/nullptr,
                               manifest_write_cb);
+        // LogAndApply can return early (e.g. every CF was dropped) without
+        // invoking its callback. Keep the prepared files protected then too.
+        if (!ownership_completed) {
+          FinishFlushOwnership(vset->db_options()->fs.get(), cfd,
+                               &ownership_paths, s);
+        }
       } else {
         // If write_edit is false (e.g: successful mempurge),
         // then remove old memtables, wake up manifest write queue threads,
@@ -882,9 +928,29 @@ Status InstallMemtableAtomicFlushResults(
     assert(0 == num_entries);
   }
 
+  std::vector<std::vector<std::string>> ownership_paths;
+  std::vector<bool> ownership_completed(cfds.size(), false);
+  std::vector<std::function<void(const Status&)>> ownership_callbacks;
+  ownership_paths.reserve(cfds.size());
+  for (size_t i = 0; i < cfds.size(); ++i) {
+    ownership_paths.push_back(FlushOutputPaths(cfds[i], edit_lists[i]));
+    ownership_callbacks.emplace_back([&, i](const Status& status) {
+      FinishFlushOwnership(vset->db_options()->fs.get(), cfds[i],
+                           &ownership_paths[i], status);
+      ownership_completed[i] = true;
+    });
+  }
+
   // this can release and reacquire the mutex.
   s = vset->LogAndApply(cfds, mutable_cf_options_list, edit_lists, mu,
-                        db_directory);
+                        db_directory, /*new_descriptor_log=*/false,
+                        /*new_cf_options=*/nullptr, ownership_callbacks);
+  for (size_t i = 0; i < cfds.size(); ++i) {
+    if (!ownership_completed[i]) {
+      FinishFlushOwnership(vset->db_options()->fs.get(), cfds[i],
+                           &ownership_paths[i], s);
+    }
+  }
 
   for (size_t k = 0; k != cfds.size(); ++k) {
     auto* imm = (imm_lists == nullptr) ? cfds[k]->imm() : imm_lists->at(k);

@@ -13,6 +13,8 @@
 #include <iostream>
 #include <memory>
 #include <sstream>
+#include <random>
+#include <thread>
 #include <string>
 
 #include "env_hdfs.h"
@@ -554,71 +556,160 @@ void HdfsFileSystem::LogStorageRpc(const char* op, const std::string& path,
   }
 }
 
-// [relink/Storage-CP] refcount++ for a file this shard now references in place.
-void HdfsFileSystem::NotifyRelinkLink(const std::string& path) const {
-  StorageCpClient* client = GetStorageCpClient();
-  if (client == nullptr || !IsSstFile(path)) return;
-  compactionservice::FileRef req;
-  req.set_path(path);
-  req.set_shard_id(storage_cp_shard_);
-  google::protobuf::Empty reply;
-  grpc::ClientContext ctx;
-  sst_creation_trace::RpcTimer rpc_timer;
-  grpc::Status s = client->stub->NotifyLink(&ctx, req, &reply);
-  rpc_timer.Finish("NotifyLink", path, s.ok());
-  LogStorageRpc("NotifyLink", path, s.ok(), s.error_message());
+namespace {
+bool StorageCpEnabled() {
+  const char* value = std::getenv("STORAGE_CP_ADDR");
+  return value != nullptr && *value != '\0';
 }
-
-// Engine-facing entry point (declared in storage_cp_hook.h). Unwraps whatever
-// FileSystem wrappers the DB stacked on top and no-ops if HDFS is not underneath.
-void StorageCpNotifyLink(FileSystem* fs, const std::string& path) {
-  if (fs == nullptr) return;
-  const HdfsFileSystem* hfs = fs->CheckedCast<HdfsFileSystem>();
-  if (hfs != nullptr) hfs->NotifyRelinkLink(path);
+std::string StorageOperationId() {
+  static const std::string session = [] {
+    std::random_device random;
+    return std::to_string(random()) + "-" + std::to_string(random()) + "-" +
+           std::to_string(getpid()) + "-" +
+           std::to_string(std::chrono::system_clock::now().time_since_epoch().count());
+  }();
+  static std::atomic<uint64_t> sequence{0};
+  return session + "-" + std::to_string(sequence.fetch_add(1));
 }
+int StorageRpcTimeoutMs() {
+  const char* value = std::getenv("STORAGE_CP_RPC_TIMEOUT_MS");
+  if (!value) return 5000;
+  char* end = nullptr;
+  long ms = std::strtol(value, &end, 10);
+  return end != value && *end == '\0' && ms > 0 && ms <= 60000
+             ? static_cast<int>(ms) : 5000;
+}
+void TracePublication(const char* phase, const std::vector<std::string>& paths) {
+  if (!sst_creation_trace::Enabled()) return;
+  for (const auto& path : paths) {
+    sst_creation_trace::GetSink().Emit(
+        "\"event\":\"ownership_publication\",\"phase\":" +
+        sst_creation_trace::Quote(phase) + ",\"path\":" +
+        sst_creation_trace::Quote(path));
+  }
+}
+}  // namespace
 
-// [relink/Storage-CP batch 2026-09-09] refcount++ for N paths in ONE unary RPC.
-// The per-file loop in RegisterExternalFilesInPlace was serial: ~3.7 ms/file
-// unloaded, ~13 ms/file under load (CP latch contention + a flushed log line +
-// a round trip each) = the only O(#files) term left in relink's stop window
-// (374 files -> 1.37 s of a 2.6 s window; 1000+ files at 64 GB -> 4-20 s).
-// Non-SST paths are skipped exactly like the single call. A CP that predates
-// the RPC answers UNIMPLEMENTED -> per-file fallback, so a mixed deployment
-// (new engine, old procp) still counts every reference.
-void HdfsFileSystem::NotifyRelinkLinkBatch(
-    const std::vector<std::string>& paths) const {
-  StorageCpClient* client = GetStorageCpClient();
-  if (client == nullptr) return;
+Status HdfsFileSystem::CallStorageBatch(
+    const char* operation, const std::vector<std::string>& paths) const {
+  auto* client = GetStorageCpClient();
+  if (!client || paths.empty()) return Status::OK();
   compactionservice::FileRefBatch req;
-  for (const auto& p : paths) {
-    if (IsSstFile(p)) req.add_path(p);
+  std::unordered_set<std::string> seen;
+  for (const auto& path : paths) {
+    if (!IsSstFile(path)) return Status::InvalidArgument("Storage-CP expects SST", path);
+    if (seen.insert(path).second) req.add_path(path);
   }
-  if (req.path_size() == 0) return;
   req.set_shard_id(storage_cp_shard_);
-  google::protobuf::Empty reply;
-  grpc::ClientContext ctx;
-  sst_creation_trace::RpcTimer rpc_timer;
-  grpc::Status s = client->stub->NotifyLinkBatch(&ctx, req, &reply);
-  rpc_timer.Finish("NotifyLinkBatch", req.path(0), s.ok(), req.path_size());
-  if (!s.ok() && s.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
-    fprintf(stderr,
-            "[storage-cp] NotifyLinkBatch UNIMPLEMENTED at the CP (old procp) -> "
-            "falling back to per-file NotifyLink x%d\n",
-            req.path_size());
-    for (const auto& p : paths) NotifyRelinkLink(p);
-    return;
+  req.set_operation_id(StorageOperationId());
+  grpc::Status result;
+  for (int attempt = 0; attempt != 3; ++attempt) {
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(StorageRpcTimeoutMs()));
+    google::protobuf::Empty reply;
+    sst_creation_trace::RpcTimer timer;
+    const std::string op(operation);
+    if (op == "NotifyCreateBatch") result = client->stub->NotifyCreateBatch(&ctx, req, &reply);
+    else if (op == "PrepareReferences") result = client->stub->PrepareReferences(&ctx, req, &reply);
+    else if (op == "AbortUnpublished") result = client->stub->AbortUnpublished(&ctx, req, &reply);
+    else if (op == "RecoverReferences") result = client->stub->RecoverReferences(&ctx, req, &reply);
+    else return Status::InvalidArgument("Unknown Storage-CP operation", op);
+    const bool retry = !result.ok() && attempt != 2 &&
+        (result.error_code() == grpc::StatusCode::UNAVAILABLE ||
+         result.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED);
+    timer.Finish(operation, req.path(0), result.ok(), req.path_size(),
+                 req.operation_id(), attempt + 1, !retry);
+    LogStorageRpc(operation, req.path(0), result.ok(), result.error_message());
+    if (result.ok()) return Status::OK();
+    if (!retry) break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10 << attempt));
   }
-  LogStorageRpc("NotifyLinkBatch",
-                "n=" + std::to_string(req.path_size()) + " first=" + req.path(0),
-                s.ok(), s.error_message());
+  return Status::IOError(std::string("Storage-CP ") + operation, result.error_message());
 }
 
-// Engine-facing batch entry point (declared in storage_cp_hook.h).
-void StorageCpNotifyLinkBatch(FileSystem* fs,
-                              const std::vector<std::string>& paths) {
-  if (fs == nullptr || paths.empty()) return;
-  const HdfsFileSystem* hfs = fs->CheckedCast<HdfsFileSystem>();
-  if (hfs != nullptr) hfs->NotifyRelinkLinkBatch(paths);
+Status HdfsFileSystem::PrepareOutputs(const std::vector<std::string>& paths) const {
+  Status s = CallStorageBatch("NotifyCreateBatch", paths);
+  if (s.ok() && StorageCpEnabled()) {
+    publication_.Set(paths, storage_cp::PublicationTracker::State::kPrepared);
+    TracePublication("prepared", paths);
+  }
+  return s;
+}
+Status HdfsFileSystem::TrackUnpublishedOutput(const std::string& path) const {
+  if (!StorageCpEnabled()) return Status::OK();
+  using State = storage_cp::PublicationTracker::State;
+  const auto state = publication_.Get(path);
+  if (!IsSstFile(path) || (state != State::kUnknown && state != State::kPending))
+    return Status::InvalidArgument("Remote output is not an unpublished SST", path);
+  publication_.Set({path}, State::kPending);
+  return Status::OK();
+}
+Status HdfsFileSystem::AbortOutputs(const std::vector<std::string>& paths) const {
+  if (!StorageCpEnabled()) return Status::OK();
+  for (const auto& path : paths) {
+    if (!publication_.CanAbort(path))
+      return Status::InvalidArgument("Cannot abort published/uncertain SST", path);
+  }
+  Status s = CallStorageBatch("AbortUnpublished", paths);
+  if (s.ok()) {
+    publication_.Set(paths, storage_cp::PublicationTracker::State::kReleased);
+    TracePublication("aborted", paths);
+  }
+  return s;
+}
+Status HdfsFileSystem::RecoverReferences(const std::vector<std::string>& paths) const {
+  constexpr size_t kBatchSize = 512;
+  for (size_t i = 0; i < paths.size(); i += kBatchSize) {
+    const std::vector<std::string> batch(paths.begin() + i,
+        paths.begin() + std::min(paths.size(), i + kBatchSize));
+    Status s = CallStorageBatch("RecoverReferences", batch);
+    if (!s.ok()) return s;
+  }
+  return Status::OK();
+}
+void HdfsFileSystem::MarkOutputsPublished(const std::vector<std::string>& paths) const {
+  if (!StorageCpEnabled()) return;
+  publication_.Set(paths, storage_cp::PublicationTracker::State::kPublished);
+  TracePublication("published", paths);
+}
+void HdfsFileSystem::PreserveOutputs(const std::vector<std::string>& paths) const {
+  if (!StorageCpEnabled()) return;
+  publication_.Set(paths, storage_cp::PublicationTracker::State::kUncertain);
+  TracePublication("uncertain", paths);
+}
+Status HdfsFileSystem::NotifyRelinkLink(const std::string& path) const {
+  return NotifyRelinkLinkBatch({path});
+}
+Status HdfsFileSystem::NotifyRelinkLinkBatch(const std::vector<std::string>& paths) const {
+  // Fail closed on old servers: their link retry semantics were not idempotent.
+  return CallStorageBatch("PrepareReferences", paths);
+}
+
+#define STORAGE_CP_STATUS_HOOK(Name, Method)                                 \
+  Status Name(FileSystem* fs, const std::vector<std::string>& paths) {         \
+    const auto* hfs = fs ? fs->CheckedCast<HdfsFileSystem>() : nullptr;        \
+    return hfs ? hfs->Method(paths) : Status::OK();                           \
+  }
+STORAGE_CP_STATUS_HOOK(StorageCpPrepareOutputs, PrepareOutputs)
+STORAGE_CP_STATUS_HOOK(StorageCpAbortOutputs, AbortOutputs)
+STORAGE_CP_STATUS_HOOK(StorageCpRecoverReferences, RecoverReferences)
+STORAGE_CP_STATUS_HOOK(StorageCpNotifyLinkBatch, NotifyRelinkLinkBatch)
+#undef STORAGE_CP_STATUS_HOOK
+Status StorageCpNotifyLink(FileSystem* fs, const std::string& path) {
+  return StorageCpNotifyLinkBatch(fs, {path});
+}
+Status StorageCpTrackUnpublishedOutput(FileSystem* fs, const std::string& path) {
+  const auto* hfs = fs ? fs->CheckedCast<HdfsFileSystem>() : nullptr;
+  return hfs ? hfs->TrackUnpublishedOutput(path) : Status::OK();
+}
+void StorageCpMarkOutputsPublished(FileSystem* fs, const std::vector<std::string>& paths) {
+  const auto* hfs = fs ? fs->CheckedCast<HdfsFileSystem>() : nullptr;
+  if (hfs) hfs->MarkOutputsPublished(paths);
+}
+void StorageCpPreserveOutputsOnUncertainCommit(FileSystem* fs, const std::vector<std::string>& paths) {
+  const auto* hfs = fs ? fs->CheckedCast<HdfsFileSystem>() : nullptr;
+  if (hfs) hfs->PreserveOutputs(paths);
 }
 
 std::string HdfsFileSystem::GetId() const {
@@ -676,6 +767,11 @@ IOStatus HdfsFileSystem::NewWritableFile(
     const std::string& fname, const FileOptions& options,
     std::unique_ptr<FSWritableFile>* result, IODebugContext* /*dbg*/) {
   result->reset();
+  if (StorageCpEnabled() && IsSstFile(fname)) {
+    if (hdfsExists(fileSys_, fname.c_str()) == 0)
+      return IOStatus::IOError("Refusing to overwrite immutable SST", fname);
+    if (errno != ENOENT) return IOError(fname, errno);
+  }
   HdfsWritableFile* f = new HdfsWritableFile(fileSys_, fname, options);
   if (f == nullptr || !f->isValid()) {
     delete f;
@@ -683,31 +779,10 @@ IOStatus HdfsFileSystem::NewWritableFile(
   }
   result->reset(f);
 
-  // [relink/Storage-CP] NotifyCreate so the CP can seed refcount=1 for this new
-  // SST. DISABLED (client==nullptr) or non-SST => no-op => baseline
-  // bit-identical. Never affects the actual file creation above: a failure is
-  // reported but not propagated. NOTE the status is no longer discarded — a
-  // dropped NotifyCreate leaves the file untracked at the CP, and an untracked
-  // file is exactly what makes a later RequestDelete unsafe for relink.
-  if (StorageCpClient* client = GetStorageCpClient()) {
-    if (IsSstFile(fname)) {
-      compactionservice::FileRef req;
-      req.set_path(fname);
-      req.set_shard_id(storage_cp_shard_);
-      google::protobuf::Empty reply;
-      grpc::ClientContext ctx;
-      const uint64_t own_start_ns =
-          f->TracingCreation() ? sst_creation_trace::NowNs() : 0;
-      grpc::Status s = client->stub->NotifyCreate(&ctx, req, &reply);
-      if (f->TracingCreation()) {
-        f->TraceOwnRpc(sst_creation_trace::NowNs() - own_start_ns, s.ok());
-      }
-      LogStorageRpc("NotifyCreate", fname, s.ok(), s.error_message());
-      // [multi-mig] a re-created path is a fresh reference — reset the
-      // released-guard so its eventual legitimate delete goes through.
-      std::lock_guard<std::mutex> lg(released_paths_mu_);
-      released_paths_.erase(fname);
-    }
+  // A writer is not an ownership publication. CSA staging and failed outputs
+  // stay unregistered; the CN registers verified final output paths in a batch.
+  if (StorageCpEnabled() && IsSstFile(fname)) {
+    publication_.Set({fname}, storage_cp::PublicationTracker::State::kPending);
   }
   return IOStatus::OK();
 }
@@ -775,58 +850,42 @@ IOStatus HdfsFileSystem::GetChildren(const std::string& path,
 IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
-  // [relink/Storage-CP] When ENABLED and this is a shared SST, route the delete
-  // through the CP's refcount: only physically delete when the CP says the
-  // refcount hit 0 (reply.deleted==true). DISABLED or non-SST => unchanged
-  // baseline path below.
-  //
-  // ★ 2026-08-08: an RPC failure now KEEPS the file instead of falling through
-  // to hdfsDelete. The old fail-OPEN fallback is what destroyed the relink dst
-  // in 0807_2 — the CP never learned about the file, the source's compaction
-  // deleted it anyway, and the dst was left with 56 dangling external_path
-  // references (FileNotFoundException + a permanently stalled dst). Keeping an
-  // unconfirmed file leaks storage, which the CP's mark-sweep GC can reclaim;
-  // deleting one that another shard still references is unrecoverable data
-  // loss. Set STORAGE_CP_UNSAFE_DELETE_ON_RPC_FAIL=1 for the old behavior.
-  if (StorageCpClient* client = GetStorageCpClient()) {
-    if (IsSstFile(fname)) {
-      // [multi-mig 2026-08-26] This process already released its reference and
-      // the CP kept the bytes for another shard — a repeat delete (forced
-      // full scan re-collecting the still-present file) must NOT burn another
-      // refcount. Short-circuit to OK, exactly what the caller saw last time.
-      {
-        std::lock_guard<std::mutex> lg(released_paths_mu_);
-        if (released_paths_.count(fname)) {
-          LogStorageRpc("RequestDelete(SKIP already-released)", fname, true, "");
-          return IOStatus::OK();
-        }
-      }
-      compactionservice::FileRef req;
-      req.set_path(fname);
-      req.set_shard_id(storage_cp_shard_);
-      compactionservice::DeleteReply reply;
-      grpc::ClientContext ctx;
-      sst_creation_trace::RpcTimer rpc_timer;
-      grpc::Status s = client->stub->RequestDelete(&ctx, req, &reply);
-      rpc_timer.Finish("RequestDelete", fname, s.ok());
-      LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
-      if (s.ok()) {
-        if (!reply.deleted()) {
-          // Still referenced by another shard (or the CP owns the delete):
-          // keep the physical file, and remember we released our reference.
-          std::lock_guard<std::mutex> lg(released_paths_mu_);
-          released_paths_.insert(fname);
-          return IOStatus::OK();
-        }
-        // refcount reached 0: fall through to physically delete.
-      } else {
-        static const bool unsafe =
-            std::getenv("STORAGE_CP_UNSAFE_DELETE_ON_RPC_FAIL") != nullptr;
-        if (!unsafe) return IOStatus::OK();  // fail-SAFE: keep, let GC reclaim
-      }
+  if (StorageCpEnabled() && IsSstFile(fname)) {
+    using State = storage_cp::PublicationTracker::State;
+    const auto state = publication_.Get(fname);
+    if (state == State::kUnknown) {
+      // A scan after restart is not proof of an abandoned writer. Only paths
+      // recovered from this DB's MANIFEST, or published in this process, may
+      // issue an ordinary release. Offline recovery resolves the remainder.
+      LogStorageRpc("DeleteUnknown(KEEP)", fname, true, "offline recovery required");
+      return IOStatus::OK();
     }
+    if (state == State::kReleased || state == State::kRenamedAway ||
+        state == State::kUncertain) return IOStatus::OK();
+    if (state == State::kPending || state == State::kPrepared) {
+      Status s = AbortOutputs({fname});
+      return s.ok() ? IOStatus::OK() : IOStatus::IOError(s.ToString());
+    }
+    auto* client = GetStorageCpClient();
+    compactionservice::FileRef req;
+    req.set_path(fname);
+    req.set_shard_id(storage_cp_shard_);
+    compactionservice::DeleteReply reply;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(StorageRpcTimeoutMs()));
+    sst_creation_trace::RpcTimer timer;
+    const auto s = client->stub->RequestDelete(&ctx, req, &reply);
+    timer.Finish("RequestDelete", fname, s.ok());
+    LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
+    if (!s.ok()) return IOStatus::IOError("Storage-CP release", s.error_message());
+    publication_.Set({fname}, State::kReleased);
+    // Physical SST deletion belongs exclusively to CP, even if an old server
+    // responds deleted=true. There is deliberately no unsafe client fallback.
+    return IOStatus::OK();
   }
-  if (hdfsDelete(fileSys_, fname.c_str(), 1) == 0) {
+  // Under ownership mode never recursively remove a directory containing SSTs.
+  if (hdfsDelete(fileSys_, fname.c_str(), StorageCpEnabled() ? 0 : 1) == 0) {
     return IOStatus::OK();
   }
   return IOError(fname, errno);
@@ -884,56 +943,36 @@ IOStatus HdfsFileSystem::GetFileModificationTime(const std::string& fname,
   return IOError(fname, errno);
 }
 
-// The rename is not atomic. HDFS does not allow a renaming if the
-// target already exists. So, we delete the target before attempting the
-// rename.
+// Only unpublished staging SSTs may move. Their final ownership is registered
+// later by the compaction install path, before MANIFEST publication.
 IOStatus HdfsFileSystem::RenameFile(const std::string& src,
                                     const std::string& target,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
-  hdfsDelete(fileSys_, target.c_str(), 1);
-  if (hdfsRename(fileSys_, src.c_str(), target.c_str()) == 0) {
-    // [relink/Storage-CP] The CP refcount is keyed by PATH, so a rename moves the
-    // bytes to a NEW key. Transfer the refcount with the bytes: seed the target (so
-    // the CN's later DeleteFile drives it to 0 and the CP GC reclaims it) and release
-    // the src key. Without this the CSA-output path that the CN adopts via rename
-    // (compaction_service_job.cc -- the only engine .sst->.sst rename) orphans at
-    // refcount=1 forever: the CP map climbs unbounded and the GC never reclaims
-    // (tracked++, batch=0/deleted=0), the live bytes at the target are UNTRACKED, and
-    // HDFS bloats -> throughput collapse. DISABLED (client==nullptr) or non-SST =>
-    // no-op => baseline bit-identical. Errors swallowed; never affects the rename.
-    if (StorageCpClient* client = GetStorageCpClient()) {
-      if (IsSstFile(src) && IsSstFile(target)) {
-        compactionservice::FileRef cr;
-        cr.set_path(target);
-        cr.set_shard_id(storage_cp_shard_);
-        google::protobuf::Empty creply;
-        grpc::ClientContext cctx;
-        sst_creation_trace::RpcTimer create_rpc_timer;
-        grpc::Status cs =
-            client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
-        create_rpc_timer.Finish("NotifyCreate(rename)", target, cs.ok());
-        LogStorageRpc("NotifyCreate(rename)", target, cs.ok(),
-                      cs.error_message());
-        {  // [multi-mig] rename target is a fresh reference — reset the guard
-          std::lock_guard<std::mutex> lg(released_paths_mu_);
-          released_paths_.erase(target);
-        }
-        compactionservice::FileRef dr;
-        dr.set_path(src);
-        dr.set_shard_id(storage_cp_shard_);
-        compactionservice::DeleteReply dreply;
-        grpc::ClientContext dctx;
-        sst_creation_trace::RpcTimer delete_rpc_timer;
-        grpc::Status ds =
-            client->stub->RequestDelete(&dctx, dr, &dreply);  // -1 on old key
-        delete_rpc_timer.Finish("RequestDelete(rename)", src, ds.ok());
-        LogStorageRpc("RequestDelete(rename)", src, ds.ok(), ds.error_message());
-      }
+  const bool ownership_sst = StorageCpEnabled() && (IsSstFile(src) || IsSstFile(target));
+  if (ownership_sst) {
+    using State = storage_cp::PublicationTracker::State;
+    const auto state = publication_.Get(src);
+    if (!IsSstFile(src) || !IsSstFile(target) ||
+        state != State::kPending) {
+      return IOStatus::InvalidArgument("Only unpublished SSTs may be renamed", src);
     }
-    return IOStatus::OK();
+    if (hdfsExists(fileSys_, target.c_str()) == 0)
+      return IOStatus::IOError("Refusing to overwrite SST rename target", target);
+    if (errno != ENOENT) return IOError(target, errno);
+  } else {
+    hdfsDelete(fileSys_, target.c_str(), StorageCpEnabled() ? 0 : 1);
   }
-  return IOError(src, errno);
+  if (hdfsRename(fileSys_, src.c_str(), target.c_str()) != 0) return IOError(src, errno);
+  if (ownership_sst) {
+    publication_.Renamed(src, target);
+    if (sst_creation_trace::Enabled()) {
+      sst_creation_trace::GetSink().Emit(
+          "\"event\":\"file_rename\",\"src\":" + sst_creation_trace::Quote(src) +
+          ",\"path\":" + sst_creation_trace::Quote(target));
+    }
+  }
+  return IOStatus::OK();
 }
 
 IOStatus HdfsFileSystem::LockFile(const std::string& /*fname*/,

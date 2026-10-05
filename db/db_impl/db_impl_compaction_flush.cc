@@ -472,6 +472,9 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
   }
 
   std::vector<FileMetaData> file_meta(num_cfs);
+  // A CF can finish writing and prepare ownership but be excluded from the
+  // atomic MANIFEST group after another CF fails or this CF is dropped.
+  std::vector<bool> output_install_attempted(num_cfs, false);
   // Use of deque<bool> because vector<bool>
   // is specific and doesn't allow &v[i].
   std::deque<bool> switched_to_mempurge(num_cfs, false);
@@ -689,6 +692,7 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
     for (int i = 0; i != num_cfs; ++i) {
       const auto& mems = jobs[i]->GetMemTables();
       if (!cfds[i]->IsDropped() && !mems.empty()) {
+        output_install_attempted[i] = true;
         tmp_cfds.emplace_back(cfds[i]);
         mems_list.emplace_back(&mems);
         mutable_cf_options_list.emplace_back(&all_mutable_cf_options[i]);
@@ -705,6 +709,14 @@ Status DBImpl::AtomicFlushMemTablesToOutputFiles(
         versions_.get(), &logs_with_prep_tracker_, &mutex_, tmp_file_meta,
         committed_flush_jobs_info, &job_context->memtables_to_free,
         directories_.GetDbDir(), log_buffer);
+  }
+
+  for (int i = 0; i != num_cfs; ++i) {
+    if (!output_install_attempted[i]) {
+      // The helper releases mutex_ around the CP RPC. Outputs submitted to
+      // LogAndApply are handled only by its publish/preserve callback instead.
+      jobs[i]->AbortUnpublishedOutputs();
+    }
   }
 
   if (s.ok()) {

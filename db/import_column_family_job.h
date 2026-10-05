@@ -49,6 +49,11 @@ class ImportColumnFamilyJob {
   // REQUIRES: Mutex held
   Status Run();
 
+  // Final paths are complete after Run. RPCs require the DB mutex released.
+  Status PrepareOwnership();
+  // Call immediately after the actual MANIFEST attempt; local state only.
+  void FinishOwnership(const Status& manifest_status);
+
   // Cleanup after successful/failed job
   void Cleanup(const Status& status);
 
@@ -74,6 +79,8 @@ class ImportColumnFamilyJob {
   const EnvOptions& env_options_;
   autovector<IngestedFileInfo> files_to_import_;
   VersionEdit edit_;
+  std::vector<std::string> ownership_paths_;
+  bool ownership_manifest_attempted_ = false;
   const ImportColumnFamilyOptions& import_options_;
   std::vector<LiveFileMetaData> metadata_;
   const std::shared_ptr<IOTracer> io_tracer_;

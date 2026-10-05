@@ -85,11 +85,12 @@ service ProCPService {
 }
 
 // [relink/Storage-CP] Per-file refcount + GC over shared SSTs on HDFS.
-// path = full HDFS URI of the .sst (e.g. hdfs://192.168.88.87:9000/kg/s0/000123.sst).
+// path = canonical absolute bare HDFS path (e.g. /kg/s0/000123.sst).
+// One CP serves one HDFS namespace. URI and alternate spellings are rejected.
 // Eager refcount: NotifyCreate(=1) -> NotifyLink(++ on relink) -> RequestDelete(--; physical
-// delete only at 0). A periodic mark-sweep GC reconciles leaks against live MANIFESTs.
+// delete only at 0). Durable tombstones fence GC against late registration.
 message FileRef {
-  string path = 1;       // full HDFS URI of the .sst file
+  string path = 1;       // canonical absolute bare path of the .sst file
   uint32 shard_id = 2;   // owning / requesting shard index
 }
 
@@ -106,11 +107,20 @@ message DeleteReply {
 // Additive change: old engines keep using NotifyLink; an engine that gets UNIMPLEMENTED from
 // an old CP falls back to the per-file loop.
 message FileRefBatch {
-  repeated string path = 1;  // full HDFS URIs of the .sst files
+  repeated string path = 1;  // canonical absolute bare paths of the .sst files
   uint32 shard_id = 2;       // adopting shard index
+  string operation_id = 3;  // stable across retries of ONE operation
 }
 
 service StorageService {
+  // Final paths only; successful durable ACK is required BEFORE MANIFEST.
+  rpc NotifyCreateBatch(FileRefBatch) returns (google.protobuf.Empty) {}
+  // Shared inputs: durable, retry-safe claim BEFORE destination MANIFEST.
+  rpc PrepareReferences(FileRefBatch) returns (google.protobuf.Empty) {}
+  // Caller proves these outputs were never published. Fences late create.
+  rpc AbortUnpublished(FileRefBatch) returns (google.protobuf.Empty) {}
+  // Verify existing durable references; never guess ownership from absence.
+  rpc RecoverReferences(FileRefBatch) returns (google.protobuf.Empty) {}
   rpc NotifyCreate(FileRef) returns (google.protobuf.Empty) {}  // refcount[path]=1, owners={shard}
   rpc NotifyLink(FileRef) returns (google.protobuf.Empty) {}    // refcount[path]++, owners+={shard}
   rpc NotifyLinkBatch(FileRefBatch) returns (google.protobuf.Empty) {}  // NotifyLink x N, one latch

@@ -23,6 +23,8 @@
 #include "table/table_builder.h"
 #include "table/unique_id_impl.h"
 #include "util/stop_watch.h"
+#include "plugin/hdfs/storage_cp_hook.h"
+#include "test_util/sync_point.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -179,7 +181,40 @@ Status ImportColumnFamilyJob::Run() {
   return status;
 }
 
+Status ImportColumnFamilyJob::PrepareOwnership() {
+  ownership_paths_.clear();
+  for (const auto& file : files_to_import_) {
+    if (!file.internal_file_path.empty()) ownership_paths_.push_back(file.internal_file_path);
+  }
+  TEST_SYNC_POINT_CALLBACK("ImportColumnFamilyJob::StorageCpPrepare:Paths",
+                           &ownership_paths_);
+  Status status = StorageCpPrepareOutputs(fs_.get(), ownership_paths_);
+  TEST_SYNC_POINT_CALLBACK("ImportColumnFamilyJob::StorageCpPrepare:Status", &status);
+  return status;
+}
+
+void ImportColumnFamilyJob::FinishOwnership(const Status& manifest_status) {
+  ownership_manifest_attempted_ = true;
+  if (manifest_status.ok() && !cfd_->IsDropped()) {
+    StorageCpMarkOutputsPublished(fs_.get(), ownership_paths_);
+    TEST_SYNC_POINT_CALLBACK("ImportColumnFamilyJob::StorageCpPublished:Paths",
+                             &ownership_paths_);
+  } else {
+    StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), ownership_paths_);
+    TEST_SYNC_POINT_CALLBACK("ImportColumnFamilyJob::StorageCpPreserved:Paths",
+                             &ownership_paths_);
+  }
+}
+
 void ImportColumnFamilyJob::Cleanup(const Status& status) {
+  if (!ownership_manifest_attempted_) {
+    std::vector<std::string> abandoned;
+    for (const auto& file : files_to_import_) {
+      if (!file.internal_file_path.empty()) abandoned.push_back(file.internal_file_path);
+    }
+    TEST_SYNC_POINT_CALLBACK("ImportColumnFamilyJob::StorageCpAbort:Paths", &abandoned);
+    StorageCpAbortOutputs(fs_.get(), abandoned).PermitUncheckedError();
+  }
   if (!status.ok()) {
     // We failed to add files to the database remove all the files we copied.
     for (const auto& f : files_to_import_) {

@@ -1,7 +1,7 @@
 // Opt-in, per-physical-SST experiment tracing. No clocks, path copies, or
 // output are used unless SST_CREATION_TRACE names a local JSONL output file.
 // Open-to-close is wall time, including interleaved merge iteration, encoding,
-// synchronous ownership registration, writes, Sync and Close. Work before
+// writes, Sync and Close. Publication ownership RPCs are separate events. Work before
 // opening the file is deliberately not attributed to that file.
 #pragma once
 
@@ -105,13 +105,17 @@ inline bool Enabled() { return GetSink().enabled(); }
 
 inline void OwnershipRpc(const char* op, const std::string& path,
                          uint64_t duration_ns, bool success,
-                         uint64_t files = 1) {
+                         uint64_t files = 1, const std::string& operation_id = "",
+                         uint32_t attempt = 1, bool terminal = true) {
   if (!Enabled()) return;
   std::ostringstream row;
   row << "\"event\":\"ownership_rpc\",\"op\":" << Quote(op)
       << ",\"path\":" << Quote(path) << ",\"duration_ns\":" << duration_ns
       << ",\"success\":" << (success ? "true" : "false")
-      << ",\"files\":" << files;
+      << ",\"files\":" << files
+      << ",\"operation_id\":" << Quote(operation_id)
+      << ",\"attempt\":" << attempt
+      << ",\"terminal\":" << (terminal ? "true" : "false");
   GetSink().Emit(row.str());
 }
 
@@ -119,10 +123,12 @@ class RpcTimer {
  public:
   RpcTimer() : enabled_(Enabled()), start_ns_(enabled_ ? NowNs() : 0) {}
   void Finish(const char* op, const std::string& path, bool success,
-              uint64_t files = 1) const {
+              uint64_t files = 1, const std::string& operation_id = "",
+              uint32_t attempt = 1, bool terminal = true) const {
     if (!enabled_) return;
     const uint64_t duration_ns = NowNs() - start_ns_;
-    OwnershipRpc(op, path, duration_ns, success, files);
+    OwnershipRpc(op, path, duration_ns, success, files, operation_id, attempt,
+                 terminal);
   }
  private:
   bool enabled_;
