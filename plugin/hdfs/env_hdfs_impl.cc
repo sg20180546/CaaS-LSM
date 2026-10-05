@@ -25,6 +25,7 @@
 #include "rocksdb/env.h"
 #include "rocksdb/status.h"
 #include "util/string_util.h"
+#include "util/sst_creation_trace.h"
 
 // [relink/Storage-CP] Generated gRPC client for the StorageService refcount/GC
 // CP. These headers are produced at build time into ${CMAKE_CURRENT_BINARY_DIR}
@@ -239,6 +240,7 @@ class HdfsWritableFile : public FSWritableFile {
   hdfsFS fileSys_;
   std::string filename_;
   hdfsFile hfile_;
+  sst_creation_trace::File creation_trace_;
 
  public:
   HdfsWritableFile(hdfsFS fileSys, const std::string& fname,
@@ -249,7 +251,9 @@ class HdfsWritableFile : public FSWritableFile {
         hfile_(nullptr) {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile opening %s\n",
                     filename_.c_str());
+    creation_trace_.Begin(filename_);
     hfile_ = hdfsOpenFile(fileSys_, filename_.c_str(), O_WRONLY, 0, 0, 0);
+    creation_trace_.Opened(hfile_ != nullptr);
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile opened %s\n",
                     filename_.c_str());
     assert(hfile_ != nullptr);
@@ -258,7 +262,8 @@ class HdfsWritableFile : public FSWritableFile {
     if (hfile_ != nullptr) {
       ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closing %s\n",
                       filename_.c_str());
-      hdfsCloseFile(fileSys_, hfile_);
+      const int rc = hdfsCloseFile(fileSys_, hfile_);
+      creation_trace_.End(rc == 0, "destructor");
       ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closed %s\n",
                       filename_.c_str());
       hfile_ = nullptr;
@@ -270,6 +275,11 @@ class HdfsWritableFile : public FSWritableFile {
   // If the file was successfully created, then this returns true.
   // Otherwise returns false.
   bool isValid() { return hfile_ != nullptr; }
+
+  bool TracingCreation() const { return creation_trace_.enabled(); }
+  void TraceOwnRpc(uint64_t duration_ns, bool success) {
+    creation_trace_.OwnRpc(duration_ns, success);
+  }
 
   // The name of the file, mostly needed for debug logging.
   const std::string& getName() { return filename_; }
@@ -284,8 +294,10 @@ class HdfsWritableFile : public FSWritableFile {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Appended %s\n",
                     filename_.c_str());
     if (ret != left) {
+      creation_trace_.IoFailed();
       return IOError(filename_, errno);
     }
+    creation_trace_.AddBytes(left);
     g_hdfs_io_bytes_written.fetch_add(left, std::memory_order_relaxed);
     return IOStatus::OK();
   }
@@ -294,8 +306,10 @@ class HdfsWritableFile : public FSWritableFile {
   IOStatus Append(const char* src, size_t size) {
     if (hdfsWrite(fileSys_, hfile_, src, static_cast<tSize>(size)) !=
         static_cast<tSize>(size)) {
+      creation_trace_.IoFailed();
       return IOError(filename_, errno);
     }
+    creation_trace_.AddBytes(size);
     g_hdfs_io_bytes_written.fetch_add(size, std::memory_order_relaxed);
     return IOStatus::OK();
   }
@@ -310,9 +324,11 @@ class HdfsWritableFile : public FSWritableFile {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Sync %s\n",
                     filename_.c_str());
     if (hdfsFlush(fileSys_, hfile_) == -1) {
+      creation_trace_.IoFailed();
       return IOError(filename_, errno);
     }
     if (hdfsHSync(fileSys_, hfile_) == -1) {
+      creation_trace_.IoFailed();
       return IOError(filename_, errno);
     }
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile Synced %s\n",
@@ -336,6 +352,7 @@ class HdfsWritableFile : public FSWritableFile {
       hdfsFile h = hfile_;
       hfile_ = nullptr;
       rc = hdfsCloseFile(fileSys_, h);
+      creation_trace_.End(rc == 0, "explicit");
     }
     if (rc != 0) {
       return IOError(filename_, errno);
@@ -546,7 +563,9 @@ void HdfsFileSystem::NotifyRelinkLink(const std::string& path) const {
   req.set_shard_id(storage_cp_shard_);
   google::protobuf::Empty reply;
   grpc::ClientContext ctx;
+  sst_creation_trace::RpcTimer rpc_timer;
   grpc::Status s = client->stub->NotifyLink(&ctx, req, &reply);
+  rpc_timer.Finish("NotifyLink", path, s.ok());
   LogStorageRpc("NotifyLink", path, s.ok(), s.error_message());
 }
 
@@ -578,7 +597,9 @@ void HdfsFileSystem::NotifyRelinkLinkBatch(
   req.set_shard_id(storage_cp_shard_);
   google::protobuf::Empty reply;
   grpc::ClientContext ctx;
+  sst_creation_trace::RpcTimer rpc_timer;
   grpc::Status s = client->stub->NotifyLinkBatch(&ctx, req, &reply);
+  rpc_timer.Finish("NotifyLinkBatch", req.path(0), s.ok(), req.path_size());
   if (!s.ok() && s.error_code() == grpc::StatusCode::UNIMPLEMENTED) {
     fprintf(stderr,
             "[storage-cp] NotifyLinkBatch UNIMPLEMENTED at the CP (old procp) -> "
@@ -675,7 +696,12 @@ IOStatus HdfsFileSystem::NewWritableFile(
       req.set_shard_id(storage_cp_shard_);
       google::protobuf::Empty reply;
       grpc::ClientContext ctx;
+      const uint64_t own_start_ns =
+          f->TracingCreation() ? sst_creation_trace::NowNs() : 0;
       grpc::Status s = client->stub->NotifyCreate(&ctx, req, &reply);
+      if (f->TracingCreation()) {
+        f->TraceOwnRpc(sst_creation_trace::NowNs() - own_start_ns, s.ok());
+      }
       LogStorageRpc("NotifyCreate", fname, s.ok(), s.error_message());
       // [multi-mig] a re-created path is a fresh reference — reset the
       // released-guard so its eventual legitimate delete goes through.
@@ -780,7 +806,9 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
       req.set_shard_id(storage_cp_shard_);
       compactionservice::DeleteReply reply;
       grpc::ClientContext ctx;
+      sst_creation_trace::RpcTimer rpc_timer;
       grpc::Status s = client->stub->RequestDelete(&ctx, req, &reply);
+      rpc_timer.Finish("RequestDelete", fname, s.ok());
       LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
       if (s.ok()) {
         if (!reply.deleted()) {
@@ -881,8 +909,10 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
         cr.set_shard_id(storage_cp_shard_);
         google::protobuf::Empty creply;
         grpc::ClientContext cctx;
+        sst_creation_trace::RpcTimer create_rpc_timer;
         grpc::Status cs =
             client->stub->NotifyCreate(&cctx, cr, &creply);  // +1 on the new key
+        create_rpc_timer.Finish("NotifyCreate(rename)", target, cs.ok());
         LogStorageRpc("NotifyCreate(rename)", target, cs.ok(),
                       cs.error_message());
         {  // [multi-mig] rename target is a fresh reference — reset the guard
@@ -894,8 +924,10 @@ IOStatus HdfsFileSystem::RenameFile(const std::string& src,
         dr.set_shard_id(storage_cp_shard_);
         compactionservice::DeleteReply dreply;
         grpc::ClientContext dctx;
+        sst_creation_trace::RpcTimer delete_rpc_timer;
         grpc::Status ds =
             client->stub->RequestDelete(&dctx, dr, &dreply);  // -1 on old key
+        delete_rpc_timer.Finish("RequestDelete(rename)", src, ds.ok());
         LogStorageRpc("RequestDelete(rename)", src, ds.ok(), ds.error_message());
       }
     }
