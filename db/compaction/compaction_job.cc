@@ -56,6 +56,7 @@
 #include "table/unique_id_impl.h"
 #include "test_util/sync_point.h"
 #include "util/stop_watch.h"
+#include "util/sst_creation_trace.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -1052,6 +1053,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   }
 #endif  // !ROCKSDB_LITE
 
+  sst_creation_trace::Scope creation_scope("compaction", job_id_);
   uint64_t prev_cpu_micros = db_options_.clock->CPUMicros();
 
   ColumnFamilyData* cfd = sub_compact->compaction->column_family_data();
@@ -1421,6 +1423,7 @@ void CompactionJob::ProcessKeyValueCompaction(SubcompactionState* sub_compact) {
   raw_input.reset();
   sub_compact->status = status;
   NotifyOnSubcompactionCompleted(sub_compact);
+  creation_scope.SetResult(status.ok());
 }
 
 uint64_t CompactionJob::GetCompactionId(SubcompactionState* sub_compact) const {
@@ -1634,6 +1637,11 @@ Status CompactionJob::FinishCompactionOutputFile(
   }
 #endif
 
+  if (sst_creation_trace::Enabled()) {
+    sst_creation_trace::BuildResult(
+        GetTableFileName(output_number), meta == nullptr ? 0 : meta->fd.file_size,
+        s.ok(), meta == nullptr || (current_entries == 0 && tp.num_range_deletions == 0));
+  }
   outputs.ResetBuilder();
   return s;
 }
@@ -1805,6 +1813,7 @@ Status CompactionJob::OpenCompactionOutputFile(SubcompactionState* sub_compact,
         fname, job_id_, FileDescriptor(), kInvalidBlobFileNumber,
         TableProperties(), TableFileCreationReason::kCompaction, s,
         kUnknownFileChecksum, kUnknownFileChecksumFuncName);
+    sst_creation_trace::BuildResult(fname, 0, false, true);
     return s;
   }
 

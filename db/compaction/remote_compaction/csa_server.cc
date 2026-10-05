@@ -165,6 +165,14 @@ int main(int argc, char** argv) {
     std::cout << GetTime() << "csa_address overridden to "
               << compaction_service_options.csa_address << std::endl;
   }
+  // Optional full address for isolated experiments sharing a CSA host.
+  if (const char* address = getenv("CSA_ADDR")) {
+    if (*address) {
+      compaction_service_options.csa_address = address;
+      std::cout << GetTime() << "csa_address overridden from CSA_ADDR to "
+                << compaction_service_options.csa_address << std::endl;
+    }
+  }
   // [tuning] per-CSA concurrent compaction-task limit, overridable via env so we can
   // sweep it without recompiling. Default stays 5 (options.h). The CSA enforces this
   // (queues when over) and reports it to the CP, which schedules accordingly.
