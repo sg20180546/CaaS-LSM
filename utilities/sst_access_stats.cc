@@ -80,6 +80,15 @@ uint64_t SstAccessStatsNowMicros(DB* db) {
   return impl->immutable_db_options().clock->NowMicros();
 }
 
+Status SetResidentReaderRatesForWarmup(DB* db, std::vector<SstReaderRate> rates) {
+  if (db == nullptr) {
+    return Status::InvalidArgument("db cannot be null");
+  }
+  static_cast<DBImpl*>(db->GetRootDB())
+      ->SetWarmupResidentReaderRates(std::move(rates));
+  return Status::OK();
+}
+
 Status GetLRUCacheShardPoolStats(Cache* cache,
                                  std::vector<LRUCacheShardPoolStats>* out) {
   if (cache == nullptr) {

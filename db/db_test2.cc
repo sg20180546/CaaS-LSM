@@ -8058,14 +8058,14 @@ TEST_F(DBTest2, RelinkTableCacheWarmupRateModeRanksByLookupRate) {
       DB::Open(destination_options, destination_name, &destination_raw));
   std::unique_ptr<DB> destination(destination_raw);
 
-  // Register eleven deep files and one L0 file. None of these paths exists. The
+  // Register twelve deep files and one L0 file. None of these paths exists. The
   // metadata-complete registration and warmup must therefore succeed without
   // opening or reading an SST.
   std::vector<std::string> external_paths;
   std::vector<ExternalFileForRegister> registrations;
-  external_paths.reserve(12);
-  registrations.reserve(12);
-  for (size_t i = 0; i < 12; ++i) {
+  external_paths.reserve(13);
+  registrations.reserve(13);
+  for (size_t i = 0; i < 13; ++i) {
     external_paths.emplace_back(destination_name + "/missing-external-" +
                                 std::to_string(i) + ".sst");
     ExternalFileForRegister registration;
@@ -8157,7 +8157,7 @@ TEST_F(DBTest2, RelinkTableCacheWarmupRateModeRanksByLookupRate) {
   SetSstAccessStatsCounting(false);
   ColumnFamilyMetaData metadata;
   destination->GetColumnFamilyMetaData(&metadata);
-  ASSERT_EQ(metadata.levels[6].files.size(), 11);
+  ASSERT_EQ(metadata.levels[6].files.size(), 12);
   std::vector<ExternalTableCacheEntry> rated_off;
   for (size_t i = 1; i <= 11; ++i) {
     rated_off.emplace_back(rated_entry(i, kFast));
@@ -8168,6 +8168,56 @@ TEST_F(DBTest2, RelinkTableCacheWarmupRateModeRanksByLookupRate) {
   ASSERT_EQ(rated_off_stats.installed, 0);
   ASSERT_EQ(rated_off_stats.evicted_existing, 0);
   ASSERT_EQ(rated_off_stats.duplicate + rated_off_stats.skipped_lower_level, 11);
+
+  // [sst access stats 2026-10-05] Provided resident rates override the lifetime
+  // estimator (last, so the steps above keep their cache population). Counting
+  // back on; file 12 (L6, never offered before) is the incoming reader. Make
+  // file 5 resident for sure (a duplicate if it already is, else it replaces
+  // the slowest resident), then name it the slowest resident through
+  // SetResidentReaderRatesForWarmup while every other resident is rated far
+  // above the incoming one: exactly file 5 gives way.
+  SetSstAccessStatsCounting(true);
+  {
+    std::vector<ExternalTableCacheEntry> ensure;
+    ensure.emplace_back(rated_entry(5, kFast));
+    TableCacheWarmupTransferStats ensure_stats;
+    ASSERT_NO_FATAL_FAILURE(install(std::move(ensure), &ensure_stats));
+    ASSERT_EQ(ensure_stats.rate_mode, 1);
+    ASSERT_EQ(ensure_stats.duplicate + ensure_stats.installed, 1);
+
+    ColumnFamilyMetaData md;
+    destination->GetColumnFamilyMetaData(&md);
+    std::vector<SstReaderRate> rates;
+    uint64_t file5 = 0;
+    for (const auto& level : md.levels) {
+      for (const auto& f : level.files) {
+        const bool is5 =
+            f.external_path.find("missing-external-5.sst") != std::string::npos;
+        if (is5) file5 = f.file_number;
+        rates.push_back({f.file_number, is5 ? 1e-12 : 1e3});
+      }
+    }
+    ASSERT_NE(file5, 0u);
+    ASSERT_EQ(rates.size(), 13u);
+    ASSERT_OK(SetResidentReaderRatesForWarmup(destination.get(), rates));
+    std::vector<ExternalTableCacheEntry> modest;
+    modest.emplace_back(rated_entry(12, 1.0));
+    TableCacheWarmupTransferStats modest_stats;
+    ASSERT_NO_FATAL_FAILURE(install(std::move(modest), &modest_stats));
+    ASSERT_EQ(modest_stats.rate_mode, 1);
+    ASSERT_EQ(modest_stats.resident_rates_provided, 10);   // every resident was listed
+    ASSERT_EQ(modest_stats.installed, 1);
+    ASSERT_EQ(modest_stats.evicted_existing, 1);
+    // file 5 is gone: offered again at the lowest rate it is an incoming that
+    // loses the full cache's ranking, not a duplicate; and the list was consumed.
+    std::vector<ExternalTableCacheEntry> gone;
+    gone.emplace_back(rated_entry(5, kSlow));
+    TableCacheWarmupTransferStats gone_stats;
+    ASSERT_NO_FATAL_FAILURE(install(std::move(gone), &gone_stats));
+    ASSERT_EQ(gone_stats.duplicate, 0);
+    ASSERT_EQ(gone_stats.skipped_lower_level, 1);
+    ASSERT_EQ(gone_stats.resident_rates_provided, 0);
+  }
 
   destination.reset();
   ASSERT_OK(DestroyDB(destination_name, destination_options));

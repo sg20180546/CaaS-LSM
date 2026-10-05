@@ -89,6 +89,23 @@ bool SstAccessStatsCounting();
 // The clock used for SstAccessStats::open_time_micros, read now.
 uint64_t SstAccessStatsNowMicros(DB* db);
 
+// [sst access stats 2026-10-05] A lookup rate the caller measured for one of
+// this DB's resident TableReaders (file_number = the file it reads).
+struct SstReaderRate {
+  uint64_t file_number = 0;
+  double lookups_per_sec = 0.0;
+};
+
+// Rates for the NEXT InstallExternalTableCacheEntries call on this DB: in rate
+// mode that call ranks a resident reader by the rate given here instead of by
+// its lifetime counters ((lookups - 1 + 0.5) / age), so a caller that keeps a
+// windowed history of the counters (e.g. hits over the last block-cache
+// turnover, the same window it measures the incoming files over) can make the
+// two sides comparable. Readers not listed keep the lifetime estimate. The
+// list is consumed (cleared) by that call, in any mode; calling again
+// replaces an unconsumed list.
+Status SetResidentReaderRatesForWarmup(DB* db, std::vector<SstReaderRate> rates);
+
 // Per-shard LRU pool accounting of an LRUCache, the facts a caller needs to
 // decide admission without walking any LRU list:
 //   capacity            shard capacity in bytes
