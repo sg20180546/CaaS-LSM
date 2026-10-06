@@ -291,8 +291,12 @@ TEST_F(ExternalSSTFileBasicTest, OwnershipIngestManifestErrorPreservesOutputs) {
   sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPrepare:Paths", [&](void* arg) {
     prepared = *static_cast<std::vector<std::string>*>(arg);
   });
-  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest", [](void* arg) {
-    *static_cast<IOStatus*>(arg) = IOStatus::IOError("uncertain MANIFEST sync");
+  sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest", [&](void* arg) {
+    // Ingestion may reserve file numbers in an earlier MANIFEST edit. Inject
+    // only after ownership preparation, when publishing the ingested SST.
+    if (!prepared.empty()) {
+      *static_cast<IOStatus*>(arg) = IOStatus::IOError("uncertain MANIFEST sync");
+    }
   });
   sync->SetCallBack("ExternalSstFileIngestionJob::StorageCpPreserved:Paths", [&](void* arg) {
     preserved = *static_cast<std::vector<std::string>*>(arg);
