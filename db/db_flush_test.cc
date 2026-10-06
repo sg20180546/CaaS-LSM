@@ -179,6 +179,9 @@ TEST_F(DBFlushTest, OwnershipConcurrentFlushTracksActualCommitter) {
   Options options = CurrentOptions();
   options.disable_auto_compactions = true;
   options.max_background_flushes = 2;
+  // The WriteManifest barrier below must intercept a flush publication, not
+  // the foreground WAL edit made while switching the next memtable.
+  options.track_and_verify_wals_in_manifest = false;
   Reopen(options);
   std::mutex observed_mu;
   std::map<std::string, std::thread::id> prepared, published;
@@ -279,8 +282,12 @@ TEST_F(DBFlushTest, OwnershipAtomicManifestErrorPreservesAllOutputs) {
   // Inject after the actual sync: a non-OK return does not prove the MANIFEST
   // edit is absent from durable storage.
   sync->SetCallBack("VersionSet::ProcessManifestWrites:AfterSyncManifest",
-                    [](void* arg) {
-    *static_cast<IOStatus*>(arg) = IOStatus::IOError("ambiguous MANIFEST sync");
+                    [&](void* arg) {
+    // Skip earlier WAL bookkeeping edits. The uncertain commit must occur
+    // after both SST outputs have obtained their ownership acknowledgements.
+    if (prepared.size() == 2) {
+      *static_cast<IOStatus*>(arg) = IOStatus::IOError("ambiguous MANIFEST sync");
+    }
   });
   sync->SetCallBack("MemTableList::StorageCpPreserved:Paths", [&](void* arg) {
     for (const auto& path : *static_cast<std::vector<std::string>*>(arg)) {
