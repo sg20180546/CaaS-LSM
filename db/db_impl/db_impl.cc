@@ -6046,6 +6046,14 @@ Status DBImpl::InstallExternalTableCacheEntries(
     ColumnFamilyHandle* column_family,
     std::vector<ExternalTableCacheEntry>&& entries, size_t max_entry_bytes,
     TableCacheWarmupTransferStats* stats) {
+  // [sst access stats 2026-10-05] rates the caller measured for resident
+  // readers (SetResidentReaderRatesForWarmup): taken before any argument check
+  // or early return, so the list never outlives the call it was meant for.
+  std::vector<SstReaderRate> provided_rates;
+  {
+    std::lock_guard<std::mutex> lock(warmup_resident_rates_mutex_);
+    provided_rates.swap(warmup_resident_rates_);
+  }
   if (column_family == nullptr) {
     return Status::InvalidArgument("column_family must not be null");
   }
@@ -6119,11 +6127,14 @@ Status DBImpl::InstallExternalTableCacheEntries(
   //     the table cache to level priority, and admitted readers are inserted
   //     the way a foreground open inserts them.
   // A reader's rate is the posterior mean (k + 0.5) / T of a Poisson rate under
-  // the standard non-informative (Jeffreys) prior, k = lookups - 1 observed in
-  // T = its age: the lookup that opened it on demand is not an observation, and
-  // a reader without observations is not "rate 0" -- one opened a millisecond
-  // ago (just demanded) ranks high, one idle for an hour ranks low. Without
-  // rates (the default) the level policy below is unchanged.
+  // the standard non-informative (Jeffreys) prior. For a resident reader the
+  // caller may supply k / T measured over its own window
+  // (SetResidentReaderRatesForWarmup, consumed at the top of this function);
+  // otherwise k = lookups - 1 observed in T = the reader's age: the lookup that
+  // opened it on demand is not an observation, and a reader without
+  // observations is not "rate 0" -- one opened a millisecond ago (just
+  // demanded) ranks high, one idle for an hour ranks low. Without rates (the
+  // default) the level policy below is unchanged.
   bool rate_mode = SstAccessStatsCounting();
   for (const auto& entry : entries) {
     if (!(entry.source_lookups_per_sec >= 0.0)) {
@@ -6133,10 +6144,22 @@ Status DBImpl::InstallExternalTableCacheEntries(
   }
   std::unordered_map<uint64_t, double> resident_rate;
   if (rate_mode) {
+    std::unordered_map<uint64_t, double> provided;
+    for (const SstReaderRate& r : provided_rates) {
+      if (r.lookups_per_sec >= 0.0) {
+        provided[r.file_number] = r.lookups_per_sec;
+      }
+    }
     std::vector<SstAccessStats> access;
     table_cache->GetSstAccessStatsOfResidentTables(&access);
     const uint64_t now_us = immutable_db_options_.clock->NowMicros();
     for (const SstAccessStats& a : access) {
+      auto p = provided.find(a.file_number);
+      if (p != provided.end()) {
+        resident_rate[a.file_number] = p->second;
+        ++local_stats.resident_rates_provided;
+        continue;
+      }
       const uint64_t lookups = a.fg_data_block_hits + a.fg_data_block_misses;
       const double observed = lookups > 0 ? static_cast<double>(lookups - 1) : 0.0;
       resident_rate[a.file_number] =
@@ -6661,8 +6684,9 @@ Status DBImpl::InstallExternalTableCacheEntries(
   if (local_stats.rate_mode != 0) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "[relink] table-cache warmup rate_mode=1 "
-                   "resident-mean-lookups/s=%.3f",
-                   local_stats.resident_mean_lookups_per_sec);
+                   "resident-mean-lookups/s=%.3f resident-rates-provided=%" PRIu64,
+                   local_stats.resident_mean_lookups_per_sec,
+                   local_stats.resident_rates_provided);
   }
   if (stats != nullptr) {
     *stats = local_stats;

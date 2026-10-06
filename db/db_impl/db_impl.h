@@ -60,6 +60,7 @@
 #ifndef ROCKSDB_LITE
 #include "rocksdb/utilities/replayer.h"
 #endif  // ROCKSDB_LITE
+#include "rocksdb/utilities/sst_access_stats.h"
 #include "rocksdb/write_buffer_manager.h"
 #include "table/merging_iterator.h"
 #include "table/scoped_arena_iterator.h"
@@ -556,6 +557,14 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family,
       std::vector<ExternalTableCacheEntry>&& entries, size_t max_entry_bytes,
       TableCacheWarmupTransferStats* stats) override;
+
+  // [sst access stats 2026-10-05] rates for the next
+  // InstallExternalTableCacheEntries (see rocksdb/utilities/sst_access_stats.h
+  // SetResidentReaderRatesForWarmup); consumed by that call.
+  void SetWarmupResidentReaderRates(std::vector<SstReaderRate> rates) {
+    std::lock_guard<std::mutex> lock(warmup_resident_rates_mutex_);
+    warmup_resident_rates_ = std::move(rates);
+  }
 
   // [src-memory pull 2026-09-21] table properties from the table cache only (no_io).
   virtual Status GetPropertiesOfResidentTables(
@@ -1393,6 +1402,11 @@ class DBImpl : public DB {
   std::atomic<int> next_job_id_;
 
   std::atomic<bool> shutting_down_;
+
+  // [sst access stats 2026-10-05] see SetWarmupResidentReaderRates (not LITE-guarded: the
+  // setter and InstallExternalTableCacheEntries are not either)
+  std::mutex warmup_resident_rates_mutex_;
+  std::vector<SstReaderRate> warmup_resident_rates_;
 
   // RecoveryContext struct stores the context about version edits along
   // with corresponding column_family_data and column_family_options.

@@ -210,11 +210,13 @@ struct ExternalTableCacheEntry {
   std::vector<ExternalTableCacheRange> ranges;
   // [sst access stats 2026-10-04] The SOURCE's foreground data-block lookup rate
   // on this file in lookups per second (hits + misses -- every lookup needs the
-  // reader -- as (lookups - 1 + 0.5) / reader age; see sst_access_stats.h), or
-  // negative when unknown. When every entry carries one and this process counts
-  // its own per-SST lookups (SetSstAccessStatsCounting),
-  // InstallExternalTableCacheEntries ranks reader slots by lookup rate instead
-  // of by level (see DBImpl::InstallExternalTableCacheEntries).
+  // reader -- as the Jeffreys posterior mean (observed + 0.5) / window of the
+  // source's own measurement window; see sst_access_stats.h), or negative when
+  // unknown. When every entry carries one and this process counts its own
+  // per-SST lookups (SetSstAccessStatsCounting), InstallExternalTableCacheEntries
+  // ranks reader slots by lookup rate instead of by level, the resident readers
+  // by the rates given through SetResidentReaderRatesForWarmup when present
+  // (see DBImpl::InstallExternalTableCacheEntries).
   double source_lookups_per_sec = -1.0;
 };
 
@@ -258,6 +260,9 @@ struct TableCacheWarmupTransferStats {
   // this CF's resident readers), not a decision input.
   uint64_t rate_mode = 0;
   double resident_mean_lookups_per_sec = 0.0;
+  // [sst access stats 2026-10-05] resident readers ranked by a rate the caller
+  // supplied (SetResidentReaderRatesForWarmup) instead of lifetime counters.
+  uint64_t resident_rates_provided = 0;
 };
 
 using TableCacheWarmupEntryCallback =
