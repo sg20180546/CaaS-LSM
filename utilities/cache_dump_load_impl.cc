@@ -275,7 +275,8 @@ IOStatus CacheDumperImpl::CatalogWarmupCandidates(
   bool catalog_deadline_expired = false;
   Status catalog_status = cache_->ApplyToAllEntriesForCacheWarmup(
       [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
-          Cache::Priority effective_priority) {
+          Cache::Priority effective_priority, uint32_t hits,
+          uint64_t insert_time_us) {
         if (deadline.Expired()) {
           catalog_deadline_expired = true;
           return;
@@ -315,6 +316,13 @@ IOStatus CacheDumperImpl::CatalogWarmupCandidates(
         std::memcpy(candidate.key.data(), key.data(), kCacheKeySize);
         candidate.charge = charge;
         candidate.priority = effective_priority;
+        // [block hit count 2026-10-06] catalog-time values: the lease below
+        // re-validates priority and charge, not identity, so a same-key
+        // re-insert inside the catalog build (sub-second) ships the evicted
+        // incarnation's hits / age for the new block -- rare, and it errs
+        // toward admitting one block.
+        candidate.hits = hits;
+        candidate.insert_time_us = insert_time_us;
         bucket->push_back(candidate);
       },
       catalog_options);
@@ -601,7 +609,8 @@ Status CacheDumperImpl::CatalogWarmupDataBlocksForPull(
       }
       pull_catalog->Add(handle, current_priority,
                         Slice(candidate.key.data(), candidate.key.size()),
-                        block_data, block_size);
+                        block_data, block_size, candidate.hits,
+                        candidate.insert_time_us);
       CacheWarmupPriorityTransferStats* priority_stats =
           CacheWarmupStatsForPriority(&warmup_stats_, candidate.priority);
       ++warmup_stats_.entries_staged;
@@ -626,13 +635,16 @@ Status CacheDumperImpl::CatalogWarmupDataBlocksForPull(
 void CacheWarmupPullCatalogImpl::Add(Cache::Handle* handle,
                                      Cache::Priority effective_priority,
                                      const Slice& key, const char* data,
-                                     size_t size) {
+                                     size_t size, uint32_t hits,
+                                     uint64_t insert_time_us) {
   assert(handle != nullptr);
   CacheWarmupPulledBlock block;
   block.key = key.ToString();
   block.priority = effective_priority;
   block.data = data;
   block.size = size;
+  block.hits = hits;
+  block.insert_time_us = insert_time_us;
   blocks_.push_back(std::move(block));
   leases_.push_back(Lease{handle, effective_priority});
   payload_bytes_ += size;

@@ -89,6 +89,21 @@ bool SstAccessStatsCounting();
 // The clock used for SstAccessStats::open_time_micros, read now.
 uint64_t SstAccessStatsNowMicros(DB* db);
 
+// [block hit count 2026-10-06] Process-wide switch for the per-ENTRY counters
+// of every LRUCache (default off): with it on, each cache entry records the
+// lookups that hit it since it was inserted and the engine clock at that
+// insert (one plain increment under the shard mutex the lookup already holds;
+// one clock read per insert). A warm-up probe (LookupForCacheWarmup) and a
+// warm-up insert's own admission do not count. The values are exposed per
+// entry by the warm-up traversal (Cache::ApplyToAllEntriesForCacheWarmup) and
+// per cataloged block by CacheDumper::CatalogWarmupDataBlocksForPull
+// (CacheWarmupPulledBlock::hits / insert_time_us). Why: the relink cache
+// hand-off's per-block selection compares a block's hits over its time in the
+// source cache against the destination's own hit density. Entries inserted
+// while the switch was off report insert_time 0 (hits do count once it is on).
+void SetBlockCacheHitCounting(bool on);
+bool BlockCacheHitCounting();
+
 // [sst access stats 2026-10-05] A lookup rate the caller measured for one of
 // this DB's resident TableReaders (file_number = the file it reads).
 struct SstReaderRate {

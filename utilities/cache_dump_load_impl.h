@@ -149,6 +149,8 @@ struct CacheWarmupCandidate {
   std::array<char, kCacheKeySize> key;
   size_t charge;
   Cache::Priority priority;
+  uint32_t hits;             // [block hit count 2026-10-06] LRUHandle::hits at catalog time
+  uint64_t insert_time_us;   // LRUHandle::insert_time_us (0 = counting off)
 };
 
 // [relink cache handoff, RDMA pull] Lease holder returned by
@@ -178,7 +180,8 @@ class CacheWarmupPullCatalogImpl : public CacheWarmupPullCatalog {
   // Takes ownership of one already-held lease. `data`/`size` are the leased
   // Block's data()/size().
   void Add(Cache::Handle* handle, Cache::Priority effective_priority,
-           const Slice& key, const char* data, size_t size);
+           const Slice& key, const char* data, size_t size, uint32_t hits,
+           uint64_t insert_time_us);
 
  private:
   struct Lease {

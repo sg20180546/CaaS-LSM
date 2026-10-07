@@ -69,6 +69,14 @@ bool SstAccessStatsCounting() {
   return g_sst_access_stats_counting.load(std::memory_order_relaxed);
 }
 
+void SetBlockCacheHitCounting(bool on) {
+  lru_cache::g_block_cache_hit_counting.store(on, std::memory_order_relaxed);
+}
+
+bool BlockCacheHitCounting() {
+  return lru_cache::g_block_cache_hit_counting.load(std::memory_order_relaxed);
+}
+
 uint64_t SstAccessStatsNowMicros(DB* db) {
   if (db == nullptr) {
     return 0;

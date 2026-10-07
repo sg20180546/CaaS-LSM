@@ -162,6 +162,11 @@ struct CacheWarmupPulledBlock {
   const void* data;          // Block::data() of the cached value, valid
                              // while the lease is held by the catalog
   size_t size;               // Block::size(); what the dump path would write
+  // [block hit count 2026-10-06] the entry's lookup hits since it was inserted
+  // and the engine clock at that insert, as of catalog time (0 / 0 unless
+  // SetBlockCacheHitCounting(true); see rocksdb/utilities/sst_access_stats.h).
+  uint32_t hits = 0;
+  uint64_t insert_time_us = 0;
 };
 
 // Owns the warmup leases taken by CacheDumper::CatalogWarmupDataBlocksForPull.

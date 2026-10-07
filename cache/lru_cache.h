@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -61,6 +62,13 @@ extern void* const kDummyValueMarker;
 // LRUCacheShard::Lookup.
 // While refs > 0, public properties like value and deleter must not change.
 
+// [block hit count 2026-10-06] process-wide switch for LRUHandle::hits /
+// insert_time_us (default off; rocksdb/utilities/sst_access_stats.h
+// SetBlockCacheHitCounting).
+extern std::atomic<bool> g_block_cache_hit_counting;
+// Initialize a freshly allocated handle's access stats (see LRUHandle).
+void LRUHandleInitAccessStats(struct LRUHandle* e);
+
 struct LRUHandle {
   void* value;
   union Info {
@@ -83,6 +91,16 @@ struct LRUHandle {
   uint32_t hash;
   // The number of external refs to this entry. The cache itself is not counted.
   uint32_t refs;
+  // [block hit count 2026-10-06] Lookup hits since this entry was inserted and
+  // the engine clock at the insert, both maintained under the shard mutex and
+  // only while g_block_cache_hit_counting is on (otherwise 0: the baseline
+  // never pays the clock read). A warm-up probe (LookupForCacheWarmup) and a
+  // warm-up insert's own admission do not count as hits. The relink cache
+  // hand-off reads them through the warm-up traversal: a block's hits over its
+  // time in THIS cache is the per-block popularity the destination compares
+  // against its own hit density.
+  uint32_t hits;
+  uint64_t insert_time_us;
 
   // Mutable flags - access controlled by mutex
   // The m_ and M_ prefixes (and im_ and IM_ later) are to hopefully avoid

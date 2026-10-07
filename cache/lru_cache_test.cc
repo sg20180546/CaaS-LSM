@@ -393,7 +393,8 @@ TEST_F(LRUCacheTest, CacheWarmupMetadataAndLookupDoNotRecordHit) {
   do {
     cache_->ApplyToSomeEntriesForCacheWarmup(
         [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
-            Cache::Priority priority) {
+            Cache::Priority priority, uint32_t /*hits*/,
+            uint64_t /*insert_time_us*/) {
           EXPECT_EQ(1U, charge);
           EXPECT_EQ(nullptr, deleter);
           priorities[key.ToString()] = priority;
@@ -447,12 +448,79 @@ TEST_F(LRUCacheTest, CacheWarmupReleasePreservesDemotedClass) {
   do {
     cache_->ApplyToSomeEntriesForCacheWarmup(
         [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
-            Cache::Priority effective_priority) {
+            Cache::Priority effective_priority, uint32_t /*hits*/,
+            uint64_t /*insert_time_us*/) {
           priorities[key.ToString()] = effective_priority;
         },
         /*average_entries_per_lock=*/1, &state);
   } while (state != SIZE_MAX);
   EXPECT_EQ(Cache::Priority::BOTTOM, priorities["high-a"]);
+}
+
+// [block hit count 2026-10-06] Per-entry hits / insert time: off by default
+// (both stay 0, no clock read), on = normal Lookup hits count, a warm-up probe
+// does not, and the warm-up traversal reports both.
+TEST_F(LRUCacheTest, BlockHitCountingCountsLookupHitsOnly) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.0, /*low_pri_pool_ratio=*/1.0);
+  auto stats_of = [&](const std::string& want, uint32_t* hits,
+                      uint64_t* insert_time) {
+    bool seen = false;
+    size_t state = 0;
+    do {
+      cache_->ApplyToSomeEntriesForCacheWarmup(
+          [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
+              Cache::Priority /*priority*/, uint32_t h, uint64_t t) {
+            if (key.ToString() == want) {
+              seen = true;
+              *hits = h;
+              *insert_time = t;
+            }
+          },
+          /*average_entries_per_lock=*/1, &state);
+    } while (state != SIZE_MAX);
+    return seen;
+  };
+  uint32_t hits = 99;
+  uint64_t insert_time = 99;
+
+  // off (the default): nothing is recorded (the fields exist either way: under
+  // kFullChargeCacheMetadata every entry's metadata charge grew with them)
+  ASSERT_FALSE(lru_cache::g_block_cache_hit_counting.load());
+  Insert("off");
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(stats_of("off", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_EQ(0u, insert_time);
+
+  lru_cache::g_block_cache_hit_counting.store(true);
+  Insert("on");
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_GT(insert_time, 0u);
+  const uint64_t inserted_at = insert_time;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(Lookup("on"));
+  }
+  // a warm-up probe is not a hit
+  Cache::Priority priority = Cache::Priority::BOTTOM;
+  LRUHandle* probe = cache_->LookupForCacheWarmup("on", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, probe);
+  cache_->ReleaseForCacheWarmup(probe, priority);
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(3u, hits);
+  EXPECT_EQ(inserted_at, insert_time);
+  // an entry inserted while counting was off keeps 0 / 0 even if hit now
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(stats_of("off", &hits, &insert_time));
+  EXPECT_EQ(1u, hits);  // the hit itself counts once counting is on ...
+  EXPECT_EQ(0u, insert_time);  // ... but its insert time is unknown
+  // a re-insert of the same key starts a fresh entry
+  Insert("on");
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_GE(insert_time, inserted_at);
+  lru_cache::g_block_cache_hit_counting.store(false);
 }
 
 TEST_F(LRUCacheTest, CacheWarmupLeasePreservesExactRecency) {
@@ -3588,7 +3656,8 @@ std::set<std::string> ResidentWarmupPullTestKeys(Cache* cache) {
   Cache::ApplyToAllEntriesOptions opts;
   EXPECT_OK(cache->ApplyToAllEntriesForCacheWarmup(
       [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
-          Cache::Priority /*priority*/) { keys.insert(key.ToString()); },
+          Cache::Priority /*priority*/, uint32_t /*hits*/,
+          uint64_t /*insert_time_us*/) { keys.insert(key.ToString()); },
       opts));
   return keys;
 }
@@ -3807,6 +3876,88 @@ TEST(CacheWarmupPullTest, CatalogLeasesAndInsertRoundTrip) {
 // allocator exactly once before the call returns; concurrent owned inserts
 // from several threads, each with its own loader and stats, admit every
 // distinct key. A counting allocator plays the role of the pinned arena.
+// [block hit count 2026-10-06] With per-entry counting on, the pull catalog
+// carries each block's lookup hits since its insert and its insert time; the
+// catalog's own no-touch lease is not a hit.
+TEST(CacheWarmupPullTest, CatalogCarriesBlockHitCounts) {
+  Random rnd(302);
+  const size_t kBlockSize = 4096;
+  const std::string kPrefix("\x21\x22\x23\x24\x25\x26\x27\x28", 8);
+  LRUCacheOptions cache_opts(64 << 20, 0 /*num_shard_bits*/,
+                             false /*strict_capacity_limit*/,
+                             0.5 /*high_pri_pool_ratio*/);
+  std::shared_ptr<Cache> src = NewLRUCache(cache_opts);
+  ASSERT_NE(nullptr, src);
+
+  SetBlockCacheHitCounting(true);
+  Defer counting_off([]() { SetBlockCacheHitCounting(false); });
+  const uint64_t before = SystemClock::Default()->NowMicros();
+  const size_t kBlocks = 3;
+  std::vector<std::string> keys(kBlocks);
+  for (size_t i = 0; i < kBlocks; ++i) {
+    keys[i] = MakeWarmupPullTestKey(kPrefix, i);
+    InsertWarmupPullTestBlock(src.get(), keys[i],
+                              MakeWarmupPullTestBlock(&rnd, kBlockSize),
+                              Cache::Priority::HIGH, BlockType::kData);
+  }
+  // key 0: three hits; key 1: one hit; key 2: none
+  for (int n = 0; n < 3; ++n) {
+    Cache::Handle* h = src->Lookup(keys[0]);
+    ASSERT_NE(nullptr, h);
+    src->Release(h);
+  }
+  {
+    Cache::Handle* h = src->Lookup(keys[1]);
+    ASSERT_NE(nullptr, h);
+    src->Release(h);
+  }
+  const uint64_t after = SystemClock::Default()->NowMicros();
+
+  CacheDumpOptions cd_options;
+  cd_options.clock = SystemClock::Default().get();
+  std::unique_ptr<CacheDumper> dumper;
+  ASSERT_OK(NewDefaultCacheDumper(cd_options, src, nullptr /*writer*/,
+                                  &dumper));
+  ASSERT_OK(dumper->SetDumpFilterPrefixes({kPrefix}));
+  CacheWarmupOptions warmup_options;
+  warmup_options.max_entry_bytes = kBlockSize;
+  std::unique_ptr<CacheWarmupPullCatalog> catalog;
+  CacheWarmupTransferStats stats;
+  ASSERT_OK(
+      dumper->CatalogWarmupDataBlocksForPull(warmup_options, &catalog, &stats));
+  ASSERT_NE(nullptr, catalog);
+  const std::vector<CacheWarmupPulledBlock>& blocks = catalog->blocks();
+  ASSERT_EQ(kBlocks, blocks.size());
+  std::map<std::string, const CacheWarmupPulledBlock*> by_key;
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    by_key[b.key] = &b;
+  }
+  ASSERT_EQ(kBlocks, by_key.size());
+  EXPECT_EQ(3u, by_key[keys[0]]->hits);
+  EXPECT_EQ(1u, by_key[keys[1]]->hits);
+  EXPECT_EQ(0u, by_key[keys[2]]->hits);
+  for (size_t i = 0; i < kBlocks; ++i) {
+    EXPECT_GE(by_key[keys[i]]->insert_time_us, before);
+    EXPECT_LE(by_key[keys[i]]->insert_time_us, after);
+  }
+  // a second catalog sees the same counts: leasing is not a hit. (The first
+  // catalog's blocks() vector dies with it: copy the values out before.)
+  std::map<std::string, uint32_t> first_hits;
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    first_hits[b.key] = b.hits;
+  }
+  by_key.clear();
+  catalog->Release();
+  catalog.reset();
+  ASSERT_OK(
+      dumper->CatalogWarmupDataBlocksForPull(warmup_options, &catalog, &stats));
+  ASSERT_EQ(kBlocks, catalog->blocks().size());
+  for (const CacheWarmupPulledBlock& b : catalog->blocks()) {
+    EXPECT_EQ(first_hits.at(b.key), b.hits);
+  }
+  catalog->Release();
+}
+
 TEST(CacheWarmupPullTest, OwnedInsertOwnershipAndConcurrency) {
   Random rnd(302);
   const size_t kBlockSize = 4096;

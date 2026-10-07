@@ -19,12 +19,27 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
 #include "port/lang.h"
+#include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/sst_access_stats.h"
 #include "test_util/sync_point.h"
 #include "util/distributed_mutex.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
+
+// [block hit count 2026-10-06] see lru_cache.h
+std::atomic<bool> g_block_cache_hit_counting{false};
+
+void LRUHandleInitAccessStats(LRUHandle* e) {
+  e->hits = 0;
+  // SystemClock::Default() is the clock behind Env::Default(), i.e. the one
+  // the DB's open_time_micros / SstAccessStatsNowMicros use, so an age computed
+  // from insert_time_us is on the same scale as the per-SST reader ages.
+  e->insert_time_us =
+      g_block_cache_hit_counting.load(std::memory_order_relaxed)
+          ? SystemClock::Default()->NowMicros()
+          : 0;
+}
 
 namespace {
 
@@ -255,7 +270,7 @@ void LRUCacheShard::ApplyToSomeEntriesForCacheWarmup(
                                 ? h->info_.helper->del_cb
                                 : h->info_.deleter;
         callback(h->key(), h->GetCharge(metadata_charge_policy_), deleter,
-                 GetEffectivePriority(h));
+                 GetEffectivePriority(h), h->hits, h->insert_time_us);
       },
       index_begin, index_end);
 }
@@ -728,6 +743,12 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
         }
         e->Ref();
         e->SetHit();
+        // [block hit count 2026-10-06] under the shard mutex already held: no
+        // atomic; saturating. Off by default (one relaxed load per hit).
+        if (g_block_cache_hit_counting.load(std::memory_order_relaxed) &&
+            e->hits != UINT32_MAX) {
+          e->hits++;
+        }
       }
     }
   }
@@ -757,6 +778,7 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
 
       e->m_flags = 0;
       e->im_flags = 0;
+      LRUHandleInitAccessStats(e);
       e->SetSecondaryCacheCompatible(true);
       e->info_.helper = helper;
       e->key_length = key.size();
@@ -987,6 +1009,7 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   if (helper) {
     // Use only one of the two parameters
     assert(deleter == nullptr);
@@ -1027,6 +1050,7 @@ Status LRUCacheShard::InsertForCacheWarmup(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
@@ -1170,6 +1194,7 @@ Status LRUCacheShard::InsertForCacheWarmupNoEvict(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
@@ -1225,6 +1250,7 @@ Status LRUCacheShard::ReplaceForCacheWarmup(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
