@@ -97,6 +97,40 @@ Status SetResidentReaderRatesForWarmup(DB* db, std::vector<SstReaderRate> rates)
   return Status::OK();
 }
 
+Status GetLRUCacheShardEntryRecency(
+    Cache* cache, std::vector<std::vector<LRUCacheEntryRecency>>* out) {
+  if (cache == nullptr) {
+    return Status::InvalidArgument("cache cannot be null");
+  }
+  if (out == nullptr) {
+    return Status::InvalidArgument("out cannot be null");
+  }
+  out->clear();
+  if (std::strcmp(cache->Name(), LRUCache::kClassName()) != 0) {
+    return Status::NotSupported(
+        "per-entry recency is only available for LRUCache, not " +
+        std::string(cache->Name()));
+  }
+  static_cast<LRUCache*>(cache)->GetShardEntryRecency(out);
+  return Status::OK();
+}
+
+Status LRUCacheInsertForCacheWarmupByRecency(
+    Cache* cache, const Slice& key, void* value, size_t charge,
+    Cache::DeleterFn deleter, Cache::Priority priority, uint64_t last_ref_us,
+    Cache::CacheWarmupInsertResult* result) {
+  if (cache == nullptr) {
+    return Status::InvalidArgument("cache cannot be null");
+  }
+  if (std::strcmp(cache->Name(), LRUCache::kClassName()) != 0) {
+    return Status::NotSupported(
+        "recency-aware warm-up insertion is only available for LRUCache, not " +
+        std::string(cache->Name()));
+  }
+  return static_cast<LRUCache*>(cache)->InsertForCacheWarmupByRecency(
+      key, value, charge, deleter, priority, last_ref_us, result);
+}
+
 Status GetLRUCacheShardPoolStats(Cache* cache,
                                  std::vector<LRUCacheShardPoolStats>* out) {
   if (cache == nullptr) {

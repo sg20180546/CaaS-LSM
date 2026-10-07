@@ -23,6 +23,8 @@
 #include "util/crc32c.h"
 #include "utilities/cache_dump_load_impl.h"
 
+#include "rocksdb/utilities/sst_access_stats.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 namespace {
@@ -276,7 +278,7 @@ IOStatus CacheDumperImpl::CatalogWarmupCandidates(
   Status catalog_status = cache_->ApplyToAllEntriesForCacheWarmup(
       [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
           Cache::Priority effective_priority, uint32_t hits,
-          uint64_t insert_time_us) {
+          uint64_t insert_time_us, uint64_t last_ref_us) {
         if (deadline.Expired()) {
           catalog_deadline_expired = true;
           return;
@@ -323,6 +325,7 @@ IOStatus CacheDumperImpl::CatalogWarmupCandidates(
         // toward admitting one block.
         candidate.hits = hits;
         candidate.insert_time_us = insert_time_us;
+        candidate.last_ref_us = last_ref_us;
         bucket->push_back(candidate);
       },
       catalog_options);
@@ -610,7 +613,7 @@ Status CacheDumperImpl::CatalogWarmupDataBlocksForPull(
       pull_catalog->Add(handle, current_priority,
                         Slice(candidate.key.data(), candidate.key.size()),
                         block_data, block_size, candidate.hits,
-                        candidate.insert_time_us);
+                        candidate.insert_time_us, candidate.last_ref_us);
       CacheWarmupPriorityTransferStats* priority_stats =
           CacheWarmupStatsForPriority(&warmup_stats_, candidate.priority);
       ++warmup_stats_.entries_staged;
@@ -636,7 +639,8 @@ void CacheWarmupPullCatalogImpl::Add(Cache::Handle* handle,
                                      Cache::Priority effective_priority,
                                      const Slice& key, const char* data,
                                      size_t size, uint32_t hits,
-                                     uint64_t insert_time_us) {
+                                     uint64_t insert_time_us,
+                                     uint64_t last_ref_us) {
   assert(handle != nullptr);
   CacheWarmupPulledBlock block;
   block.key = key.ToString();
@@ -645,6 +649,7 @@ void CacheWarmupPullCatalogImpl::Add(Cache::Handle* handle,
   block.size = size;
   block.hits = hits;
   block.insert_time_us = insert_time_us;
+  block.last_ref_us = last_ref_us;
   blocks_.push_back(std::move(block));
   leases_.push_back(Lease{handle, effective_priority});
   payload_bytes_ += size;
@@ -1213,7 +1218,7 @@ IOStatus CacheDumpedLoaderImpl::CheckWarmupUnitLimits(
 // deleter) is destroyed by block_holder before this returns.
 IOStatus CacheDumpedLoaderImpl::AdmitWarmupBlock(
     const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
-    size_t size, CacheWarmupTransferStats* stats) {
+    size_t size, CacheWarmupTransferStats* stats, uint64_t last_ref_us) {
   assert(stats != nullptr);
   Cache::CacheItemHelper* helper =
       BlocklikeTraits<Block>::GetCacheItemHelper(BlockType::kData);
@@ -1239,9 +1244,14 @@ IOStatus CacheDumpedLoaderImpl::AdmitWarmupBlock(
   const size_t charge = block_holder->ApproximateMemoryUsage();
   Cache::CacheWarmupInsertResult insert_result =
       Cache::CacheWarmupInsertResult::kRejectedNoSpace;
-  Status insert_status = primary_cache_->InsertForCacheWarmup(
-      key, block_holder.get(), charge, helper->del_cb, priority,
-      &insert_result);
+  Status insert_status =
+      last_ref_us != 0
+          ? LRUCacheInsertForCacheWarmupByRecency(
+                primary_cache_.get(), key, block_holder.get(), charge,
+                helper->del_cb, priority, last_ref_us, &insert_result)
+          : primary_cache_->InsertForCacheWarmup(key, block_holder.get(),
+                                                 charge, helper->del_cb,
+                                                 priority, &insert_result);
   if (!insert_status.ok()) {
     return status_to_io_status(std::move(insert_status));
   }
@@ -1318,6 +1328,21 @@ IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockOwned(
     return io_s;
   }
   return AdmitWarmupBlock(key, priority, std::move(buf), size, s);
+}
+
+IOStatus CacheDumpedLoaderImpl::InsertWarmupDataBlockOwnedByRecency(
+    const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+    size_t size, uint64_t last_ref_us, CacheWarmupTransferStats* stats) {
+  CacheWarmupTransferStats* s = stats != nullptr ? stats : &warmup_stats_;
+  IOStatus io_s = CheckWarmupUnitLimits(
+      key, size, buf != nullptr, CacheWarmupOptions{}, s->entries_received,
+      s->payload_bytes, s);
+  if (!io_s.ok()) {
+    buf.reset();
+    return io_s;
+  }
+  return AdmitWarmupBlock(key, priority, std::move(buf), size, s,
+                          last_ref_us == 0 ? 1 : last_ref_us);
 }
 
 // Read and copy the dump unit metadata to std::string data, decode and create

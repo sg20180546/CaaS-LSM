@@ -167,6 +167,9 @@ struct CacheWarmupPulledBlock {
   // SetBlockCacheHitCounting(true); see rocksdb/utilities/sst_access_stats.h).
   uint32_t hits = 0;
   uint64_t insert_time_us = 0;
+  // [recency 2026-10-06] the engine clock at the entry's last counted hit
+  // (= insert_time_us until the first hit; 0 unless counting is on).
+  uint64_t last_ref_us = 0;
 };
 
 // Owns the warmup leases taken by CacheDumper::CatalogWarmupDataBlocksForPull.
@@ -402,6 +405,26 @@ class CacheDumpedLoader {
   virtual const CacheWarmupTransferStats& GetCacheWarmupTransferStats() const {
     static const CacheWarmupTransferStats kEmptyStats;
     return kEmptyStats;
+  }
+
+  // [recency 2026-10-06] InsertWarmupDataBlockOwned admitted through the
+  // recency-aware insert (rocksdb/utilities/sst_access_stats.h
+  // LRUCacheInsertForCacheWarmupByRecency): `last_ref_us` is the engine-clock
+  // time of the block's last reference as it should read in THIS cache (the
+  // caller converts the source's "seconds since last reference" with its own
+  // clock). Checks, counters, ownership and thread safety as the owned
+  // insert. Appended last: the earlier virtuals keep their slots.
+  virtual IOStatus InsertWarmupDataBlockOwnedByRecency(
+      const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+      size_t size, uint64_t last_ref_us, CacheWarmupTransferStats* stats) {
+    (void)key;
+    (void)priority;
+    (void)size;
+    (void)last_ref_us;
+    (void)stats;
+    buf.reset();
+    return IOStatus::NotSupported(
+        "InsertWarmupDataBlockOwnedByRecency is not supported");
   }
 };
 
