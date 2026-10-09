@@ -393,7 +393,8 @@ TEST_F(LRUCacheTest, CacheWarmupMetadataAndLookupDoNotRecordHit) {
   do {
     cache_->ApplyToSomeEntriesForCacheWarmup(
         [&](const Slice& key, size_t charge, Cache::DeleterFn deleter,
-            Cache::Priority priority) {
+            Cache::Priority priority, uint32_t /*hits*/,
+            uint64_t /*insert_time_us*/, uint64_t /*last_ref_us*/) {
           EXPECT_EQ(1U, charge);
           EXPECT_EQ(nullptr, deleter);
           priorities[key.ToString()] = priority;
@@ -447,12 +448,272 @@ TEST_F(LRUCacheTest, CacheWarmupReleasePreservesDemotedClass) {
   do {
     cache_->ApplyToSomeEntriesForCacheWarmup(
         [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
-            Cache::Priority effective_priority) {
+            Cache::Priority effective_priority, uint32_t /*hits*/,
+            uint64_t /*insert_time_us*/, uint64_t /*last_ref_us*/) {
           priorities[key.ToString()] = effective_priority;
         },
         /*average_entries_per_lock=*/1, &state);
   } while (state != SIZE_MAX);
   EXPECT_EQ(Cache::Priority::BOTTOM, priorities["high-a"]);
+}
+
+// [block hit count 2026-10-06] Per-entry hits / insert time: off by default
+// (both stay 0, no clock read), on = normal Lookup hits count, a warm-up probe
+// does not, and the warm-up traversal reports both.
+TEST_F(LRUCacheTest, BlockHitCountingCountsLookupHitsOnly) {
+  NewCache(8, /*high_pri_pool_ratio=*/0.0, /*low_pri_pool_ratio=*/1.0);
+  auto stats_of = [&](const std::string& want, uint32_t* hits,
+                      uint64_t* insert_time) {
+    bool seen = false;
+    size_t state = 0;
+    do {
+      cache_->ApplyToSomeEntriesForCacheWarmup(
+          [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
+              Cache::Priority /*priority*/, uint32_t h, uint64_t t,
+              uint64_t /*last_ref_us*/) {
+            if (key.ToString() == want) {
+              seen = true;
+              *hits = h;
+              *insert_time = t;
+            }
+          },
+          /*average_entries_per_lock=*/1, &state);
+    } while (state != SIZE_MAX);
+    return seen;
+  };
+  uint32_t hits = 99;
+  uint64_t insert_time = 99;
+
+  // off (the default): nothing is recorded (the fields exist either way: under
+  // kFullChargeCacheMetadata every entry's metadata charge grew with them)
+  ASSERT_FALSE(lru_cache::g_block_cache_hit_counting.load());
+  Insert("off");
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(stats_of("off", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_EQ(0u, insert_time);
+
+  lru_cache::g_block_cache_hit_counting.store(true);
+  Insert("on");
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_GT(insert_time, 0u);
+  const uint64_t inserted_at = insert_time;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_TRUE(Lookup("on"));
+  }
+  // a warm-up probe is not a hit
+  Cache::Priority priority = Cache::Priority::BOTTOM;
+  LRUHandle* probe = cache_->LookupForCacheWarmup("on", 0 /*hash*/, &priority);
+  ASSERT_NE(nullptr, probe);
+  cache_->ReleaseForCacheWarmup(probe, priority);
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(3u, hits);
+  EXPECT_EQ(inserted_at, insert_time);
+  // an entry inserted while counting was off keeps 0 / 0 even if hit now
+  ASSERT_TRUE(Lookup("off"));
+  ASSERT_TRUE(stats_of("off", &hits, &insert_time));
+  EXPECT_EQ(1u, hits);  // the hit itself counts once counting is on ...
+  EXPECT_EQ(0u, insert_time);  // ... but its insert time is unknown
+  // a re-insert of the same key starts a fresh entry
+  Insert("on");
+  ASSERT_TRUE(stats_of("on", &hits, &insert_time));
+  EXPECT_EQ(0u, hits);
+  EXPECT_GE(insert_time, inserted_at);
+  lru_cache::g_block_cache_hit_counting.store(false);
+}
+
+// [recency 2026-10-06] The recency-aware warm-up insert: inside the incoming's
+// own pool only entries referenced before it are victims, oldest first; lower
+// pools are victims regardless; the inserted entry carries the given recency;
+// nothing is evicted for a block that would not survive.
+TEST_F(LRUCacheTest, CacheWarmupInsertByRecency) {
+  lru_cache::g_block_cache_hit_counting.store(true);
+  // one pool (bottom only): capacity 3, charge 1 each
+  NewCache(3, /*high_pri_pool_ratio=*/0.0, /*low_pri_pool_ratio=*/0.0);
+  auto insert_at = [&](const std::string& key, Cache::Priority prio,
+                       uint64_t last_ref) {
+    Cache::CacheWarmupInsertResult r =
+        Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    EXPECT_OK(cache_->InsertForCacheWarmupByRecency(
+        key, 0 /*hash*/, nullptr /*value*/, 1 /*charge*/, nullptr /*deleter*/,
+        prio, last_ref, &r));
+    return r;
+  };
+  auto recency = [&]() {
+    std::vector<LRUCacheEntryRecency> v;
+    cache_->CollectEntryRecency(&v);
+    return v;
+  };
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("x", Cache::Priority::BOTTOM, 100));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("y", Cache::Priority::BOTTOM, 200));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("z", Cache::Priority::BOTTOM, 300));
+  ValidateLRUList({"x", "y", "z"}, 0, 0, 3);
+  {
+    std::vector<LRUCacheEntryRecency> v = recency();
+    ASSERT_EQ(3u, v.size());   // oldest first, carrying the given recency
+    EXPECT_EQ(100u, v[0].last_ref_us);
+    EXPECT_EQ(300u, v[2].last_ref_us);
+    EXPECT_EQ(2u, v[0].pool);
+    EXPECT_TRUE(v[0].evictable);
+  }
+  // full; a block referenced before everything here evicts nothing
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace,
+            insert_at("w", Cache::Priority::BOTTOM, 50));
+  ValidateLRUList({"x", "y", "z"}, 0, 0, 3);
+  // referenced after x but before y: x (the oldest) gives way, y and z stay
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("w", Cache::Priority::BOTTOM, 150));
+  ValidateLRUList({"y", "z", "w"}, 0, 0, 3);
+  // a duplicate is reported, never re-inserted
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kDuplicate,
+            insert_at("w", Cache::Priority::BOTTOM, 999));
+  ValidateLRUList({"y", "z", "w"}, 0, 0, 3);
+  // a pinned oldest entry is skipped, the next older one goes
+  Cache::Priority prio = Cache::Priority::BOTTOM;
+  LRUHandle* lease = cache_->LookupForCacheWarmup("y", 0 /*hash*/, &prio);
+  ASSERT_NE(nullptr, lease);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("v", Cache::Priority::BOTTOM, 400));
+  ValidateLRUList({"y", "w", "v"}, 0, 0, 3);   // z (300 < 400) left, y stayed pinned
+  cache_->ReleaseForCacheWarmup(lease, prio);
+
+  // two pools: HIGH incoming evicts lower-pool entries whatever their recency
+  NewCache(4, /*high_pri_pool_ratio=*/0.5, /*low_pri_pool_ratio=*/0.0);
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("b1", Cache::Priority::BOTTOM, 900));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("b2", Cache::Priority::BOTTOM, 950));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h1", Cache::Priority::HIGH, 100));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h2", Cache::Priority::HIGH, 200));
+  ValidateLRUList({"b1", "b2", "h1", "h2"}, 2 /*high*/, 0, 2 /*bottom*/);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h3", Cache::Priority::HIGH, 10));   // older than every HIGH
+  // b1 (the oldest bottom entry) went; h3 at the high head pushed the high
+  // pool over its 2-entry share, so h1 was demoted (no low pool: to bottom)
+  ValidateLRUList({"b2", "h1", "h2", "h3"}, 2 /*high*/, 0, 2 /*bottom*/);
+  // a BOTTOM incoming older than the remaining bottom entry evicts nothing
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace,
+            insert_at("b0", Cache::Priority::BOTTOM, 20));
+  // ... and younger than it takes its place
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("b3", Cache::Priority::BOTTOM, 1000));
+  // b2 (950 < 1000, the bottom pool's oldest) went; b3 is the bottom pool's
+  // newest, before the high pool in LRU order
+  ValidateLRUList({"h1", "b3", "h2", "h3"}, 2 /*high*/, 0, 2 /*bottom*/);
+  {
+    std::vector<LRUCacheEntryRecency> v = recency();   // LRU order, current pools
+    ASSERT_EQ(4u, v.size());
+    EXPECT_EQ(100u, v[0].last_ref_us);   // h1, now bottom
+    EXPECT_EQ(2u, v[0].pool);
+    EXPECT_EQ(1000u, v[1].last_ref_us);  // b3
+    EXPECT_EQ(0u, v[2].pool);            // h2, high
+    EXPECT_EQ(10u, v[3].last_ref_us);    // h3
+  }
+  lru_cache::g_block_cache_hit_counting.store(false);
+}
+
+// [recency 2026-10-06] The remaining branches of the recency rule: a HIGH block
+// whose only victims are older HIGH entries; all-or-nothing with a partial
+// victim set; an older entry deeper in the pool behind a newer one (no early
+// stop); the LOW pool; a leased entry reported as not evictable; the refusal
+// while counting is off.
+TEST_F(LRUCacheTest, CacheWarmupInsertByRecencyMoreCases) {
+  auto insert_at = [&](const std::string& key, Cache::Priority prio,
+                       uint64_t last_ref, size_t charge = 1) {
+    Cache::CacheWarmupInsertResult r =
+        Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    EXPECT_OK(cache_->InsertForCacheWarmupByRecency(
+        key, 0 /*hash*/, nullptr /*value*/, charge, nullptr /*deleter*/, prio,
+        last_ref, &r));
+    return r;
+  };
+  // counting off: refused, nothing changes
+  NewCache(2, /*high_pri_pool_ratio=*/0.0, /*low_pri_pool_ratio=*/0.0);
+  lru_cache::g_block_cache_hit_counting.store(false);
+  {
+    Cache::CacheWarmupInsertResult r =
+        Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    EXPECT_TRUE(cache_->InsertForCacheWarmupByRecency(
+                    "k", 0, nullptr, 1, nullptr, Cache::Priority::BOTTOM, 5, &r)
+                    .IsInvalidArgument());
+  }
+  lru_cache::g_block_cache_hit_counting.store(true);
+  // high pool only victims: a full cache of two HIGH entries, bottom empty
+  NewCache(2, /*high_pri_pool_ratio=*/1.0, /*low_pri_pool_ratio=*/0.0);
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h1", Cache::Priority::HIGH, 100));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h2", Cache::Priority::HIGH, 300));
+  ValidateLRUList({"h1", "h2"}, 2 /*high*/);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace,
+            insert_at("h0", Cache::Priority::HIGH, 50));    // older than both
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h3", Cache::Priority::HIGH, 200));   // h1 (100) goes
+  ValidateLRUList({"h2", "h3"}, 2 /*high*/);
+  // no early stop inside a pool: the older entry sits BEHIND a newer one in
+  // list position (h3 at 200 was linked after h2 at 300)
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h4", Cache::Priority::HIGH, 250));   // h3 (200) goes, h2 (300) stays
+  ValidateLRUList({"h2", "h4"}, 2 /*high*/);
+  // all-or-nothing: a 2-charge block finds one older victim only -> nothing evicted
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace,
+            insert_at("big", Cache::Priority::HIGH, 260, 2));
+  ValidateLRUList({"h2", "h4"}, 2 /*high*/);
+  // a leased entry is reported as not evictable and is skipped
+  {
+    Cache::Priority prio = Cache::Priority::HIGH;
+    LRUHandle* lease = cache_->LookupForCacheWarmup("h4", 0 /*hash*/, &prio);
+    ASSERT_NE(nullptr, lease);
+    std::vector<LRUCacheEntryRecency> v;
+    cache_->CollectEntryRecency(&v);
+    ASSERT_EQ(2u, v.size());
+    EXPECT_TRUE(v[0].evictable);    // h2
+    EXPECT_FALSE(v[1].evictable);   // h4, leased
+    EXPECT_EQ(0u, v[1].pool);
+    cache_->ReleaseForCacheWarmup(lease, prio);
+  }
+  // LOW pool enabled: a LOW block evicts bottom entries regardless of their
+  // recency, then older LOW entries; never a HIGH entry
+  NewCache(4, /*high_pri_pool_ratio=*/0.25, /*low_pri_pool_ratio=*/0.25);
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("b", Cache::Priority::BOTTOM, 900));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l1", Cache::Priority::LOW, 100));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l2", Cache::Priority::LOW, 500));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h", Cache::Priority::HIGH, 10));
+  // pools: high cap 1 (h), low cap 1 -> l1 was demoted to bottom when l2 arrived
+  ValidateLRUList({"b", "l1", "l2", "h"}, 1 /*high*/, 1 /*low*/, 2 /*bottom*/);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l3", Cache::Priority::LOW, 50));    // b (bottom, 900) goes, whatever its recency
+  // l2 was demoted to bottom as l3 took the one low slot
+  ValidateLRUList({"l1", "l2", "l3", "h"}, 1 /*high*/, 1 /*low*/, 2 /*bottom*/);
+  // the bottom pool is a lower class: still a victim for a LOW block older than everything
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l4", Cache::Priority::LOW, 5));     // l1 (bottom) goes
+  ValidateLRUList({"l2", "l3", "l4", "h"}, 1 /*high*/, 1 /*low*/, 2 /*bottom*/);
+  // with nothing below LOW, an older LOW block has no victim (h is HIGH, l1 is newer)
+  NewCache(2, /*high_pri_pool_ratio=*/0.5, /*low_pri_pool_ratio=*/0.5);
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("h", Cache::Priority::HIGH, 10));
+  ASSERT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l1", Cache::Priority::LOW, 500));
+  ValidateLRUList({"l1", "h"}, 1 /*high*/, 1 /*low*/, 0 /*bottom*/);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kRejectedNoSpace,
+            insert_at("l0", Cache::Priority::LOW, 5));
+  ValidateLRUList({"l1", "h"}, 1 /*high*/, 1 /*low*/, 0 /*bottom*/);
+  EXPECT_EQ(Cache::CacheWarmupInsertResult::kInserted,
+            insert_at("l5", Cache::Priority::LOW, 600));   // l1 (500) goes
+  ValidateLRUList({"l5", "h"}, 1 /*high*/, 1 /*low*/, 0 /*bottom*/);
+  lru_cache::g_block_cache_hit_counting.store(false);
 }
 
 TEST_F(LRUCacheTest, CacheWarmupLeasePreservesExactRecency) {
@@ -3588,7 +3849,10 @@ std::set<std::string> ResidentWarmupPullTestKeys(Cache* cache) {
   Cache::ApplyToAllEntriesOptions opts;
   EXPECT_OK(cache->ApplyToAllEntriesForCacheWarmup(
       [&](const Slice& key, size_t /*charge*/, Cache::DeleterFn /*deleter*/,
-          Cache::Priority /*priority*/) { keys.insert(key.ToString()); },
+          Cache::Priority /*priority*/, uint32_t /*hits*/,
+          uint64_t /*insert_time_us*/, uint64_t /*last_ref_us*/) {
+        keys.insert(key.ToString());
+      },
       opts));
   return keys;
 }
@@ -3807,6 +4071,110 @@ TEST(CacheWarmupPullTest, CatalogLeasesAndInsertRoundTrip) {
 // allocator exactly once before the call returns; concurrent owned inserts
 // from several threads, each with its own loader and stats, admit every
 // distinct key. A counting allocator plays the role of the pinned arena.
+// [block hit count 2026-10-06] With per-entry counting on, the pull catalog
+// carries each block's lookup hits since its insert and its insert time; the
+// catalog's own no-touch lease is not a hit.
+TEST(CacheWarmupPullTest, CatalogCarriesBlockHitCounts) {
+  Random rnd(302);
+  const size_t kBlockSize = 4096;
+  const std::string kPrefix("\x21\x22\x23\x24\x25\x26\x27\x28", 8);
+  LRUCacheOptions cache_opts(64 << 20, 0 /*num_shard_bits*/,
+                             false /*strict_capacity_limit*/,
+                             0.5 /*high_pri_pool_ratio*/);
+  std::shared_ptr<Cache> src = NewLRUCache(cache_opts);
+  ASSERT_NE(nullptr, src);
+
+  SetBlockCacheHitCounting(true);
+  Defer counting_off([]() { SetBlockCacheHitCounting(false); });
+  const uint64_t before = SystemClock::Default()->NowMicros();
+  const size_t kBlocks = 3;
+  std::vector<std::string> keys(kBlocks);
+  for (size_t i = 0; i < kBlocks; ++i) {
+    keys[i] = MakeWarmupPullTestKey(kPrefix, i);
+    InsertWarmupPullTestBlock(src.get(), keys[i],
+                              MakeWarmupPullTestBlock(&rnd, kBlockSize),
+                              Cache::Priority::HIGH, BlockType::kData);
+  }
+  // key 0: three hits; key 1: one hit; key 2: none
+  for (int n = 0; n < 3; ++n) {
+    Cache::Handle* h = src->Lookup(keys[0]);
+    ASSERT_NE(nullptr, h);
+    src->Release(h);
+  }
+  {
+    Cache::Handle* h = src->Lookup(keys[1]);
+    ASSERT_NE(nullptr, h);
+    src->Release(h);
+  }
+  const uint64_t after = SystemClock::Default()->NowMicros();
+
+  CacheDumpOptions cd_options;
+  cd_options.clock = SystemClock::Default().get();
+  std::unique_ptr<CacheDumper> dumper;
+  ASSERT_OK(NewDefaultCacheDumper(cd_options, src, nullptr /*writer*/,
+                                  &dumper));
+  ASSERT_OK(dumper->SetDumpFilterPrefixes({kPrefix}));
+  CacheWarmupOptions warmup_options;
+  warmup_options.max_entry_bytes = kBlockSize;
+  std::unique_ptr<CacheWarmupPullCatalog> catalog;
+  CacheWarmupTransferStats stats;
+  ASSERT_OK(
+      dumper->CatalogWarmupDataBlocksForPull(warmup_options, &catalog, &stats));
+  ASSERT_NE(nullptr, catalog);
+  const std::vector<CacheWarmupPulledBlock>& blocks = catalog->blocks();
+  ASSERT_EQ(kBlocks, blocks.size());
+  std::map<std::string, const CacheWarmupPulledBlock*> by_key;
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    by_key[b.key] = &b;
+  }
+  ASSERT_EQ(kBlocks, by_key.size());
+  EXPECT_EQ(3u, by_key[keys[0]]->hits);
+  EXPECT_EQ(1u, by_key[keys[1]]->hits);
+  EXPECT_EQ(0u, by_key[keys[2]]->hits);
+  for (size_t i = 0; i < kBlocks; ++i) {
+    EXPECT_GE(by_key[keys[i]]->insert_time_us, before);
+    EXPECT_LE(by_key[keys[i]]->insert_time_us, after);
+    // [recency 2026-10-06] last reference: at or after the insert, never later
+    // than the last lookup; a never-hit block's equals its insert time
+    EXPECT_GE(by_key[keys[i]]->last_ref_us, by_key[keys[i]]->insert_time_us);
+    EXPECT_LE(by_key[keys[i]]->last_ref_us, after);
+  }
+  {
+    // [recency 2026-10-06] the LRU order export (GetLRUCacheShardEntryRecency)
+    // sees the same entries with the same last reference; they are linked
+    // but pinned while the catalog's lease holds them, so not evictable
+    std::vector<std::vector<LRUCacheEntryRecency>> shards;
+    ASSERT_OK(GetLRUCacheShardEntryRecency(src.get(), &shards));
+    ASSERT_EQ(1u, shards.size());
+    std::multiset<uint64_t> exported, cataloged;
+    for (const LRUCacheEntryRecency& e : shards[0]) {
+      exported.insert(e.last_ref_us);
+      EXPECT_FALSE(e.evictable);
+    }
+    for (size_t i = 0; i < kBlocks; ++i) {
+      cataloged.insert(by_key[keys[i]]->last_ref_us);
+    }
+    EXPECT_EQ(cataloged, exported);
+  }
+  EXPECT_EQ(by_key[keys[2]]->insert_time_us, by_key[keys[2]]->last_ref_us);
+  // a second catalog sees the same counts: leasing is not a hit. (The first
+  // catalog's blocks() vector dies with it: copy the values out before.)
+  std::map<std::string, uint32_t> first_hits;
+  for (const CacheWarmupPulledBlock& b : blocks) {
+    first_hits[b.key] = b.hits;
+  }
+  by_key.clear();
+  catalog->Release();
+  catalog.reset();
+  ASSERT_OK(
+      dumper->CatalogWarmupDataBlocksForPull(warmup_options, &catalog, &stats));
+  ASSERT_EQ(kBlocks, catalog->blocks().size());
+  for (const CacheWarmupPulledBlock& b : catalog->blocks()) {
+    EXPECT_EQ(first_hits.at(b.key), b.hits);
+  }
+  catalog->Release();
+}
+
 TEST(CacheWarmupPullTest, OwnedInsertOwnershipAndConcurrency) {
   Random rnd(302);
   const size_t kBlockSize = 4096;

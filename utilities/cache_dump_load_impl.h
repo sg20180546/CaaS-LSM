@@ -149,6 +149,9 @@ struct CacheWarmupCandidate {
   std::array<char, kCacheKeySize> key;
   size_t charge;
   Cache::Priority priority;
+  uint32_t hits;             // [block hit count 2026-10-06] LRUHandle::hits at catalog time
+  uint64_t insert_time_us;   // LRUHandle::insert_time_us (0 = counting off)
+  uint64_t last_ref_us;      // [recency 2026-10-06] LRUHandle::last_ref_us at catalog time
 };
 
 // [relink cache handoff, RDMA pull] Lease holder returned by
@@ -178,7 +181,8 @@ class CacheWarmupPullCatalogImpl : public CacheWarmupPullCatalog {
   // Takes ownership of one already-held lease. `data`/`size` are the leased
   // Block's data()/size().
   void Add(Cache::Handle* handle, Cache::Priority effective_priority,
-           const Slice& key, const char* data, size_t size);
+           const Slice& key, const char* data, size_t size, uint32_t hits,
+           uint64_t insert_time_us, uint64_t last_ref_us);
 
  private:
   struct Lease {
@@ -311,6 +315,11 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
                                       Cache::Priority priority,
                                       CacheAllocationPtr&& buf, size_t size,
                                       CacheWarmupTransferStats* stats) override;
+  // [recency 2026-10-06] see the public header
+  IOStatus InsertWarmupDataBlockOwnedByRecency(
+      const Slice& key, Cache::Priority priority, CacheAllocationPtr&& buf,
+      size_t size, uint64_t last_ref_us,
+      CacheWarmupTransferStats* stats) override;
   // 2026-09-23: streamed-path sink; see the public header.
   void SetWarmupUnitSink(WarmupUnitSink sink,
                          MemoryAllocator* allocator) override {
@@ -343,9 +352,12 @@ class CacheDumpedLoaderImpl : public CacheDumpedLoader {
   // buffer is owned by the cache on kInserted and released through its
   // deleter before return on every other outcome. Thread-safe with a
   // per-thread *stats (touches only primary_cache_ and toptions_ otherwise).
+  // [recency 2026-10-06] last_ref_us != 0 admits through the recency-aware
+  // insert (LRUCacheInsertForCacheWarmupByRecency) instead.
   IOStatus AdmitWarmupBlock(const Slice& key, Cache::Priority priority,
                             CacheAllocationPtr&& buf, size_t size,
-                            CacheWarmupTransferStats* stats);
+                            CacheWarmupTransferStats* stats,
+                            uint64_t last_ref_us = 0);
   // Check + AllocateBlock(size, nullptr) + memcpy + Admit: the historical
   // inline unit, behaviour unchanged.
   IOStatus InsertWarmupDataBlockWithLimits(

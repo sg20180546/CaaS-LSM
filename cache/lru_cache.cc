@@ -19,12 +19,28 @@
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
 #include "port/lang.h"
+#include "rocksdb/system_clock.h"
 #include "rocksdb/utilities/sst_access_stats.h"
 #include "test_util/sync_point.h"
 #include "util/distributed_mutex.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace lru_cache {
+
+// [block hit count 2026-10-06] see lru_cache.h
+std::atomic<bool> g_block_cache_hit_counting{false};
+
+void LRUHandleInitAccessStats(LRUHandle* e) {
+  e->hits = 0;
+  // SystemClock::Default() is the clock behind Env::Default(), i.e. the one
+  // the DB's open_time_micros / SstAccessStatsNowMicros use, so an age computed
+  // from insert_time_us is on the same scale as the per-SST reader ages.
+  e->insert_time_us =
+      g_block_cache_hit_counting.load(std::memory_order_relaxed)
+          ? SystemClock::Default()->NowMicros()
+          : 0;
+  e->last_ref_us = e->insert_time_us;
+}
 
 namespace {
 
@@ -255,7 +271,8 @@ void LRUCacheShard::ApplyToSomeEntriesForCacheWarmup(
                                 ? h->info_.helper->del_cb
                                 : h->info_.deleter;
         callback(h->key(), h->GetCharge(metadata_charge_policy_), deleter,
-                 GetEffectivePriority(h));
+                 GetEffectivePriority(h), h->hits, h->insert_time_us,
+                 h->last_ref_us);
       },
       index_begin, index_end);
 }
@@ -728,6 +745,16 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
         }
         e->Ref();
         e->SetHit();
+        // [block hit count 2026-10-06] under the shard mutex already held: no
+        // atomic; saturating. Off by default (one relaxed load per hit).
+        // [recency 2026-10-06] and the time of this hit (one vDSO clock read,
+        // ~20 ns, only while counting is on).
+        if (g_block_cache_hit_counting.load(std::memory_order_relaxed)) {
+          if (e->hits != UINT32_MAX) {
+            e->hits++;
+          }
+          e->last_ref_us = SystemClock::Default()->NowMicros();
+        }
       }
     }
   }
@@ -757,6 +784,7 @@ LRUHandle* LRUCacheShard::Lookup(const Slice& key, uint32_t hash,
 
       e->m_flags = 0;
       e->im_flags = 0;
+      LRUHandleInitAccessStats(e);
       e->SetSecondaryCacheCompatible(true);
       e->info_.helper = helper;
       e->key_length = key.size();
@@ -987,6 +1015,7 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   if (helper) {
     // Use only one of the two parameters
     assert(deleter == nullptr);
@@ -1027,6 +1056,7 @@ Status LRUCacheShard::InsertForCacheWarmup(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
@@ -1156,6 +1186,172 @@ Status LRUCacheShard::InsertForCacheWarmup(
   return Status::OK();
 }
 
+// [recency 2026-10-06] See lru_cache.h. The structure mirrors
+// InsertForCacheWarmup: allocate outside the mutex, decide + evict + link under
+// it, free the handle on any non-insert outcome.
+Status LRUCacheShard::InsertForCacheWarmupByRecency(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    Cache::DeleterFn deleter, Cache::Priority priority, uint64_t last_ref_us,
+    Cache::CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup insertion requires a result pointer");
+  }
+  if (!g_block_cache_hit_counting.load(std::memory_order_relaxed)) {
+    // Without last_ref_us on the residents (all 0) every same-pool entry would
+    // read as older than any block: refuse rather than evict blindly.
+    return Status::InvalidArgument(
+        "recency-aware cache-warmup insertion needs SetBlockCacheHitCounting(true)");
+  }
+  LRUHandle* e =
+      static_cast<LRUHandle*>(malloc(sizeof(LRUHandle) - 1 + key.size()));
+  e->value = value;
+  e->m_flags = 0;
+  e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
+  e->last_ref_us = last_ref_us;   // the block's recency travels with it
+  e->info_.deleter = deleter;
+  e->key_length = key.size();
+  e->hash = hash;
+  e->refs = 0;
+  e->next = e->prev = nullptr;
+  e->SetInCache(true);
+  memcpy(e->key_data, key.data(), key.size());
+  e->CalcTotalCharge(charge, metadata_charge_policy_);
+
+  bool inserted = false;
+  autovector<LRUHandle*> evicted;
+  {
+    DMutexLock l(mutex_);
+    priority = NormalizePriorityForPools(priority);
+    e->SetPriority(priority);
+    // victim test, shared by the preflight and the eviction walk
+    auto is_victim = [&](const LRUHandle* v, bool* stop) {
+      const Cache::Priority cls = GetEffectivePriority(v);
+      if (!v->HasRefs()) {
+        if (IsStrictlyLowerPriority(cls, priority)) {
+          return true;
+        }
+        // A resident whose recency is unknown (inserted while counting was
+        // off: last_ref_us == 0) is never a same-pool victim.
+        if (cls == priority && v->last_ref_us != 0 &&
+            v->last_ref_us < last_ref_us) {
+          return true;
+        }
+      }
+      // The list runs bottom -> low -> high; once the walk is positionally
+      // past the incoming's own pool nothing beyond qualifies. (Inside the
+      // pool there is NO early stop: a pool is not ordered by last_ref_us --
+      // MaintainPoolSize demotes a pool's oldest entry to the next pool's
+      // newest position, and a carried entry links at the newest position
+      // with an older recency -- so an older entry can sit anywhere.)
+      if (IsStrictlyLowerPriority(priority, GetCurrentPriority(v))) {
+        *stop = true;
+      }
+      return false;
+    };
+
+    LRUHandle* resident = table_.Lookup(key, hash);
+    if (resident != nullptr) {
+      PromoteWarmupDuplicate(resident, priority);
+      *result = Cache::CacheWarmupInsertResult::kDuplicate;
+    } else if (e->total_charge > capacity_) {
+      *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+    } else {
+      size_t required = 0;
+      const size_t usage_limit = capacity_ - e->total_charge;
+      if (usage_ > usage_limit) {
+        required = usage_ - usage_limit;
+      }
+      size_t eligible = 0;
+      if (required > 0) {
+        // O(1) reject: the victims lie in the pools strictly below the
+        // incoming's and in its own pool, so those pools' linked charge bounds
+        // `eligible` from above (pinned entries count there but are no
+        // victims, so the bound is conservative).
+        size_t bound = LinkedChargeStrictlyBelow(priority);
+        if (priority == Cache::Priority::HIGH) {
+          bound += high_pri_pool_usage_;
+        } else if (priority == Cache::Priority::LOW) {
+          bound += low_pri_pool_usage_;
+        } else {
+          const size_t pooled = high_pri_pool_usage_ + low_pri_pool_usage_;
+          bound += lru_usage_ - std::min(lru_usage_, pooled);
+        }
+        if (bound >= required) {
+          bool stop = false;
+          for (LRUHandle* c = lru_.next;
+               c != &lru_ && eligible < required && !stop; c = c->next) {
+            if (is_victim(c, &stop)) {
+              eligible += c->total_charge;
+            }
+          }
+        }
+      }
+      if (eligible < required) {
+        *result = Cache::CacheWarmupInsertResult::kRejectedNoSpace;
+      } else {
+        size_t reclaimed = 0;
+        bool stop = false;
+        LRUHandle* victim = lru_.next;
+        while (reclaimed < required && victim != &lru_ && !stop) {
+          LRUHandle* next = victim->next;
+          if (is_victim(victim, &stop)) {
+            const size_t victim_charge = victim->total_charge;
+            LRU_Remove(victim);
+            LRUHandle* removed = table_.Remove(victim->key(), victim->hash);
+            assert(removed == victim);
+            (void)removed;
+            victim->SetInCache(false);
+            assert(usage_ >= victim_charge);
+            usage_ -= victim_charge;
+            evicted.push_back(victim);
+            if (victim_charge >= required - reclaimed) {
+              reclaimed = required;
+            } else {
+              reclaimed += victim_charge;
+            }
+          }
+          victim = next;
+        }
+        assert(reclaimed >= required);
+        LRUHandle* old_entry = table_.Insert(e);
+        assert(old_entry == nullptr);
+        (void)old_entry;
+        usage_ += e->total_charge;
+        LRU_Insert(e);
+        inserted = true;
+        *result = Cache::CacheWarmupInsertResult::kInserted;
+      }
+    }
+  }
+  if (!inserted) {
+    free(e);
+  }
+  // Demotion and deleters can be expensive and must not run under mutex_.
+  TryInsertIntoSecondaryCache(std::move(evicted));
+  return Status::OK();
+}
+
+void LRUCacheShard::CollectEntryRecency(
+    std::vector<LRUCacheEntryRecency>* out) const {
+  assert(out != nullptr);
+  DMutexLock l(mutex_);
+  // appends; the table's occupancy bounds the linked count (no reallocation
+  // under the mutex)
+  out->reserve(out->size() + table_.GetOccupancyCount());
+  for (const LRUHandle* h = lru_.next; h != &lru_; h = h->next) {
+    LRUCacheEntryRecency r;
+    r.last_ref_us = h->last_ref_us;
+    r.charge = h->total_charge;
+    // the pool it is LINKED in (contiguous segments of the list); a pending
+    // promotion marker only exists on a pinned entry, which is not evictable
+    r.pool = static_cast<uint8_t>(GetCurrentPriority(h));
+    r.evictable = !h->HasRefs();
+    out->push_back(r);
+  }
+}
+
 Status LRUCacheShard::InsertForCacheWarmupNoEvict(
     const Slice& key, uint32_t hash, void* value, size_t charge,
     Cache::DeleterFn deleter, Cache::Priority priority,
@@ -1170,6 +1366,7 @@ Status LRUCacheShard::InsertForCacheWarmupNoEvict(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
@@ -1225,6 +1422,7 @@ Status LRUCacheShard::ReplaceForCacheWarmup(
   e->value = value;
   e->m_flags = 0;
   e->im_flags = 0;
+  LRUHandleInitAccessStats(e);
   e->info_.deleter = deleter;
   e->key_length = key.size();
   e->hash = hash;
@@ -1525,6 +1723,29 @@ size_t LRUCache::TEST_GetLRUSize() {
 
 double LRUCache::GetHighPriPoolRatio() {
   return GetShard(0).GetHighPriPoolRatio();
+}
+
+void LRUCache::GetShardEntryRecency(
+    std::vector<std::vector<LRUCacheEntryRecency>>* out) const {
+  assert(out != nullptr);
+  const uint32_t num_shards = GetNumShards();
+  out->clear();
+  out->resize(num_shards);
+  for (uint32_t i = 0; i < num_shards; i++) {
+    GetShard(i).CollectEntryRecency(&(*out)[i]);
+  }
+}
+
+Status LRUCache::InsertForCacheWarmupByRecency(
+    const Slice& key, void* value, size_t charge, DeleterFn deleter,
+    Priority priority, uint64_t last_ref_us, CacheWarmupInsertResult* result) {
+  if (result == nullptr) {
+    return Status::InvalidArgument(
+        "cache-warmup insertion requires a result pointer");
+  }
+  uint32_t hash = LRUCacheShard::ComputeHash(key);
+  return GetShard(hash).InsertForCacheWarmupByRecency(
+      key, hash, value, charge, deleter, priority, last_ref_us, result);
 }
 
 void LRUCache::GetShardPoolStats(

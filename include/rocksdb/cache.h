@@ -357,10 +357,16 @@ class Cache {
 
   // Metadata exposed by the experimental cache-warmup iterator. The priority
   // is the entry's effective, current LRU pool rather than merely its priority
-  // at insertion time.
+  // at insertion time. [block hit count 2026-10-06] hits = lookups that hit
+  // this entry since it was inserted and insert_time_us = the engine clock at
+  // its insert, both 0 unless per-entry hit counting is on (LRUCache only;
+  // rocksdb/utilities/sst_access_stats.h SetBlockCacheHitCounting).
+  // [recency 2026-10-06] last_ref_us = the engine clock at the entry's last
+  // counted lookup hit (insert time until then; 0 while counting is off).
   using CacheWarmupMetadataCallback =
       std::function<void(const Slice& key, size_t charge, DeleterFn deleter,
-                         Priority effective_priority)>;
+                         Priority effective_priority, uint32_t hits,
+                         uint64_t insert_time_us, uint64_t last_ref_us)>;
 
   // A struct with pointers to helper functions for spilling items from the
   // cache into the secondary cache. May be extended in the future. An

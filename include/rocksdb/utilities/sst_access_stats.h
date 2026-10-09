@@ -43,12 +43,12 @@
 #include <cstdint>
 #include <vector>
 
+#include "rocksdb/cache.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/status.h"
 
 namespace ROCKSDB_NAMESPACE {
 
-class Cache;
 class ColumnFamilyHandle;
 class DB;
 
@@ -88,6 +88,57 @@ bool SstAccessStatsCounting();
 
 // The clock used for SstAccessStats::open_time_micros, read now.
 uint64_t SstAccessStatsNowMicros(DB* db);
+
+// [block hit count 2026-10-06] Process-wide switch for the per-ENTRY counters
+// of every LRUCache (default off): with it on, each cache entry records the
+// lookups that hit it since it was inserted and the engine clock at that
+// insert (one plain increment under the shard mutex the lookup already holds;
+// one clock read per insert). A warm-up probe (LookupForCacheWarmup) and a
+// warm-up insert's own admission do not count. The values are exposed per
+// entry by the warm-up traversal (Cache::ApplyToAllEntriesForCacheWarmup) and
+// per cataloged block by CacheDumper::CatalogWarmupDataBlocksForPull
+// (CacheWarmupPulledBlock::hits / insert_time_us). Why: the relink cache
+// hand-off's per-block selection compares a block's hits over its time in the
+// source cache against the destination's own hit density. Entries inserted
+// while the switch was off report insert_time 0 (hits do count once it is on).
+void SetBlockCacheHitCounting(bool on);
+bool BlockCacheHitCounting();
+
+// [recency 2026-10-06] One linked block-cache entry as the LRU sees it.
+struct LRUCacheEntryRecency {
+  uint64_t last_ref_us = 0;  // engine clock at its last counted hit (its insert
+                             // until then; 0 if inserted while counting was off)
+  size_t charge = 0;         // what the cache charges for it
+  uint8_t pool = 2;          // Cache::Priority of the pool it is LINKED in: 0 HIGH, 1 LOW, 2 BOTTOM
+                             // (the pools are contiguous segments of the list, in that order
+                             // from the oldest end)
+  bool evictable = false;    // linked and unpinned: a possible victim
+};
+
+// Every linked entry of every shard of an LRUCache, one vector per shard
+// (index = Cache::GetCacheWarmupShardIndex of the keys mapping to it), each in
+// the order the cache evicts: bottom pool oldest first, then low, then high.
+// Each shard is read under its own mutex. NotSupported for other caches.
+// Why: the relink cache hand-off's per-block recency selection
+// (MIG_CACHE_SELECT=age) simulates the merge of the incoming blocks into this
+// LRU order to decide which blocks to ask for and how many bytes they displace.
+Status GetLRUCacheShardEntryRecency(
+    Cache* cache, std::vector<std::vector<LRUCacheEntryRecency>>* out);
+
+// InsertForCacheWarmup with the victims widened by recency: an entry may be
+// evicted for the incoming block if its class is strictly lower (as
+// InsertForCacheWarmup) or its class is the incoming's and it was last
+// referenced before `last_ref_us` (unknown recency = never); victims are taken
+// from the LRU end, oldest position first, through the pools at or below the
+// incoming's. All-or-nothing; the inserted entry carries `last_ref_us` but
+// links at its pool's newest position (its arrival counts as a reference from
+// then on). Needs SetBlockCacheHitCounting(true). Ownership as
+// InsertForCacheWarmup. NotSupported for other caches. Non-virtual on purpose
+// (no Cache vtable change).
+Status LRUCacheInsertForCacheWarmupByRecency(
+    Cache* cache, const Slice& key, void* value, size_t charge,
+    Cache::DeleterFn deleter, Cache::Priority priority, uint64_t last_ref_us,
+    Cache::CacheWarmupInsertResult* result);
 
 // [sst access stats 2026-10-05] A lookup rate the caller measured for one of
 // this DB's resident TableReaders (file_number = the file it reads).
