@@ -1713,7 +1713,14 @@ Status DBImpl::ReFitLevel(ColumnFamilyData* cfd, int level, int target_level) {
       // the moved file looks unsupplied, and MaybeInitializeFileMetaData would fall into the stock
       // properties read, which resolves the name from cf_paths and cannot find an external file.
       // Guarded on external_path so a normal trivial move builds its meta exactly as before.
-      if (!f->fd.external_path.empty()) {
+      // [rename fix 2026-10-11] ... or on the GSN override: a rename-mode registration
+      // (ExternalFileForRegister::rename_into_db) has an EMPTY external_path but carries the
+      // same shipped stats, and without this clause its first trivial move looked unsupplied
+      // and re-read the properties block from storage (MaybeInitializeFileMetaData's fallback
+      // -- correct, the file sits at the stock in-DB path, but one more open per moved file,
+      // which the in-place route never pays). Stock outputs carry neither mark.
+      if (!f->fd.external_path.empty() ||
+          f->fd.global_seqno_override != kDisableGlobalSequenceNumber) {
         moved.relink_stats_supplied = f->relink_stats_supplied;
         moved.init_stats_from_file = f->init_stats_from_file;
         moved.num_entries = f->num_entries;
@@ -3387,7 +3394,14 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
         // the moved file looks unsupplied, and MaybeInitializeFileMetaData would fall into the stock
         // properties read, which resolves the name from cf_paths and cannot find an external file.
         // Guarded on external_path so a normal trivial move builds its meta exactly as before.
-        if (!f->fd.external_path.empty()) {
+        // [rename fix 2026-10-11] ... or on the GSN override: a rename-mode registration
+        // (ExternalFileForRegister::rename_into_db) has an EMPTY external_path but carries the
+        // same shipped stats, and without this clause its first trivial move looked unsupplied
+        // and re-read the properties block from storage (MaybeInitializeFileMetaData's fallback
+        // -- correct, the file sits at the stock in-DB path, but one more open per moved file,
+        // which the in-place route never pays). Stock outputs carry neither mark.
+        if (!f->fd.external_path.empty() ||
+            f->fd.global_seqno_override != kDisableGlobalSequenceNumber) {
           moved.relink_stats_supplied = f->relink_stats_supplied;
           moved.init_stats_from_file = f->init_stats_from_file;
           moved.num_entries = f->num_entries;

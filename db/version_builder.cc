@@ -1311,8 +1311,11 @@ class VersionBuilder::Rep {
           // (= their own directory), so they were already skipped by the first clause; the new
           // clause changes nothing for them. Stock flush/compaction outputs have
           // global_seqno_override == kDisableGlobalSequenceNumber, so the clause is inert for
-          // every non-relink edit. A trivial move re-adds a GSN-bearing file, but with its
-          // table_reader_handle already set, so the guard above precedes this skip.
+          // every non-relink edit. [rename fix 2026-10-11] A trivial move re-adds a GSN-bearing
+          // file as a FRESH FileMetaData (db_impl_compaction_flush.cc builds it without the
+          // table_reader_handle, on purpose), so it reaches this clause and is skipped as well:
+          // the same lazy-open treatment the first clause already gave an in-place reference. A
+          // stock trivial move carries neither mark and keeps its eager (table-cache-hit) open.
           if (!file_meta->fd.external_path.empty() ||
               file_meta->fd.global_seqno_override !=
                   kDisableGlobalSequenceNumber) {
