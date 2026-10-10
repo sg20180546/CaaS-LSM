@@ -208,6 +208,9 @@ struct ExternalFileForRegister {
 // files no longer in the Version (compacted away since the caller's snapshot).
 // In the rename baseline a source MUST see skipped_busy == 0: a renamed-but-kept
 // file is a MANIFEST entry pointing at a path that no longer exists.
+// [rename fix 2026-10-11] When the call returns !ok (the MANIFEST write
+// failed) the counters describe the edit that was ATTEMPTED: `dropped` files
+// are then still in the Version, so a caller must gate on the Status first.
 struct UnregisterInPlaceStats {
   uint64_t dropped = 0;
   uint64_t skipped_busy = 0;
@@ -221,7 +224,10 @@ struct UnregisterInPlaceStats {
 // wall clock of the whole rename pass (every file of the batch, renamed in
 // parallel on `rename_threads` threads: env RELINK_RENAME_THREADS, default
 // 32, capped at the file count). A batch with no rename_into_db file reports
-// 0 / 0 / 0; so does a failed batch (every rename is undone). The relink
+// 0 / 0 / 0. A FAILED batch reports renamed = 0 (every rename is undone) but
+// [rename fix 2026-10-11] still the pass's wall clock and fan-out when the
+// pass ran (a rename failure and a MANIFEST failure report the same fields);
+// a batch that failed validation before the pass reports 0 / 0 / 0. The relink
 // destination records them as its migphase row P3b_rename, so the migration
 // time decomposition can print "N files renamed in X ms" as a number.
 // [rename fix 2026-10-10] `rename_back_failed` = renames of a FAILED batch

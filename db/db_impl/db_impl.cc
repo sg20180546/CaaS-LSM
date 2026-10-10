@@ -24,6 +24,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <system_error>  // [rename fix 2026-10-11] std::system_error from port::Thread
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -5915,7 +5916,20 @@ Status DBImpl::RegisterExternalFilesInPlace(
       for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
     };
     std::vector<port::Thread> pool;
-    for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
+    for (size_t t = 1; t < threads; ++t) {
+      // [rename fix 2026-10-11] std::thread's constructor throws
+      // std::system_error when the OS refuses a thread. Letting that unwind
+      // through `pool` (joinable threads inside) is std::terminate -- a dst
+      // crash in the one window where files are already renamed and no
+      // MANIFEST names them (see the crash note on PendingOutputGuard). The
+      // shared index needs no fixed fan-out: run on the threads that exist
+      // plus this one.
+      try {
+        pool.emplace_back(worker);
+      } catch (const std::system_error&) {
+        break;
+      }
+    }
     worker();
     for (auto& t : pool) t.join();
   };
@@ -5990,6 +6004,10 @@ Status DBImpl::RegisterExternalFilesInPlace(
       // [rename fix 2026-10-10] nothing moved stays moved (renamed is empty),
       // but a rename-back that failed must still reach the caller.
       if (out != nullptr) {
+        // [rename fix 2026-10-11] the pass did run: report its wall clock
+        // and fan-out exactly like the LogAndApply-failure path below
+        // (renamed stays 0 either way).
+        out->rename_micros = rename_micros;
         out->rename_threads = static_cast<uint64_t>(rename_threads);
         out->rename_back_failed = rename_back_failed.load();
       }
