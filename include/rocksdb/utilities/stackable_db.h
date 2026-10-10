@@ -162,6 +162,22 @@ class StackableDB : public DB {
                                        uint64_t file_number) override {
     return db_->UnregisterFileInPlace(column_family, level, file_number);
   }
+  // [rename fix 2026-10-10] The batch variants were never delegated (a wrapper
+  // around the shard DB would have returned NotSupported for both, which in
+  // the rename baseline is a loud export abort); symmetric to the single-file
+  // pair above, trailing out-params forwarded as-is.
+  virtual Status RegisterExternalFilesInPlace(
+      ColumnFamilyHandle* column_family,
+      const std::vector<ExternalFileForRegister>& files,
+      RegisterInPlaceStats* out = nullptr) override {
+    return db_->RegisterExternalFilesInPlace(column_family, files, out);
+  }
+  virtual Status UnregisterFilesInPlace(
+      ColumnFamilyHandle* column_family,
+      const std::vector<std::pair<int, uint64_t>>& level_and_file,
+      UnregisterInPlaceStats* out = nullptr) override {
+    return db_->UnregisterFilesInPlace(column_family, level_and_file, out);
+  }
   // [external memtable 2026-09-23]
   virtual Status InstallExternalMemTable(ColumnFamilyHandle* column_family,
                                          ExternalMemTableBlock&& block) override {

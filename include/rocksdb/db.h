@@ -184,6 +184,57 @@ struct ExternalFileForRegister {
   uint64_t raw_value_size = 0;
   uint64_t oldest_ancester_time = 0;
   uint64_t file_creation_time = 0;
+  // [rename baseline 2026-10-10] false (default) = the IN-PLACE route: the SST
+  // stays at `external_file`, fd.external_path records that path, and the
+  // Storage-CP refcount is bumped (NotifyLink) so the owner's compaction cannot
+  // delete it underneath this DB. true = the June rename baseline: the engine
+  // MOVES `external_file` into this DB's directory with FileSystem::RenameFile
+  // (metadata-only on HDFS) under the fresh file number and registers it as a
+  // plain in-DB file -- fd.external_path stays EMPTY, no NotifyLink is issued,
+  // the GSN override is kept. The destination then is the sole owner of the
+  // bytes and the source's later obsolete-file delete of the old path is an
+  // ENOENT no-op. Honoured ONLY by the batch RegisterExternalFilesInPlace; the
+  // legacy single-file RegisterExternalFileInPlace has no such field and always
+  // references in place. Deliberately the LAST member: callers built against
+  // the older struct layout keep the default and the byte-identical in-place
+  // behaviour.
+  bool rename_into_db = false;
+};
+
+// [rename baseline 2026-10-10] Per-call counters of UnregisterFilesInPlace,
+// filled through its trailing optional out-param. `dropped` = files removed
+// from the MANIFEST by this call; `skipped_busy` = files left in place because
+// an in-flight compaction still reads them (being_compacted); `skipped_gone` =
+// files no longer in the Version (compacted away since the caller's snapshot).
+// In the rename baseline a source MUST see skipped_busy == 0: a renamed-but-kept
+// file is a MANIFEST entry pointing at a path that no longer exists.
+struct UnregisterInPlaceStats {
+  uint64_t dropped = 0;
+  uint64_t skipped_busy = 0;
+  uint64_t skipped_gone = 0;
+};
+
+// [bulk rename 2026-10-10] Per-call counters of the batch
+// RegisterExternalFilesInPlace, filled through its trailing optional
+// out-param. `renamed` = files this call MOVED into the DB directory
+// (ExternalFileForRegister::rename_into_db) and committed; `rename_micros` =
+// wall clock of the whole rename pass (every file of the batch, renamed in
+// parallel on `rename_threads` threads: env RELINK_RENAME_THREADS, default
+// 32, capped at the file count). A batch with no rename_into_db file reports
+// 0 / 0 / 0; so does a failed batch (every rename is undone). The relink
+// destination records them as its migphase row P3b_rename, so the migration
+// time decomposition can print "N files renamed in X ms" as a number.
+// [rename fix 2026-10-10] `rename_back_failed` = renames of a FAILED batch
+// that could not be undone: each such file sits at this DB's in-DB path
+// untracked by any MANIFEST (a storage leak) while the caller's MANIFEST
+// still names the old path. Nonzero only when the call returned !ok. The
+// engine logs each one through ROCKS_LOG_ERROR (the RocksDB LOG), which no
+// harness gate reads; the caller surfaces the count on its own stderr.
+struct RegisterInPlaceStats {
+  uint64_t renamed = 0;
+  uint64_t rename_micros = 0;
+  uint64_t rename_threads = 0;
+  uint64_t rename_back_failed = 0;
 };
 
 // One source file eligible for table-cache warmup. `file_number` is meaningful
@@ -1798,13 +1849,15 @@ class DB {
 
   // [relink] Register an EXISTING SST file (e.g. already on shared HDFS) into
   // this column family's MANIFEST at `level`, applying `global_seqno` as a
-  // per-file GSN override to ALL of the file's keys at read time. NO data copy:
-  // the file is moved into the DB directory via FileSystem::RenameFile
-  // (metadata-only on HDFS). This is additive/opt-in for key-group migration
-  // (relink): stock ingest/flush/compaction are untouched and the default
-  // implementation returns NotSupported, so other DB implementations are
-  // unaffected. The per-file GSN and external path are persisted in the
-  // MANIFEST.
+  // per-file GSN override to ALL of the file's keys at read time. NO data copy.
+  // This legacy single-file API always references the file IN PLACE: the SST
+  // stays at `external_file`, which is recorded as fd.external_path (the June
+  // RenameFile move survives only as the opt-in
+  // ExternalFileForRegister::rename_into_db of the batch API below). This is
+  // additive/opt-in for key-group migration (relink): stock
+  // ingest/flush/compaction are untouched and the default implementation
+  // returns NotSupported, so other DB implementations are unaffected. The
+  // per-file GSN and external path are persisted in the MANIFEST.
   virtual Status RegisterExternalFileInPlace(
       ColumnFamilyHandle* /*column_family*/,
       const std::string& /*external_file*/, int /*level*/,
@@ -1820,9 +1873,17 @@ class DB {
   // (ExternalFileForRegister), its HDFS open is skipped. Equivalent to calling
   // RegisterExternalFileInPlace per file but file-count-independent in fsyncs
   // (and HDFS opens, when bounds are given).
+  // [rename baseline 2026-10-10] Per file, ExternalFileForRegister::rename_into_db
+  // selects in-place (default: fd.external_path + Storage-CP NotifyLink) or the
+  // rename baseline (FileSystem::RenameFile into this DB's directory, empty
+  // external_path, no NotifyLink). Every rename is undone if the batch fails.
+  // [bulk rename 2026-10-10] `out` (optional) receives the rename pass's
+  // file count / wall clock / thread count (see RegisterInPlaceStats);
+  // nullptr = not wanted.
   virtual Status RegisterExternalFilesInPlace(
       ColumnFamilyHandle* /*column_family*/,
-      const std::vector<ExternalFileForRegister>& /*files*/) {
+      const std::vector<ExternalFileForRegister>& /*files*/,
+      RegisterInPlaceStats* /*out*/ = nullptr) {
     return Status::NotSupported(
         "RegisterExternalFilesInPlace is not supported in this DB implementation");
   }
@@ -1878,10 +1939,14 @@ class DB {
   }
 
   // [relink] Remove a (relinked) file from this column family's MANIFEST WITHOUT
-  // physically deleting it — the file has been renamed away into another DB by
-  // RegisterExternalFileInPlace, so the obsolete-file deletion this triggers is a
-  // harmless no-op. Additive/opt-in (key-group migration, src side); default
-  // NotSupported so other DB implementations are unaffected.
+  // this DB keeping the bytes alive: the destination has registered the same
+  // file by RegisterExternalFile(s)InPlace. In the in-place mode (default) the
+  // obsolete-file delete this triggers reaches the Storage-CP refcount
+  // (DeleteFile -> RequestDelete) and the bytes stay until the destination
+  // releases them; in the rename baseline (rename_into_db) the destination has
+  // already moved the file into its own directory, so the delete of the old
+  // path is a harmless ENOENT no-op. Additive/opt-in (key-group migration, src
+  // side); default NotSupported so other DB implementations are unaffected.
   virtual Status UnregisterFileInPlace(ColumnFamilyHandle* /*column_family*/,
                                        int /*level*/, uint64_t /*file_number*/) {
     return Status::NotSupported(
@@ -1892,9 +1957,15 @@ class DB {
   // ONE LogAndApply + ONE SuperVersion install (vs 1 each per file). Each pair is
   // {level, file_number}. Symmetric to RegisterExternalFilesInPlace; used by the relink
   // src-drop so it is file-count-independent in fsyncs / Version rebuilds.
+  // [rename baseline 2026-10-10] `out` (optional) receives the per-call
+  // dropped / skipped_busy / skipped_gone counters (see UnregisterInPlaceStats);
+  // nullptr = not wanted. Files still being compacted are skipped, not dropped
+  // (see DBImpl::UnregisterFilesInPlace) -- a rename-mode source asserts
+  // skipped_busy == 0 through this.
   virtual Status UnregisterFilesInPlace(
       ColumnFamilyHandle* /*column_family*/,
-      const std::vector<std::pair<int, uint64_t>>& /*level_and_file*/) {
+      const std::vector<std::pair<int, uint64_t>>& /*level_and_file*/,
+      UnregisterInPlaceStats* /*out*/ = nullptr) {
     return Status::NotSupported(
         "UnregisterFilesInPlace is not supported in this DB implementation");
   }

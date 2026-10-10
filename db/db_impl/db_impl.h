@@ -537,9 +537,11 @@ class DBImpl : public DB {
 
   // [relink §21] batch variant: N files -> 1 VersionEdit + 1 LogAndApply (skips per-file
   // HDFS open when user-key bounds + size are supplied in ExternalFileForRegister).
+  // [bulk rename 2026-10-10] `out` (optional) = renamed / rename_micros / rename_threads.
   virtual Status RegisterExternalFilesInPlace(
       ColumnFamilyHandle* column_family,
-      const std::vector<ExternalFileForRegister>& files) override;
+      const std::vector<ExternalFileForRegister>& files,
+      RegisterInPlaceStats* out = nullptr) override;
 
   virtual Status StreamTableCacheWarmupEntries(
       ColumnFamilyHandle* column_family,
@@ -582,9 +584,11 @@ class DBImpl : public DB {
                                        uint64_t file_number) override;
 
   // [relink §21] batch variant: N files -> 1 VersionEdit + 1 LogAndApply + 1 install.
+  // [rename baseline 2026-10-10] `out` (optional) = dropped/skipped_busy/skipped_gone.
   virtual Status UnregisterFilesInPlace(
       ColumnFamilyHandle* column_family,
-      const std::vector<std::pair<int, uint64_t>>& level_and_file) override;
+      const std::vector<std::pair<int, uint64_t>>& level_and_file,
+      UnregisterInPlaceStats* out = nullptr) override;
 
   // [external memtable 2026-09-23] install a caller-owned sorted KV-block as
   // an immutable memtable (db/db_impl/db_impl_external_memtable.cc).

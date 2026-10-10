@@ -1274,6 +1274,11 @@ class VersionBuilder::Rep {
     // carries fd.external_path; nothing a flush or compaction installs ever does. The skip below
     // is therefore inert on every non-relink edit, which is what keeps baseline runs
     // bit-identical (see migration_mechansim_exp/CLAUDE.md, relink option-gated isolation).
+    // [rename baseline 2026-10-10] A file registered with rename_into_db carries NO
+    // external_path (it was moved into this DB's directory) but still carries the per-file
+    // fd.global_seqno_override; the skip keys on either mark. Still inert for stock edits: a
+    // flush/compaction output has external_path empty AND global_seqno_override ==
+    // kDisableGlobalSequenceNumber.
     for (int level = 0; level < num_levels_; level++) {
       for (auto& file_meta_pair : levels_[level].added_files) {
         auto* file_meta = file_meta_pair.second;
@@ -1296,7 +1301,21 @@ class VersionBuilder::Rep {
           //     gone.
           // Files a flush or compaction installs never carry fd.external_path, so every
           // non-relink edit keeps the stock serial path byte-for-byte.
-          if (!file_meta->fd.external_path.empty()) {
+          // [rename baseline 2026-10-10] The same skip also covers a GSN-bearing file with an
+          // EMPTY external_path: that is a rename-mode registration (the file now lives at the
+          // stock in-DB path), and without this clause the destination's LogAndApply would open
+          // every renamed file serially here whenever the table cache is below load_limit --
+          // the N serial HDFS opens in the stop window that the 2026-09-20 fix removed. The
+          // G6/G7 write-once installs (serverclient OP_MIG_RELINK_REG for a file the dst itself
+          // wrote) go through the same register call and therefore still carry external_path
+          // (= their own directory), so they were already skipped by the first clause; the new
+          // clause changes nothing for them. Stock flush/compaction outputs have
+          // global_seqno_override == kDisableGlobalSequenceNumber, so the clause is inert for
+          // every non-relink edit. A trivial move re-adds a GSN-bearing file, but with its
+          // table_reader_handle already set, so the guard above precedes this skip.
+          if (!file_meta->fd.external_path.empty() ||
+              file_meta->fd.global_seqno_override !=
+                  kDisableGlobalSequenceNumber) {
             continue;
           }
           files_meta.emplace_back(file_meta, level);

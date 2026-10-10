@@ -14,6 +14,7 @@
 #endif
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <limits>
 #include <cinttypes>
@@ -5546,10 +5547,13 @@ Status DecodeExternalFileUniqueId(const std::string& public_unique_id,
 
 // [relink] Register an existing SST into this CF's MANIFEST at `level`,
 // applying a per-file GSN (global_seqno) that overrides ALL of the file's keys'
-// seqno at read time. NO data copy: the file is moved into the DB dir via
-// FileSystem::RenameFile (metadata-only on HDFS). Additive/opt-in for key-group
-// migration (relink); stock ingest/flush/compaction are untouched. The GSN and
-// external path are persisted as NewFile4 custom fields in the MANIFEST.
+// seqno at read time. NO data copy. This legacy single-file API ALWAYS
+// references the file in place (fd.external_path = `external_file`, no
+// rename); the June RenameFile move is available only through
+// ExternalFileForRegister::rename_into_db of the batch API below
+// ([rename baseline 2026-10-10]). Additive/opt-in for key-group migration
+// (relink); stock ingest/flush/compaction are untouched. The GSN and external
+// path are persisted as NewFile4 custom fields in the MANIFEST.
 Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
                                            const std::string& external_file,
                                            int level,
@@ -5684,7 +5688,9 @@ Status DBImpl::RegisterExternalFileInPlace(ColumnFamilyHandle* column_family,
 // commits them together.
 Status DBImpl::RegisterExternalFilesInPlace(
     ColumnFamilyHandle* column_family,
-    const std::vector<ExternalFileForRegister>& files) {
+    const std::vector<ExternalFileForRegister>& files,
+    RegisterInPlaceStats* out) {
+  if (out != nullptr) *out = RegisterInPlaceStats();  // [bulk rename 2026-10-10]
   if (column_family == nullptr) {
     return Status::InvalidArgument("column_family must not be null");
   }
@@ -5714,6 +5720,54 @@ Status DBImpl::RegisterExternalFilesInPlace(
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
   SequenceNumber max_gsn = 0;
+  // [rename baseline 2026-10-10] Files whose caller set rename_into_db, with
+  // the fresh number each will live under in this DB's directory. The renames
+  // themselves run AFTER the loop (see below); `renamed` holds (in-DB path,
+  // original external path) for every rename already performed so a failed
+  // batch can put every file back where it came from. Both stay empty on the
+  // default in-place route.
+  std::vector<std::pair<const ExternalFileForRegister*, uint64_t>> to_rename;
+  std::vector<std::pair<std::string, std::string>> renamed;
+
+  // [rename fix 2026-10-10] A renamed file sits at TableFileName(cf_paths, N)
+  // from its RenameFile until the LogAndApply below installs it: in no Version,
+  // and -- without this -- in no pending output either. A full-scan
+  // FindObsoleteFiles in that window (forced after any failed flush/compaction,
+  // db_impl_compaction_flush.cc; or the delete_obsolete_files_period) lists
+  // <N>.sst, finds it below MinObsoleteSstNumberToKeep() (= max when
+  // pending_outputs_ is empty, db_impl_files.cc) and deletes it; the commit
+  // then succeeds on a file that is gone (the version_builder skip never opens
+  // it) and a rename-back would fail too. Stock ingestion guards the same
+  // window with ReserveFileNumbersBeforeIngestion ->
+  // CaptureCurrentFileNumberInPendingOutputs; mirror it: capture
+  // current_next_file_number() BEFORE the per-file loop allocates numbers (so
+  // every NewFileNumber below is >= the captured value and PurgeObsoleteFiles
+  // keeps it), release under mutex_ once the files are live in a Version
+  // (success) or, on every other return path, after the rename-back has put
+  // them back where they came from (the guard's destructor). Captured only
+  // when a file asks for the rename, so the in-place route stays
+  // byte-identical.
+  struct PendingOutputGuard {
+    DBImpl* db;
+    std::unique_ptr<std::list<uint64_t>::iterator> elem;
+    void ReleaseLocked() {  // mutex_ held by the caller
+      db->ReleaseFileNumberFromPendingOutputs(elem);
+    }
+    ~PendingOutputGuard() {
+      if (elem != nullptr) {
+        InstrumentedMutexLock l(&db->mutex_);
+        db->ReleaseFileNumberFromPendingOutputs(elem);
+      }
+    }
+  } pending_guard{this, nullptr};
+  if (std::any_of(files.begin(), files.end(),
+                  [](const ExternalFileForRegister& f) {
+                    return f.rename_into_db;
+                  })) {
+    InstrumentedMutexLock l(&mutex_);
+    pending_guard.elem.reset(new std::list<uint64_t>::iterator(
+        CaptureCurrentFileNumberInPendingOutputs()));
+  }
 
   for (const auto& fr : files) {
     std::string smallest_user = fr.smallest_user;
@@ -5787,6 +5841,11 @@ Status DBImpl::RegisterExternalFilesInPlace(
     }
 
     uint64_t file_number = versions_->NewFileNumber();
+    // [rename baseline 2026-10-10] The fallback open above (if any) has read
+    // fr.external_file and released it; from here on the file may move. Record
+    // the move for the post-loop pass (the number is allocated now so the
+    // MANIFEST entry and the in-DB path agree).
+    if (fr.rename_into_db) to_rename.emplace_back(&fr, file_number);
     InternalKey smallest_ikey(Slice(smallest_user), fr.global_seqno,
                               kValueTypeForSeek);
     InternalKey largest_ikey(Slice(largest_user), fr.global_seqno,
@@ -5799,7 +5858,14 @@ Status DBImpl::RegisterExternalFilesInPlace(
         fr.file_creation_time, /*file_checksum=*/"",
         /*file_checksum_func_name=*/"", unique_id);
     f_meta.fd.global_seqno_override = fr.global_seqno;  // [relink] per-file GSN
-    f_meta.fd.external_path = fr.external_file;  // [relink] reference in place
+    // [relink] in-place: the reference IS the external path. [rename baseline
+    // 2026-10-10] rename: the file will sit at the stock in-DB path for
+    // `file_number` once renamed below, so external_path stays EMPTY and the
+    // table cache, PurgeObsoleteFiles and MANIFEST roll resolve it exactly like
+    // a flushed file (the GSN override alone still forces its absorption
+    // compaction local, compaction_service_job.cc).
+    f_meta.fd.external_path =
+        fr.rename_into_db ? std::string() : fr.external_file;
     // [relink fast-register 2026-09-19] Adopt the source's table stats when it
     // supplied them. Without this the destination reads the properties block
     // off HDFS per file, first eagerly inside LogAndApply and again in
@@ -5820,6 +5886,122 @@ Status DBImpl::RegisterExternalFilesInPlace(
     }
   }
 
+  // [bulk rename 2026-10-10] Fan-out of the rename pass and of its undo: env
+  // RELINK_RENAME_THREADS (default 32, floor 1), capped at the file count.
+  // One HDFS rename is one NameNode round trip (milliseconds), so a serial
+  // pass over a ~1,300-file handoff is seconds inside the stop window; N
+  // renames in flight are bounded by the NameNode's throughput instead. The
+  // pass is a metadata-only move either way: the baseline's cost is the
+  // compaction wait at the source, not the file count, and this keeps the
+  // rename slice a thin, printable number next to it. Read per call (one
+  // batch register per migration) so a relaunch can change the fan-out
+  // without a rebuild. 0 on the default in-place route (nothing to rename).
+  size_t rename_threads = 0;
+  if (!to_rename.empty()) {
+    size_t want = 32;
+    if (const char* env = std::getenv("RELINK_RENAME_THREADS")) {
+      char* end = nullptr;
+      const unsigned long long v = std::strtoull(env, &end, 10);
+      if (end != env && *end == '\0' && v >= 1) want = static_cast<size_t>(v);
+    }
+    rename_threads = std::min(want, to_rename.size());
+  }
+  // fn(i) for every i in [0, n), on `threads` threads (this thread is one of
+  // them); the indices are handed out by an atomic counter, so no two threads
+  // touch the same file and the per-index result slots need no lock.
+  auto run_parallel = [](size_t n, size_t threads, auto&& fn) {
+    std::atomic<size_t> next{0};
+    auto worker = [&]() {
+      for (size_t i = next.fetch_add(1); i < n; i = next.fetch_add(1)) fn(i);
+    };
+    std::vector<port::Thread> pool;
+    for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
+    worker();
+    for (auto& t : pool) t.join();
+  };
+
+  // [rename baseline 2026-10-10] Undo every rename of this batch so a failed
+  // batch leaves each file at the path the caller named ([bulk rename] in
+  // parallel: the files are independent, order is irrelevant). A rename-back
+  // that itself fails leaves the file at the in-DB path untracked by any
+  // MANIFEST -- a storage leak, never a loss -- and is logged here (RocksDB
+  // LOG) and [rename fix 2026-10-10] counted into `out->rename_back_failed`,
+  // because the LOG line is invisible to the caller's stderr-based gate.
+  std::atomic<uint64_t> rename_back_failed{0};
+  auto rename_back = [&]() {
+    run_parallel(renamed.size(), std::min(rename_threads, renamed.size()),
+                 [&](size_t i) {
+                   IOStatus rb = fs_->RenameFile(renamed[i].first,
+                                                 renamed[i].second,
+                                                 IOOptions(), nullptr);
+                   if (!rb.ok()) {
+                     rename_back_failed.fetch_add(1);
+                     ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                                     "[relink] rename-back %s -> %s failed: %s",
+                                     renamed[i].first.c_str(),
+                                     renamed[i].second.c_str(),
+                                     rb.ToString().c_str());
+                   }
+                 });
+    renamed.clear();
+  };
+
+  // [rename baseline 2026-10-10] Move the rename-mode files into this DB's
+  // directory under their fresh numbers: NewFileNumber -> RenameFile ->
+  // AddFile -> LogAndApply, the June a38c602 shape, but with the moves done
+  // only once the whole batch has validated (no early return remains above)
+  // and still BEFORE the MANIFEST commit, outside mutex_ (HDFS metadata RPC).
+  // [bulk rename 2026-10-10] All renames of the batch run in parallel; the
+  // results are collected afterwards, and ANY failure undoes every rename
+  // that succeeded and fails the batch with nothing moved (the first error
+  // is returned). Empty on the default in-place route.
+  uint64_t rename_micros = 0;
+  if (!to_rename.empty()) {
+    const size_t n = to_rename.size();
+    std::vector<std::string> path_in_db(n);
+    for (size_t i = 0; i < n; ++i) {
+      path_in_db[i] = TableFileName(cfd->ioptions()->cf_paths,
+                                    to_rename[i].second, 0 /* path_id */);
+    }
+    std::vector<IOStatus> rename_status(n);
+    const uint64_t rename_t0 = immutable_db_options_.clock->NowMicros();
+    run_parallel(n, rename_threads, [&](size_t i) {
+      const std::string& src = to_rename[i].first->external_file;
+      rename_status[i] =
+          fs_->RenameFile(src, path_in_db[i], IOOptions(), nullptr);
+      if (!rename_status[i].ok()) {
+        ROCKS_LOG_ERROR(immutable_db_options_.info_log,
+                        "[relink] RenameFile %s -> %s failed: %s", src.c_str(),
+                        path_in_db[i].c_str(),
+                        rename_status[i].ToString().c_str());
+      }
+    });
+    rename_micros = immutable_db_options_.clock->NowMicros() - rename_t0;
+    IOStatus first_error;
+    for (size_t i = 0; i < n; ++i) {
+      if (rename_status[i].ok()) {
+        renamed.emplace_back(path_in_db[i], to_rename[i].first->external_file);
+      } else if (first_error.ok()) {
+        first_error = rename_status[i];
+      }
+    }
+    if (!first_error.ok()) {
+      rename_back();
+      // [rename fix 2026-10-10] nothing moved stays moved (renamed is empty),
+      // but a rename-back that failed must still reach the caller.
+      if (out != nullptr) {
+        out->rename_threads = static_cast<uint64_t>(rename_threads);
+        out->rename_back_failed = rename_back_failed.load();
+      }
+      return first_error;  // pending_guard releases the reservation on exit
+    }
+    ROCKS_LOG_INFO(immutable_db_options_.info_log,
+                   "[relink] renamed %zu files into the DB directory in "
+                   "%llu us on %zu threads",
+                   n, static_cast<unsigned long long>(rename_micros),
+                   rename_threads);
+  }
+
   Status s;
   {
     InstrumentedMutexLock l(&mutex_);
@@ -5836,7 +6018,28 @@ Status DBImpl::RegisterExternalFilesInPlace(
       InstallSuperVersionAndScheduleWork(cfd, &sv_ctx,
                                          *cfd->GetLatestMutableCFOptions());
       sv_ctx.Clean();
+      // [rename fix 2026-10-10] the renamed files are live in a Version now:
+      // the pending-output reservation has done its job (no-op in-place).
+      pending_guard.ReleaseLocked();
     }
+  }
+  // [rename baseline 2026-10-10] The MANIFEST never learned of the moved files:
+  // put them back so the source's MANIFEST (which still names the old paths)
+  // stays valid. Closes the June a38c602 orphan hazard (rename before a
+  // possibly failing LogAndApply, no compensation). [rename fix 2026-10-10]
+  // pending_guard is still held here, so no obsolete-file scan can take the
+  // moved files out from under the rename-back; it is released on return.
+  if (!s.ok() && !renamed.empty()) {
+    rename_back();
+  }
+  // [bulk rename 2026-10-10] What the caller gets to print: the files that
+  // now live in this DB's directory (0 after a rename-back), the pass's wall
+  // clock and its fan-out. In-place batches report 0 / 0 / 0.
+  if (out != nullptr) {
+    out->renamed = static_cast<uint64_t>(renamed.size());
+    out->rename_micros = rename_micros;
+    out->rename_threads = static_cast<uint64_t>(rename_threads);
+    out->rename_back_failed = rename_back_failed.load();
   }
 #ifdef HDFS
   // [relink/Storage-CP] Batch variant of the same claim: every file in this
@@ -5845,11 +6048,18 @@ Status DBImpl::RegisterExternalFilesInPlace(
   // [batch 2026-09-09] ONE RPC for the whole edit. The per-file loop here was
   // serial (~3.7 ms/file unloaded, ~13 ms under load) and, after the single
   // LogAndApply above, the last O(#files) term in relink's stop window.
+  // [rename baseline 2026-10-10] Only the in-place files are shared with their
+  // owner; a renamed file is this DB's alone (and the Storage-CP, if armed,
+  // already moved its path key inside HdfsFileSystem::RenameFile), so it is
+  // left out of the claim. Default route: every file is in-place, same list
+  // and same single RPC as before.
   if (s.ok()) {
     std::vector<std::string> paths;
     paths.reserve(files.size());
-    for (const auto& fr : files) paths.push_back(fr.external_file);
-    StorageCpNotifyLinkBatch(fs_.get(), paths);
+    for (const auto& fr : files) {
+      if (!fr.rename_into_db) paths.push_back(fr.external_file);
+    }
+    if (!paths.empty()) StorageCpNotifyLinkBatch(fs_.get(), paths);
   }
 #endif
   return s;
@@ -6666,9 +6876,13 @@ Status DBImpl::InstallExternalTableCacheEntries(
   return first_error;
 }
 
-// [relink] Remove a relinked file from this CF's MANIFEST. The physical file has been
-// renamed into another DB by RegisterExternalFileInPlace, so the obsolete-file deletion
-// triggered by removing it here is a harmless no-op (the path no longer exists). Used by
+// [relink] Remove a relinked file from this CF's MANIFEST. The destination has
+// registered the same file by RegisterExternalFile(s)InPlace: in the in-place mode
+// (default) the obsolete-file deletion triggered here goes through the Storage-CP
+// refcount (env_hdfs DeleteFile -> RequestDelete) and the bytes survive for the
+// destination; in the rename baseline ([rename baseline 2026-10-10], rename_into_db)
+// the destination has moved the file into its own directory, so the deletion of the
+// old path is a harmless no-op (the path no longer exists). Used by
 // key-group migration on the SOURCE side after the destination has registered the file.
 Status DBImpl::UnregisterFileInPlace(ColumnFamilyHandle* column_family, int level,
                                      uint64_t file_number) {
@@ -6697,9 +6911,16 @@ Status DBImpl::UnregisterFileInPlace(ColumnFamilyHandle* column_family, int leve
 // ONE LogAndApply + ONE SuperVersion install. Symmetric to UnregisterFileInPlace above;
 // used by the relink src-drop so it is file-count-independent (vs 1 fsync + 1 Version
 // rebuild per file).
+// [rename baseline 2026-10-10] `out` (optional) receives the dropped /
+// skipped_busy / skipped_gone counters this function already computes; the
+// rename-mode source asserts skipped_busy == 0 through it (a skipped file there
+// is a MANIFEST entry whose path the destination has already renamed away).
+// Logic and the stderr line below are unchanged.
 Status DBImpl::UnregisterFilesInPlace(
     ColumnFamilyHandle* column_family,
-    const std::vector<std::pair<int, uint64_t>>& level_and_file) {
+    const std::vector<std::pair<int, uint64_t>>& level_and_file,
+    UnregisterInPlaceStats* out) {
+  if (out != nullptr) *out = UnregisterInPlaceStats();
   if (column_family == nullptr) {
     return Status::InvalidArgument("column_family must not be null");
   }
@@ -6748,6 +6969,11 @@ Status DBImpl::UnregisterFilesInPlace(
             "[relink] UnregisterFilesInPlace: dropped=%d skipped_being_compacted=%d "
             "skipped_already_gone=%d (of %zu)\n",
             dropped, skipped_busy, skipped_gone, level_and_file.size());
+  }
+  if (out != nullptr) {  // [rename baseline 2026-10-10]
+    out->dropped = static_cast<uint64_t>(dropped);
+    out->skipped_busy = static_cast<uint64_t>(skipped_busy);
+    out->skipped_gone = static_cast<uint64_t>(skipped_gone);
   }
   if (dropped == 0) return Status::OK();
   Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
