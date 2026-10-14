@@ -69,6 +69,7 @@ std::mutex scheduler_latch_;
 // [procp-offline-fix 2026-10-14] consecutive failed CheckCSAStatus calls per CSA (under monitor_latch_). One failed
 // check used to remove a CSA for good; 2026-10-14 nxi4k34 lost CSA 88 three seconds after it registered.
 std::unordered_map<std::string, int> csa_check_failures_;
+std::vector<std::unique_ptr<compactionservice::CSAService::Stub>> retired_csa_stubs_;  // never freed (see RegisterCSA)
 static constexpr int kCsaOfflineAfterFailures = 3;
 static constexpr int kCsaCheckDeadlineSec = 10;
 
@@ -205,17 +206,20 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
                            const compactionservice::CSAStatus* request,
                            google::protobuf::Empty* response) override {
     // [procp-offline-fix 2026-10-14] the CSA maps are inserted/erased only under BOTH latches, taken in the
-    // order ConsumeTask uses (scheduler -> monitor). A stub, once created, is never destroyed or replaced:
-    // DistributeCompactionJob calls it through a raw pointer outside the latches (gRPC channels reconnect).
+    // order ConsumeTask uses (scheduler -> monitor). A stub is never destroyed: DistributeCompactionJob calls it
+    // through a raw pointer outside the latches.
     {
       std::lock_guard<std::mutex> sl(scheduler_latch_);
       std::lock_guard<std::mutex> ml(monitor_latch_);
       csa_status_map_[request->address()] = *request;
-      if (csa_client_map_.find(request->address()) == csa_client_map_.end()) {
-        csa_client_map_[request->address()] =
-            compactionservice::CSAService::NewStub(grpc::CreateChannel(
-                request->address(), grpc::InsecureChannelCredentials()));
-      }
+      // A fresh channel for every registration (an old channel to a restarted CSA sits in reconnect backoff and
+      // failed the first status checks in the 2026-10-14 smoke test); the old stub is retired, not destroyed,
+      // because a dispatch may still be using it through a raw pointer.
+      auto old = csa_client_map_.find(request->address());
+      if (old != csa_client_map_.end() && old->second) retired_csa_stubs_.push_back(std::move(old->second));
+      csa_client_map_[request->address()] =
+          compactionservice::CSAService::NewStub(grpc::CreateChannel(
+              request->address(), grpc::InsecureChannelCredentials()));
       std::vector<uint64_t> temp;
       csa_task_list_[request->address()] = temp;
       csa_check_failures_.erase(request->address());
@@ -467,7 +471,7 @@ grpc::Status DistributeCompactionJob(
 //  (c) csa_status_map_ was iterated without any latch while RegisterCSA inserted into it. Now a snapshot of the
 //      keys is taken under the monitor latch.
 // Also: the status RPC gets a deadline, a CSA is declared offline only after kCsaOfflineAfterFailures consecutive
-// failed checks, and its stub stays alive (see RegisterCSA). Behavior with healthy CSAs is unchanged.
+// failed checks, and stubs are retired instead of destroyed (see RegisterCSA). Healthy-CSA behavior is unchanged.
 void UpdateOneCSAStatus(std::string address) {
   compactionservice::CSAService::Stub* stub = nullptr;
   {
