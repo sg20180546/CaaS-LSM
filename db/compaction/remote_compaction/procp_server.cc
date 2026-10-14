@@ -66,6 +66,11 @@ std::priority_queue<uint64_t, std::vector<uint64_t>, TaskCmp>
     task_priority_queue_;
 std::mutex monitor_latch_;
 std::mutex scheduler_latch_;
+// [procp-offline-fix 2026-10-14] consecutive failed CheckCSAStatus calls per CSA (under monitor_latch_). One failed
+// check used to remove a CSA for good; 2026-10-14 nxi4k34 lost CSA 88 three seconds after it registered.
+std::unordered_map<std::string, int> csa_check_failures_;
+static constexpr int kCsaOfflineAfterFailures = 3;
+static constexpr int kCsaCheckDeadlineSec = 10;
 
 // [relink/Storage-CP] Per-file refcount over shared SSTs on HDFS.
 // path(bare HDFS path, e.g. /kg/s0/000123.sst) -> {count, owning shard ids}.
@@ -199,12 +204,22 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
   grpc::Status RegisterCSA(grpc::ServerContext* context,
                            const compactionservice::CSAStatus* request,
                            google::protobuf::Empty* response) override {
-    csa_status_map_[request->address()] = *request;
-    csa_client_map_[request->address()] =
-        compactionservice::CSAService::NewStub(grpc::CreateChannel(
-            request->address(), grpc::InsecureChannelCredentials()));
-    std::vector<uint64_t> temp;
-    csa_task_list_[request->address()] = temp;
+    // [procp-offline-fix 2026-10-14] the CSA maps are inserted/erased only under BOTH latches, taken in the
+    // order ConsumeTask uses (scheduler -> monitor). A stub, once created, is never destroyed or replaced:
+    // DistributeCompactionJob calls it through a raw pointer outside the latches (gRPC channels reconnect).
+    {
+      std::lock_guard<std::mutex> sl(scheduler_latch_);
+      std::lock_guard<std::mutex> ml(monitor_latch_);
+      csa_status_map_[request->address()] = *request;
+      if (csa_client_map_.find(request->address()) == csa_client_map_.end()) {
+        csa_client_map_[request->address()] =
+            compactionservice::CSAService::NewStub(grpc::CreateChannel(
+                request->address(), grpc::InsecureChannelCredentials()));
+      }
+      std::vector<uint64_t> temp;
+      csa_task_list_[request->address()] = temp;
+      csa_check_failures_.erase(request->address());
+    }
     std::cout << GetTime() << "Register CSA (" << request->address() << ")"
               << std::endl;
     return grpc::Status::OK;
@@ -424,45 +439,91 @@ class StorageImpl final : public compactionservice::StorageService::Service {
 grpc::Status DistributeCompactionJob(
     const compactionservice::CompactionTaskArgs& compact_task_args,
     const std::string& csa_address) {
+  // [procp-offline-fix 2026-10-14] operator[] on a CSA that went offline inserted a NULL stub and dereferenced it.
+  compactionservice::CSAService::Stub* stub = nullptr;
+  {
+    std::lock_guard<std::mutex> ml(monitor_latch_);
+    auto it = csa_client_map_.find(csa_address);
+    if (it != csa_client_map_.end()) stub = it->second.get();
+  }
+  if (stub == nullptr) {
+    return grpc::Status(grpc::StatusCode::UNAVAILABLE, "no stub for CSA " + csa_address);
+  }
   grpc::ClientContext context;
   google::protobuf::Empty response;
-  grpc::Status status = csa_client_map_[csa_address]->ExecuteCompactionTask(
+  grpc::Status status = stub->ExecuteCompactionTask(
       &context, compact_task_args, &response);
   return status;
 }
 
-void UpdateOneCSAStatus(const std::string& address) {
-  auto& stub = csa_client_map_[address];
+// [procp-offline-fix 2026-10-14] Three defects made one transient CSA hiccup kill or wedge the control plane
+// (nxi4k34 2026-10-14: "CSA (...88...) Offline" 3 s after registration, then procp never logged again and every
+// compaction of that run fell back to the CN):
+//  (a) use-after-free: the caller passed iter++->first, a REFERENCE to the key inside csa_status_map_; erasing that
+//      entry freed the string and the code kept hashing it (glibc 2.35 overwrites a freed chunk's first words with
+//      a random tcache key -> the string's data pointer becomes garbage -> SIGSEGV). Now the address is a copy.
+//  (b) lock order: this path took monitor -> scheduler while ConsumeTask holds scheduler -> monitor (ScheduleCSA):
+//      ABBA deadlock whenever a CSA goes offline during scheduling. Now scheduler -> monitor here too.
+//  (c) csa_status_map_ was iterated without any latch while RegisterCSA inserted into it. Now a snapshot of the
+//      keys is taken under the monitor latch.
+// Also: the status RPC gets a deadline, a CSA is declared offline only after kCsaOfflineAfterFailures consecutive
+// failed checks, and its stub stays alive (see RegisterCSA). Behavior with healthy CSAs is unchanged.
+void UpdateOneCSAStatus(std::string address) {
+  compactionservice::CSAService::Stub* stub = nullptr;
+  {
+    std::lock_guard<std::mutex> ml(monitor_latch_);
+    auto it = csa_client_map_.find(address);
+    if (it != csa_client_map_.end()) stub = it->second.get();
+  }
+  if (stub == nullptr) return;
   grpc::ClientContext context;
+  context.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(kCsaCheckDeadlineSec));
   google::protobuf::Empty request;
   compactionservice::CSAStatus csa_status;
   grpc::Status status = stub->CheckCSAStatus(&context, request, &csa_status);
-  monitor_latch_.lock();
   if (status.ok()) {
-    csa_status_map_[address] = csa_status;
-  } else {
-    std::cout << GetTime() << "CSA (" << address << ") Offline" << std::endl;
-    scheduler_latch_.lock();
-    csa_status_map_.erase(address);
-    csa_client_map_.erase(address);
-    auto task_list = csa_task_list_[address];
-    for (uint64_t i : task_list) {
+    std::lock_guard<std::mutex> ml(monitor_latch_);
+    auto it = csa_status_map_.find(address);
+    if (it != csa_status_map_.end()) it->second = csa_status;
+    csa_check_failures_.erase(address);
+    return;
+  }
+  int failures = 0;
+  {
+    std::lock_guard<std::mutex> ml(monitor_latch_);
+    failures = ++csa_check_failures_[address];
+  }
+  if (failures < kCsaOfflineAfterFailures) {
+    std::cout << GetTime() << "CSA (" << address << ") status check failed (" << failures << "/"
+              << kCsaOfflineAfterFailures << "): " << status.error_message() << std::endl;
+    return;
+  }
+  std::cout << GetTime() << "CSA (" << address << ") Offline after " << failures
+            << " failed status checks: " << status.error_message() << std::endl;
+  std::lock_guard<std::mutex> sl(scheduler_latch_);
+  std::lock_guard<std::mutex> ml(monitor_latch_);
+  csa_status_map_.erase(address);
+  csa_check_failures_.erase(address);
+  auto tl = csa_task_list_.find(address);
+  if (tl != csa_task_list_.end()) {
+    for (uint64_t i : tl->second) {
       if (task_args_map_.count(i) > 0) {
         task_priority_queue_.push(i);
       }
     }
-    csa_task_list_.erase(address);
-    scheduler_latch_.unlock();
+    csa_task_list_.erase(tl);
   }
-  monitor_latch_.unlock();
 }
 
 [[noreturn]] void UpdateCSAStatus() {
   while (true) {
     sleep(5);
-    for (auto iter = csa_status_map_.begin(); iter != csa_status_map_.end();) {
-      UpdateOneCSAStatus(iter++->first);
+    std::vector<std::string> addresses;
+    {
+      std::lock_guard<std::mutex> ml(monitor_latch_);
+      for (const auto& kv : csa_status_map_) addresses.push_back(kv.first);
     }
+    for (const auto& a : addresses) UpdateOneCSAStatus(a);
   }
 }
 
@@ -549,10 +610,14 @@ std::string ScheduleCSA(
     last_heartbeat_[task_id] = std::chrono::steady_clock::now();  // [heartbeat] grace until 1st CSA ping
     scheduler_latch_.unlock();
     monitor_latch_.lock();
-    std::cout << GetTime() << "Memory usage is "
-              << csa_status_map_[worker_address].memory_usage() << std::endl;
-    csa_status_map_[worker_address].set_local_task_nums(
-        csa_status_map_[worker_address].local_task_nums() + 1);
+    {
+      // [procp-offline-fix 2026-10-14] find(), not operator[]: the CSA may have gone offline since ScheduleCSA
+      auto it = csa_status_map_.find(worker_address);
+      if (it != csa_status_map_.end()) {
+        std::cout << GetTime() << "Memory usage is " << it->second.memory_usage() << std::endl;
+        it->second.set_local_task_nums(it->second.local_task_nums() + 1);
+      }
+    }
     monitor_latch_.unlock();
     compactionservice::CompactionTaskArgs compaction_task_args;
     compaction_task_args.set_task_id(task_id);
