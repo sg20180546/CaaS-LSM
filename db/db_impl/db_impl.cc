@@ -6955,31 +6955,42 @@ Status DBImpl::UnregisterFilesInPlace(
   // being_compacted check + the DeleteFile edit are built under mutex_ here so classify+drop is atomic
   // (closes the GetColumnFamilyMetaData snapshot TOCTOU in ExportRelink). RELINK-ONLY: the sole caller
   // is serverclient ExportRelink, so baselines never reach this path.
+  // [relink Fix B, 2026-10-16] ...and the files this edit drops are RESERVED (being_compacted=true) until
+  // LogAndApply has installed it, as upstream DeleteFilesInRanges does. LogAndApply releases mutex_ while
+  // it writes the MANIFEST (~60 ms on HDFS); without the reservation the compaction picker could select a
+  // file that is about to vanish from the current version, and that compaction's install then fails with
+  // "Corruption: VersionBuilder: Cannot delete table file #N ... not in the LSM tree" -> background error
+  // -> the source DB stops taking writes (migration_mechanism_1016_nxeb4k65_1: JOB 4048 picked L1 #7443
+  // 35 ms into the src drop). input_version is Ref'd so the reserved FileMetaData outlive the swap.
   InstrumentedMutexLock l(&mutex_);
-  auto* vstorage = cfd->current()->storage_info();
+  Version* input_version = cfd->current();
+  auto* vstorage = input_version->storage_info();
   VersionEdit edit;
   edit.SetColumnFamily(cfd->GetID());
   int dropped = 0, skipped_busy = 0, skipped_gone = 0;
+  std::vector<FileMetaData*> reserved;
+  reserved.reserve(level_and_file.size());
   for (const auto& lf : level_and_file) {
     const int level = lf.first;
     const uint64_t fnum = lf.second;
-    bool found = false, busy = false;
+    FileMetaData* hit = nullptr;
     for (FileMetaData* f : vstorage->LevelFiles(level)) {
       if (f->fd.GetNumber() == fnum) {
-        found = true;
-        busy = f->being_compacted;
+        hit = f;
         break;
       }
     }
-    if (!found) {  // already gone (compacted away since the export snapshot) -> nothing to drop
+    if (hit == nullptr) {  // already gone (compacted away since the export snapshot) -> nothing to drop
       skipped_gone++;
       continue;
     }
-    if (busy) {  // leave it; its in-flight compaction removes it on install
+    if (hit->being_compacted) {  // leave it; its in-flight compaction removes it on install
       skipped_busy++;
       continue;
     }
     edit.DeleteFile(level, fnum);
+    hit->being_compacted = true;  // [Fix B] reserved until the edit is installed
+    reserved.push_back(hit);
     dropped++;
   }
   if (skipped_busy || skipped_gone) {
@@ -6994,6 +7005,10 @@ Status DBImpl::UnregisterFilesInPlace(
     out->skipped_gone = static_cast<uint64_t>(skipped_gone);
   }
   if (dropped == 0) return Status::OK();
+  // [Fix B] the picker's scores of the still-current version must not count the reserved files
+  vstorage->ComputeCompactionScore(*cfd->ioptions(),
+                                   *cfd->GetLatestMutableCFOptions());
+  input_version->Ref();
   Status s = versions_->LogAndApply(cfd, *cfd->GetLatestMutableCFOptions(), &edit,
                                     &mutex_, directories_.GetDbDir());
   if (s.ok()) {
@@ -7002,6 +7017,10 @@ Status DBImpl::UnregisterFilesInPlace(
                                        *cfd->GetLatestMutableCFOptions());
     sv_ctx.Clean();
   }
+  for (FileMetaData* f : reserved) {  // [Fix B] on failure the files stay live and pickable again
+    f->being_compacted = false;
+  }
+  input_version->Unref();
   return s;
 }
 
