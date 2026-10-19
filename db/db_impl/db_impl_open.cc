@@ -1782,9 +1782,20 @@ Status DBImpl::Open(const DBOptions& db_options, const std::string& dbname,
   auto& remote_listeners =
       const_cast<std::vector<std::shared_ptr<EventListener>>&>(
           db_options.listeners);
-  tmp_options.compaction_service = std::make_shared<MyTestCompactionService>(
-      dbname, compaction_options, compaction_stats, remote_listeners,
-      remote_table_properties_collector_factories);
+  // [compaction-service switch 2026-10-18] CAAS_COMPACTION_SERVICE=off: install no
+  // compaction service at all, so every compaction runs in-process without first
+  // dialing the ProCP (MyRocks hosts without a CP/CSA). Unset or any other value:
+  // unchanged -- every job is offered to the ProCP and falls back to local only
+  // when that call fails (kUseLocal). Read once per process.
+  static const bool kCompactionServiceOff = [] {
+    const char* e = getenv("CAAS_COMPACTION_SERVICE");
+    return e && std::string(e) == "off";
+  }();
+  if (!kCompactionServiceOff) {
+    tmp_options.compaction_service = std::make_shared<MyTestCompactionService>(
+        dbname, compaction_options, compaction_stats, remote_listeners,
+        remote_table_properties_collector_factories);
+  }
 
   Status s = ValidateOptionsByTable(db_options, column_families);
   if (!s.ok()) {
