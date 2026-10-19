@@ -320,6 +320,13 @@ class HdfsWritableFile : public FSWritableFile {
     return IOStatus::OK();
   }
 
+  // [myrocks-hdfs 2026-10-18] DBImpl::SyncWAL() (any write with WriteOptions.sync,
+  // e.g. MyRocks' data-dictionary commits) refuses a WAL file whose writer is not
+  // sync-thread-safe: "NotSupported: SyncWAL() is not supported for this
+  // implementation of WAL file". hdfsFlush/hdfsHSync go to a Java DFSOutputStream
+  // whose methods are synchronized, so Sync() may run concurrently with Append().
+  bool IsSyncThreadSafe() const override { return true; }
+
   IOStatus Close(const IOOptions& /*options*/,
                  IODebugContext* /*dbg*/) override {
     ROCKS_LOG_DEBUG(mylog, "[hdfs] HdfsWritableFile closing %s\n",
