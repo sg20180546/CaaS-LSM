@@ -120,6 +120,30 @@ class HdfsFileSystem : public FileSystemWrapper {
                        const IOOptions& /*options*/, bool* /*is_dir*/,
                        IODebugContext* /*dbg*/) override;
 
+  // [myrocks-hdfs 2026-10-18] FileSystemWrapper forwards every method that is
+  // not overridden to the POSIX target, i.e. to a LOCAL path that does not
+  // exist. The first victim was IngestExternalFile(move_files=true) (MyRocks
+  // bulk load): POSIX link() on the HDFS path failed with ENOENT, and RocksDB
+  // falls back to copying only when LinkFile says NotSupported. HDFS has no
+  // hard links, so these report NotSupported; the last two answer from HDFS.
+  IOStatus LinkFile(const std::string& /*src*/, const std::string& /*target*/,
+                    const IOOptions& /*options*/,
+                    IODebugContext* /*dbg*/) override;
+  IOStatus NumFileLinks(const std::string& /*fname*/,
+                        const IOOptions& /*options*/, uint64_t* /*count*/,
+                        IODebugContext* /*dbg*/) override;
+  IOStatus AreFilesSame(const std::string& /*first*/,
+                        const std::string& /*second*/,
+                        const IOOptions& /*options*/, bool* /*res*/,
+                        IODebugContext* /*dbg*/) override;
+  IOStatus GetFreeSpace(const std::string& /*path*/,
+                        const IOOptions& /*options*/, uint64_t* /*diskfree*/,
+                        IODebugContext* /*dbg*/) override;
+  IOStatus GetChildrenFileAttributes(const std::string& /*dir*/,
+                                     const IOOptions& /*options*/,
+                                     std::vector<FileAttributes>* /*result*/,
+                                     IODebugContext* /*dbg*/) override;
+
  private:
   std::string fsname_;  // string of the form "hdfs://hostname:port/dira"
   hdfsFS fileSys_;      // a single hdfsFS object for all files

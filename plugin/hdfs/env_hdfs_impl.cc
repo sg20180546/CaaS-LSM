@@ -963,6 +963,66 @@ IOStatus HdfsFileSystem::IsDirectory(const std::string& path,
   return IOError(path, errno);
 }
 
+// [myrocks-hdfs 2026-10-18] See the declaration: without these, the wrapper
+// forwarded to the POSIX target with HDFS paths.
+IOStatus HdfsFileSystem::LinkFile(const std::string& src,
+                                  const std::string& /*target*/,
+                                  const IOOptions& /*options*/,
+                                  IODebugContext* /*dbg*/) {
+  return IOStatus::NotSupported("HDFS has no hard links: " + src);
+}
+
+IOStatus HdfsFileSystem::NumFileLinks(const std::string& fname,
+                                      const IOOptions& /*options*/,
+                                      uint64_t* /*count*/,
+                                      IODebugContext* /*dbg*/) {
+  return IOStatus::NotSupported("HDFS has no hard links: " + fname);
+}
+
+IOStatus HdfsFileSystem::AreFilesSame(const std::string& first,
+                                      const std::string& second,
+                                      const IOOptions& /*options*/, bool* res,
+                                      IODebugContext* /*dbg*/) {
+  if (res != nullptr) {
+    *res = (first == second);
+  }
+  return IOStatus::OK();
+}
+
+IOStatus HdfsFileSystem::GetFreeSpace(const std::string& path,
+                                      const IOOptions& /*options*/,
+                                      uint64_t* diskfree,
+                                      IODebugContext* /*dbg*/) {
+  tOffset capacity = hdfsGetCapacity(fileSys_);
+  tOffset used = hdfsGetUsed(fileSys_);
+  if (capacity < 0 || used < 0) {
+    return IOError(path, errno);
+  }
+  *diskfree = static_cast<uint64_t>(capacity > used ? capacity - used : 0);
+  return IOStatus::OK();
+}
+
+IOStatus HdfsFileSystem::GetChildrenFileAttributes(
+    const std::string& dir, const IOOptions& options,
+    std::vector<FileAttributes>* result, IODebugContext* dbg) {
+  std::vector<std::string> names;
+  IOStatus s = GetChildren(dir, options, &names, dbg);
+  if (!s.ok()) {
+    return s;
+  }
+  result->clear();
+  for (const auto& name : names) {
+    FileAttributes attr;
+    attr.name = name;
+    s = GetFileSize(dir + "/" + name, options, &attr.size_bytes, dbg);
+    if (!s.ok()) {
+      return s;
+    }
+    result->push_back(std::move(attr));
+  }
+  return IOStatus::OK();
+}
+
 Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base,
                               const std::string& uri,
                               std::unique_ptr<FileSystem>* result) {
