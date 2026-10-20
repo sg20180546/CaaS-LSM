@@ -15,6 +15,7 @@
 #include "db/db_test_util.h"
 #include "db/read_callback.h"
 #include "options/options_helper.h"
+#include "rocksdb/utilities/transaction_db.h"  // [migagent 2026-10-20] RelinkApisThroughTransactionDB
 #include "port/port.h"
 #include "port/stack_trace.h"
 #include "rocksdb/experimental.h"
@@ -8282,6 +8283,115 @@ TEST_F(DBTest2, GetLatestSeqAndTsForKey) {
   ASSERT_EQ(0, options.statistics->getTickerCount(GET_HIT_L0));
 }
 #endif  // ROCKSDB_LITE
+
+
+// [migagent 2026-10-20] The in-process migration agent (MyRocks) is handed a
+// TransactionDB -- a StackableDB -- over {default, __system__}. The relink APIs
+// it calls must reach DBImpl through the wrapper: before the StackableDB
+// forwards, EnableFileDeletionsNoFullScan fell back to the FULL-scan
+// EnableFileDeletions (which deletes an untracked .sst in the DB dir -- the
+// shape of a relink-unregistered-but-still-shared file: the 0825
+// double-RequestDelete bug), GetSnapshotNoBottommostTrigger to a plain
+// GetSnapshot, and six others answered NotSupported.
+TEST_F(DBTest2, RelinkApisThroughTransactionDB) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.max_open_files = 100;  // the register path refuses -1 (agent shape)
+  CreateAndReopenWithCF({"__system__"}, options);
+  ASSERT_OK(Put(0, "k1", "v1"));
+  ASSERT_OK(Put(1, "s1", "x"));
+  ASSERT_OK(Flush(0));
+  Close();
+
+  TransactionDBOptions txn_opts;
+  std::vector<ColumnFamilyDescriptor> cfds = {
+      {kDefaultColumnFamilyName, options}, {"__system__", options}};
+  std::vector<ColumnFamilyHandle*> handles;
+  TransactionDB* tdb = nullptr;
+  ASSERT_OK(
+      TransactionDB::Open(options, txn_opts, dbname_, cfds, &handles, &tdb));
+  ASSERT_EQ(handles.size(), 2u);
+  DB* db = tdb;  // the agent sees a rocksdb::DB*
+  ColumnFamilyHandle* data_cf = handles[0];
+  ASSERT_EQ(data_cf->GetName(), kDefaultColumnFamilyName);
+
+  // (B.7) EnableFileDeletionsNoFullScan through the wrapper: a stray, untracked
+  // table file in the DB directory survives it...
+  ASSERT_OK(db->DisableFileDeletions());
+  const std::string stray = dbname_ + "/000001.sst";
+  ASSERT_OK(WriteStringToFile(env_, "stray", stray, true));
+  ASSERT_OK(db->EnableFileDeletionsNoFullScan(false));
+  ASSERT_OK(env_->FileExists(stray));
+  // ...whereas the full-scan EnableFileDeletions (what the StackableDB default
+  // used to call) collects it.
+  ASSERT_OK(db->DisableFileDeletions());
+  ASSERT_OK(db->EnableFileDeletions(false));
+  ASSERT_TRUE(env_->FileExists(stray).IsNotFound());
+
+  // (B.7) GetSnapshotNoBottommostTrigger returns a snapshot.
+  const Snapshot* snap = db->GetSnapshotNoBottommostTrigger();
+  ASSERT_NE(snap, nullptr);
+  ASSERT_GE(snap->GetSequenceNumber(), 2u);
+  db->ReleaseSnapshot(snap);
+
+  // (B.8) none of the six answers the StackableDB/DB default "not supported in
+  // this DB implementation" any more: each call reaches DBImpl (whose own
+  // status for these trivial inputs is OK, or -- SetBucketBoundaries on a
+  // non-bucketed CF -- a NotSupported that names l0_bucket_count).
+  const std::string kDefaultText = "not supported in this DB implementation";
+  {
+    std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>> props;
+    Status s = db->GetPropertiesOfResidentTables(data_cf, &props);
+    ASSERT_OK(s);
+  }
+  {
+    std::unordered_map<uint64_t, std::string> prefixes;
+    ASSERT_OK(db->GetBlockCacheKeyPrefixes(data_cf, {}, &prefixes));
+  }
+  {
+    std::vector<TableCacheWarmupSnapshotEntry> entries;
+    TableCacheWarmupTransferStats st;
+    Status s = db->SnapshotTableCacheWarmupEntries(data_cf, {}, 1u << 20,
+                                                   &entries, &st);
+    ASSERT_EQ(s.ToString().find(kDefaultText), std::string::npos)
+        << s.ToString();
+  }
+  {
+    TableCacheWarmupTransferStats st;
+    TableCacheWarmupEntryCallback cb = [](ExternalTableCacheEntry&&) {
+      return Status::OK();
+    };
+    Status s =
+        db->StreamTableCacheWarmupEntries(data_cf, {}, 1u << 20, cb, &st);
+    ASSERT_EQ(s.ToString().find(kDefaultText), std::string::npos)
+        << s.ToString();
+  }
+  {
+    TableCacheWarmupTransferStats st;
+    Status s = db->InstallExternalTableCacheEntries(
+        data_cf, std::vector<ExternalTableCacheEntry>(), 1u << 20, &st);
+    ASSERT_EQ(s.ToString().find(kDefaultText), std::string::npos)
+        << s.ToString();
+  }
+  {
+    Status s = db->SetBucketBoundaries(data_cf, {});
+    ASSERT_TRUE(s.IsNotSupported()) << s.ToString();  // non-bucketed CF
+    ASSERT_NE(s.ToString().find("l0_bucket_count"), std::string::npos)
+        << s.ToString();  // ...from DBImpl, not the wrapper's default
+    ASSERT_EQ(s.ToString().find(kDefaultText), std::string::npos);
+  }
+  // The data written before the reopen is still there through the wrapper.
+  std::string v;
+  ASSERT_OK(db->Get(ReadOptions(), data_cf, "k1", &v));
+  ASSERT_EQ(v, "v1");
+  ASSERT_OK(db->Get(ReadOptions(), handles[1], "s1", &v));
+  ASSERT_EQ(v, "x");
+
+  for (auto* h : handles) {
+    delete h;
+  }
+  delete tdb;
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 
