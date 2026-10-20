@@ -1315,7 +1315,7 @@ TEST_F(ExternalMemTableTest, BlockOnlyFlushAfterOlderImmCommitWithWal) {
   ASSERT_EQ(Get("b"), "2");
   ASSERT_EQ(Get(Key(5)), Val(5));
 
-  Reopen(options);
+  ReopenWithColumnFamilies({"default", "__system__"}, options);  // 2-CF DB
   ASSERT_EQ(Get("a"), "1");
   ASSERT_EQ(Get("b"), "2");
   ASSERT_EQ(Get(Key(0)), Val(0));
@@ -1422,7 +1422,7 @@ TEST_F(ExternalMemTableTest, BlockOnlyFlushConcurrentWithOlderImmCommitWithWal) 
   ASSERT_EQ(Get("b"), "2");
   ASSERT_EQ(Get(Key(5)), Val(5));
 
-  Reopen(options);
+  ReopenWithColumnFamilies({"default", "__system__"}, options);  // 2-CF DB
   ASSERT_EQ(Get("a"), "1");
   ASSERT_EQ(Get("b"), "2");
   ASSERT_EQ(Get(Key(0)), Val(0));
