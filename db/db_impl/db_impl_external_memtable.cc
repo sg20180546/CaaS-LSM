@@ -66,7 +66,17 @@ bool ParseMemTableEntry(const char* p, const char* limit, Slice* internal_key,
 
 // O(count) over 4-byte offsets plus two entry parses: cheap enough for the
 // install window (~0.3 ms for 700k entries).
-Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
+// [migagent 2026-10-20] ...plus one header parse per entry (varint32 key
+// length, 8-byte tag, varint32 value length; the key and value bytes are not
+// read), still O(count), for the release-mode type check and the tombstone
+// count the memtable's num_deletes_ reports. Before this, a release build
+// trusted the builder and only the debug-only ValidateBlockFull rejected a
+// Merge / blob / wide-column type; a hand-encoded or foreign block could put
+// an entry into the memtable that the read paths cannot interpret.
+Status ValidateBlockCheap(const ExternalMemTableBlock& b,
+                          uint64_t* num_deletes) {
+  assert(num_deletes != nullptr);
+  *num_deletes = 0;
   if (b.data == nullptr || b.offsets == nullptr) {
     return Status::InvalidArgument(
         "InstallExternalMemTable: block data/offsets must not be null");
@@ -120,6 +130,31 @@ Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
         "InstallExternalMemTable: last entry is malformed or exceeds "
         "data_size");
   }
+  // [migagent 2026-10-20] Every entry: header fits its offset slot, type is
+  // one of the three a block may carry, tombstones counted.
+  uint64_t deletes = 0;
+  for (uint64_t i = 0; i < b.count; ++i) {
+    const char* slot_end =
+        (i + 1 < b.count) ? b.data + b.offsets[i + 1] : limit;
+    if (!ParseMemTableEntry(b.data + b.offsets[i], slot_end, &ik, &v, &end) ||
+        end > slot_end) {
+      return Status::InvalidArgument(
+          "InstallExternalMemTable: entry " + std::to_string(i) +
+          " does not fit its offset slot");
+    }
+    const unsigned char type = static_cast<unsigned char>(
+        DecodeFixed64(ik.data() + ik.size() - kNumInternalBytes) & 0xff);
+    if (type == kTypeDeletion || type == kTypeSingleDeletion) {
+      ++deletes;
+    } else if (type != kTypeValue) {
+      return Status::Corruption(
+          "InstallExternalMemTable: entry " + std::to_string(i) +
+          " has value type " + std::to_string(static_cast<unsigned>(type)) +
+          "; only Value (0x1), Deletion (0x0) and SingleDeletion (0x7) are "
+          "allowed in a block");
+    }
+  }
+  *num_deletes = deletes;
   return Status::OK();
 }
 
@@ -127,7 +162,9 @@ Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
 // Full entry walk (debug builds only: O(bytes), ~0.1 s for 780 MB): every
 // entry parses inside its slot, carries an allowed type and a seqno inside
 // the window, and the sequence is strictly increasing in
-// InternalKeyComparator order.
+// InternalKeyComparator order. (Slot fit and type are also checked by
+// ValidateBlockCheap since 2026-10-20; the seqno window and the ordering
+// remain debug-only.)
 Status ValidateBlockFull(const ExternalMemTableBlock& b,
                          const InternalKeyComparator& icmp) {
   const char* limit = b.data + b.data_size;
@@ -182,7 +219,8 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
         "InstallExternalMemTable: column_family must not be null");
   }
   // ---- 1. Validate WITHOUT consuming the block (no release() on failure).
-  Status s = ValidateBlockCheap(block);
+  uint64_t num_deletes = 0;
+  Status s = ValidateBlockCheap(block, &num_deletes);
   if (!s.ok()) {
     return s;
   }
@@ -309,7 +347,8 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       // not charged to the write buffer manager).
       mem = MemTable::NewFromExternalSortedBlock(
           cfd->internal_comparator(), *cfd->ioptions(), *mopts,
-          nullptr /* write_buffer_manager */, cfd->GetID(), std::move(block));
+          nullptr /* write_buffer_manager */, cfd->GetID(), std::move(block),
+          num_deletes);
       // No range tombstones => no-op, but keeps the immutable-list invariant
       // (IsFragmentedRangeTombstonesConstructed) explicit like SwitchMemtable.
       mem->ConstructFragmentedRangeTombstones();

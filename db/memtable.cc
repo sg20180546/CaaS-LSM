@@ -164,7 +164,7 @@ MemTable::MemTable(ExternalSortedBlockTag, const InternalKeyComparator& cmp,
                    WriteBufferManager* write_buffer_manager,
                    uint32_t column_family_id,
                    SequenceNumber block_smallest_seqno,
-                   ExternalMemTableBlock&& block)
+                   ExternalMemTableBlock&& block, uint64_t num_deletes)
     : comparator_(cmp),
       moptions_(ioptions, mutable_cf_options),
       refs_(0),
@@ -216,9 +216,12 @@ MemTable::MemTable(ExternalSortedBlockTag, const InternalKeyComparator& cmp,
   // flush_verify_memtable_count check) and the stats read.
   data_size_.store(b.data_size, std::memory_order_relaxed);
   num_entries_.store(b.count, std::memory_order_relaxed);
-  // The block does not carry a delete count (stats-only field); the relink
-  // driver ships no deletions (DBIter walk, tombstones hidden).
-  num_deletes_.store(0, std::memory_order_relaxed);
+  // The block does not carry a delete count (stats-only field).
+  // [migagent 2026-10-20] The installer's validation scan counts the
+  // Deletion / SingleDeletion entries and passes them in (the typed export of
+  // ExportMemTableRange ships tombstones; the relink driver's DBIter walk
+  // shipped none, and still passes 0).
+  num_deletes_.store(num_deletes, std::memory_order_relaxed);
   // first_seqno_ != 0 => !IsEmpty() (MemTable::Get returns early on empty).
   first_seqno_.store(b.smallest_seqno, std::memory_order_relaxed);
   UpdateOldestKeyTime();  // read by FlushJob for oldest_ancester_time
@@ -244,11 +247,12 @@ MemTable* MemTable::NewFromExternalSortedBlock(
     const InternalKeyComparator& comparator, const ImmutableOptions& ioptions,
     const MutableCFOptions& mutable_cf_options,
     WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
-    ExternalMemTableBlock&& block) {
+    ExternalMemTableBlock&& block, uint64_t num_deletes) {
   const SequenceNumber smallest = block.smallest_seqno;
   return new MemTable(ExternalSortedBlockTag(), comparator, ioptions,
                       mutable_cf_options, write_buffer_manager,
-                      column_family_id, smallest, std::move(block));
+                      column_family_id, smallest, std::move(block),
+                      num_deletes);
 }
 
 size_t MemTable::ApproximateMemoryUsage() {

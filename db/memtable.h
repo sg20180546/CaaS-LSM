@@ -126,11 +126,15 @@ class MemTable {
   // could never be populated and would give false negatives) and
   // write_buffer_manager may be nullptr so the block is not charged to the
   // write buffer. Refcount starts at 0 like the stock ctor.
+  // [migagent 2026-10-20] num_deletes = number of Deletion / SingleDeletion
+  // entries in the block (the block carries no such count; the installer
+  // counts them in its validation scan), stored in num_deletes_ for the
+  // rocksdb.num-deletes-imm-mem-tables property and the flush event log.
   static MemTable* NewFromExternalSortedBlock(
       const InternalKeyComparator& comparator, const ImmutableOptions& ioptions,
       const MutableCFOptions& mutable_cf_options,
       WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
-      ExternalMemTableBlock&& block);
+      ExternalMemTableBlock&& block, uint64_t num_deletes = 0);
 
   // Increase reference count.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -571,7 +575,8 @@ class MemTable {
            const ImmutableOptions& ioptions,
            const MutableCFOptions& mutable_cf_options,
            WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
-           SequenceNumber block_smallest_seqno, ExternalMemTableBlock&& block);
+           SequenceNumber block_smallest_seqno, ExternalMemTableBlock&& block,
+           uint64_t num_deletes);
 
   KeyComparator comparator_;
   const ImmutableMemTableOptions moptions_;

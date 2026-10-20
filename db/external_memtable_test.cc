@@ -18,6 +18,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/external_memtable.h"
 #include "rocksdb/utilities/stackable_db.h"
+#include "util/coding.h"
 
 #ifndef NDEBUG  // TEST_* wait hooks exist in debug builds only (RocksDB test convention)
 namespace ROCKSDB_NAMESPACE {
@@ -595,6 +596,49 @@ TEST_F(ExternalMemTableTest, ValidationFailuresDoNotConsumeBlock) {
   ASSERT_EQ(released.load(), 0);
   ASSERT_EQ(Get(Key(0)), "NOT_FOUND");
 
+  // [migagent 2026-10-20] Hand-encoded entry with type kTypeMerge (0x2): the
+  // builder refuses it, and the installer's release-mode scan must too
+  // (Corruption), without consuming the block.
+  {
+    std::string data;
+    PutVarint32(&data, 1 + 8);  // |"m"| + 8
+    data.append("m", 1);
+    PutFixed64(&data, (static_cast<uint64_t>(s0 + 1) << 8) | 0x2);
+    PutVarint32(&data, 1);
+    data.append("v", 1);
+    std::vector<uint32_t> offsets{0};
+    std::atomic<int> merge_released{0};
+    ExternalMemTableBlock b;
+    b.data = data.data();
+    b.data_size = data.size();
+    b.offsets = offsets.data();
+    b.count = 1;
+    b.smallest_seqno = b.largest_seqno = s0 + 1;
+    b.release = [&merge_released]() { merge_released.fetch_add(1); };
+    Status st = db_->InstallExternalMemTable(cf, std::move(b));
+    ASSERT_TRUE(st.IsCorruption()) << st.ToString();
+    ASSERT_EQ(merge_released.load(), 0);
+    ASSERT_EQ(Get("m"), "NOT_FOUND");
+    // A second entry whose header runs past its offset slot (the first
+    // entry's slot ends where the second begins) -> InvalidArgument.
+    std::string two = data;
+    PutVarint32(&two, 1 + 8);
+    two.append("n", 1);
+    PutFixed64(&two, (static_cast<uint64_t>(s0 + 1) << 8) | 0x1);
+    PutVarint32(&two, 200);  // claims 200 value bytes, none follow
+    std::vector<uint32_t> offsets2{0, static_cast<uint32_t>(data.size())};
+    ExternalMemTableBlock b2;
+    b2.data = two.data();
+    b2.data_size = two.size();
+    b2.offsets = offsets2.data();
+    b2.count = 2;
+    b2.smallest_seqno = b2.largest_seqno = s0 + 1;
+    b2.release = [&merge_released]() { merge_released.fetch_add(1); };
+    st = db_->InstallExternalMemTable(cf, std::move(b2));
+    ASSERT_TRUE(st.IsInvalidArgument() || st.IsCorruption()) << st.ToString();
+    ASSERT_EQ(merge_released.load(), 0);
+  }
+
   // Per-entry memtable checksums are not carried by a block -> NotSupported.
   options.memtable_protection_bytes_per_key = 8;
   Reopen(options);
@@ -636,6 +680,65 @@ TEST_F(ExternalMemTableTest, StackableDBPassthrough) {
   WaitForRelease(&released, 1);
   ASSERT_EQ(released.load(), 1);
   ASSERT_EQ(Get(Key(3)), Val(3));
+}
+
+// [migagent 2026-10-20] A block's tombstones are counted at install (the
+// block carries no delete count) and reported like a stock immutable
+// memtable's; after the flush the tombstones apply to the older L0 versions.
+TEST_F(ExternalMemTableTest, TombstoneBlockCountsDeletes) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  DestroyAndReopen(options);
+  ASSERT_OK(Put("d0", "x"));
+  ASSERT_OK(Put("s0", "y"));
+  ASSERT_OK(Flush());  // older versions of two of the deleted keys in L0
+
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::vector<Entry> entries;  // bytewise order: "d*" < "k*" < "s*"
+  for (int i = 0; i < 5; ++i) {
+    entries.push_back(
+        {"d" + std::to_string(i), g, kExternalMemTableTypeDeletion, ""});
+  }
+  for (int i = 0; i < 10; ++i) {
+    entries.push_back({Key(i), g, kExternalMemTableTypeValue, Val(i)});
+  }
+  for (int i = 0; i < 3; ++i) {
+    entries.push_back(
+        {"s" + std::to_string(i), g, kExternalMemTableTypeSingleDeletion, ""});
+  }
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(entries, &released, /*request_flush=*/false);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk)));
+  uint64_t v = 0;
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kNumDeletesImmMemTables, &v));
+  ASSERT_EQ(v, 8u);  // 5 Deletion + 3 SingleDeletion
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kNumEntriesImmMemTables, &v));
+  ASSERT_EQ(v, 18u);
+  ASSERT_EQ(Get("d0"), "NOT_FOUND");
+  ASSERT_EQ(Get("s0"), "NOT_FOUND");
+  ASSERT_EQ(Get(Key(1)), Val(1));
+  {
+    FlushOptions fo;
+    fo.allow_write_stall = true;  // request_flush=false: no queued flush
+    ASSERT_OK(db_->Flush(fo));
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_TRUE(
+      db_->GetIntProperty(DB::Properties::kNumDeletesImmMemTables, &v));
+  ASSERT_EQ(v, 0u);
+  ASSERT_EQ(Get("d0"), "NOT_FOUND");
+  ASSERT_EQ(Get("s0"), "NOT_FOUND");
+  ASSERT_EQ(Get(Key(9)), Val(9));
+  Reopen(options);
+  ASSERT_EQ(Get("d0"), "NOT_FOUND");
+  ASSERT_EQ(Get("s0"), "NOT_FOUND");
+  ASSERT_EQ(Get(Key(0)), Val(0));
 }
 
 // [migagent 2026-10-20] Multi-CF rules: a DB with more than one column family
