@@ -12,7 +12,8 @@
 // Sequence of operations (all under mutex_ + both write queues stopped):
 //   validate -> build MemTable(SortedBlockMemTableRep) -> raise the DB's
 //   last sequence to max(current, block.largest) -> SetNextLogNumber /
-//   SetID (active memtable's id) -> imm()->Add -> new SuperVersion ->
+//   SetID (active memtable's id; active - 1 with >1 CF) -> imm()->Add ->
+//   new SuperVersion ->
 //   (optionally) queue a flush request.
 // On any non-OK return the block is untouched and block.release is NOT
 // called; on success the MemTable owns the block and release() runs exactly
@@ -368,7 +369,19 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       // fresh id larger than the active's would be skipped by
       // PickMemtablesToFlush (breaks on id > request max) and strand the
       // block. Duplicate ids are tolerated by every id comparison.
-      memtable_id = cfd->mem()->GetID();
+      //
+      // [migagent 2026-10-20] With more than one column family and a WAL,
+      // FlushMemTableToOutputFile fences the pick at
+      // imm()->GetLatestMemTableID() (= this block's id, it is the newest
+      // immutable) BEFORE SyncClosedLogs drops the mutex; a memtable switched
+      // during that window keeps the active's id and, if the block carried
+      // the same id, would pass the fence although its WAL is unsynced. The
+      // active's id is >= 1 (ColumnFamilyData::SetMemtable mints from 1), and
+      // every existing immutable has an id <= active - 1, so active - 1 is
+      // the block's own position in the list. Single-CF DBs never fence
+      // (max id = UINT64_MAX) and keep the active's id as before.
+      const uint64_t active_id = cfd->mem()->GetID();
+      memtable_id = (num_cfs > 1) ? active_id - 1 : active_id;
       mem->SetID(memtable_id);
       // The immutable list takes over this reference (MemTableList::Add
       // does not Ref).

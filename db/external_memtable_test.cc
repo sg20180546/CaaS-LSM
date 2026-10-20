@@ -699,6 +699,118 @@ TEST_F(ExternalMemTableTest, MultiCFDefaultOnly) {
   ASSERT_EQ(Get(1, Key(0)), "NOT_FOUND");
 }
 
+// [migagent 2026-10-20] Multi-CF flush id fence. With >1 CF and a WAL,
+// FlushMemTableToOutputFile captures max_memtable_id = the newest immutable's
+// id (the block's) before SyncClosedLogs releases the mutex. A memtable
+// switched in that window keeps the active's id; if the block had been
+// stamped with the active's id too, the switched memtable would pass the
+// fence and be flushed on unsynced WAL data. The block therefore carries
+// active - 1 in multi-CF DBs; the single-CF path (no fence, max id =
+// UINT64_MAX) keeps the active's id and still co-flushes everything.
+TEST_F(ExternalMemTableTest, MultiCFFenceExcludesSwitchedActive) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_write_buffer_number = 4;  // two immutables must not stall
+  CreateAndReopenWithCF({"__system__"}, options);
+  ASSERT_GT(dbfull()->TEST_LogfileNumber(), 0u);  // WAL on
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(handles_[0])->cfd();
+  ASSERT_OK(Put(0, "pre", "p"));  // WAL-backed, stays in the active memtable
+  const uint64_t active_id = cfd->mem()->GetID();
+  ASSERT_GE(active_id, 1u);
+
+  std::atomic<int> switches{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::SyncClosedLogs:Start", [&](void*) {
+        // The flush job has captured max_memtable_id and dropped the mutex.
+        if (switches.fetch_add(1) == 0) {
+          ASSERT_OK(dbfull()->TEST_SwitchMemtable(cfd));
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(SequentialEntries(10, g, /*width_one=*/true), &released);
+  ASSERT_OK(db_->InstallExternalMemTable(handles_[0], std::move(blk)));
+  // The block's own flush commits (release runs); the switched memtable has
+  // no flush scheduled, so it must still be there afterwards.
+  WaitForRelease(&released, 1);
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(switches.load(), 1);
+  ASSERT_EQ(cfd->mem()->GetID(), active_id + 1);  // the switch happened
+  uint64_t num_imm = 0;
+  ASSERT_TRUE(db_->GetIntProperty(
+      handles_[0], DB::Properties::kNumImmutableMemTable, &num_imm));
+  ASSERT_EQ(num_imm, 1u);
+  ASSERT_EQ(NumTableFilesAtLevel(0, 0), 1);
+  {
+    // The L0 file holds the block alone: 10 entries at seq g, not "pre".
+    ColumnFamilyMetaData meta;
+    db_->GetColumnFamilyMetaData(handles_[0], &meta);
+    ASSERT_EQ(meta.levels[0].files.size(), 1u);
+    ASSERT_EQ(meta.levels[0].files[0].num_entries, 10u);
+    ASSERT_EQ(meta.levels[0].files[0].smallest_seqno, g);
+    ASSERT_EQ(meta.levels[0].files[0].largest_seqno, g);
+  }
+  ASSERT_EQ(Get(0, "pre"), "p");
+  ASSERT_EQ(Get(0, Key(3)), Val(3));
+  // Flush the switched memtable; everything survives a reopen.
+  ASSERT_OK(Flush(0));
+  ASSERT_EQ(NumTableFilesAtLevel(0, 0), 2);
+  ReopenWithColumnFamilies({"default", "__system__"}, options);
+  ASSERT_EQ(Get(0, "pre"), "p");
+  ASSERT_EQ(Get(0, Key(0)), Val(0));
+  ASSERT_EQ(Get(0, Key(9)), Val(9));
+
+  // Single-CF equivalent: no fence, so a memtable switched after the flush
+  // request was queued (DBImpl::BGWorkFlush runs before the pick, without
+  // the mutex) is picked together with the block (id = active's id).
+  options.max_write_buffer_number = 2;
+  DestroyAndReopen(options);
+  cfd = static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())
+            ->cfd();
+  ASSERT_OK(Put("pre", "p"));
+  const uint64_t active_id1 = cfd->mem()->GetID();
+  switches.store(0);
+  SyncPoint::GetInstance()->SetCallBack("DBImpl::BGWorkFlush", [&](void*) {
+    if (switches.fetch_add(1) == 0) {
+      ASSERT_OK(dbfull()->TEST_SwitchMemtable(cfd));
+    }
+  });
+  SyncPoint::GetInstance()->EnableProcessing();
+  const SequenceNumber g1 = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released1{0};
+  ExternalMemTableBlock blk1 =
+      MakeBlock(SequentialEntries(10, g1, /*width_one=*/true), &released1);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk1)));
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  WaitForRelease(&released1, 1);
+  ASSERT_EQ(released1.load(), 1);
+  ASSERT_EQ(switches.load(), 1);
+  ASSERT_EQ(cfd->mem()->GetID(), active_id1 + 1);
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumImmutableMemTable,
+                                  &num_imm));
+  ASSERT_EQ(num_imm, 0u);  // block AND the switched memtable were picked
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+  {
+    ColumnFamilyMetaData meta;
+    db_->GetColumnFamilyMetaData(&meta);
+    ASSERT_EQ(meta.levels[0].files.size(), 1u);
+    ASSERT_EQ(meta.levels[0].files[0].num_entries, 11u);  // 10 + "pre"
+  }
+  ASSERT_EQ(Get("pre"), "p");
+  ASSERT_EQ(Get(Key(3)), Val(3));
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
