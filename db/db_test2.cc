@@ -8293,6 +8293,85 @@ TEST_F(DBTest2, GetLatestSeqAndTsForKey) {
 // shape of a relink-unregistered-but-still-shared file: the 0825
 // double-RequestDelete bug), GetSnapshotNoBottommostTrigger to a plain
 // GetSnapshot, and six others answered NotSupported.
+// [relink 2026-10-20] Regression for the lab failure of that day: right after an
+// in-place move MyRocks recomputes index statistics through
+// GetPropertiesOfTablesInRange() before any read has opened the relinked files.
+// On that table-cache miss the properties are read straight from the file, and
+// the name GetPropertiesOfAllTables()/GetPropertiesOfTablesInRange() handed down
+// was derived from the destination's cf_paths + file number, which does not
+// exist for an in-place reference (the file still sits in the source directory)
+// -> "IO error: No such file or directory: /kg/sql54e/000169.sst", 80 failed
+// queries. Registration leaves the table cache cold (nothing pins the reader),
+// so the lookups below must resolve the external path themselves.
+TEST_F(DBTest2, RelinkTablePropertiesResolveExternalPathOnColdTableCache) {
+  Options options = CurrentOptions();
+  options.create_if_missing = true;
+  options.disable_auto_compactions = true;
+  options.max_open_files = 64;  // finite: readers are not pinned
+  DestroyAndReopen(options);
+
+  ASSERT_OK(Put("k1", "v1"));
+  ASSERT_OK(Put("k2", "v2"));
+  ASSERT_OK(Flush());
+
+  ColumnFamilyMetaData source_metadata;
+  db_->GetColumnFamilyMetaData(&source_metadata);
+  ASSERT_EQ(source_metadata.levels[0].files.size(), 1);
+  const SstFileMetaData source_file = source_metadata.levels[0].files[0];
+  const std::string source_path =
+      source_file.directory + "/" + source_file.relative_filename;
+  TablePropertiesCollection source_properties;
+  ASSERT_OK(db_->GetPropertiesOfAllTables(&source_properties));
+  ASSERT_EQ(source_properties.size(), 1);
+  const auto& source_table_properties = *source_properties.begin()->second;
+
+  const std::string dst_name =
+      test::PerThreadDBPath(env_, "relink_props_cold_cache_dst");
+  ASSERT_OK(DestroyDB(dst_name, options));
+  DB* dst_raw = nullptr;
+  ASSERT_OK(DB::Open(options, dst_name, &dst_raw));
+  std::unique_ptr<DB> dst(dst_raw);
+
+  ExternalFileForRegister arg;
+  arg.external_file = source_path;
+  arg.level = 0;
+  arg.global_seqno = source_file.largest_seqno;
+  arg.smallest_user = source_file.smallestkey;
+  arg.largest_user = source_file.largestkey;
+  arg.file_size = source_file.size;
+  arg.unique_id = source_file.unique_id;
+  arg.num_entries = source_file.num_entries;
+  arg.num_deletions = source_file.num_deletions;
+  arg.raw_key_size = source_table_properties.raw_key_size;
+  arg.raw_value_size = source_table_properties.raw_value_size;
+  arg.oldest_ancester_time = source_file.oldest_ancester_time;
+  arg.file_creation_time = source_file.file_creation_time;
+  ASSERT_OK(
+      dst->RegisterExternalFilesInPlace(dst->DefaultColumnFamily(), {arg}));
+
+  // No read has touched the file on the destination yet: both lookups miss the
+  // table cache and must open the file at its external path. Before the fix
+  // they returned PathNotFound for "<dst_name>/<number>.sst".
+  TablePropertiesCollection all_props;
+  ASSERT_OK(dst->GetPropertiesOfAllTables(&all_props));
+  ASSERT_EQ(all_props.size(), 1);
+  ASSERT_EQ(all_props.begin()->first, source_path);
+  ASSERT_EQ(all_props.begin()->second->num_entries, 2u);
+
+  const Range range("k1", "k3");
+  TablePropertiesCollection range_props;
+  ASSERT_OK(dst->GetPropertiesOfTablesInRange(dst->DefaultColumnFamily(),
+                                              &range, 1, &range_props));
+  ASSERT_EQ(range_props.size(), 1);
+  ASSERT_EQ(range_props.begin()->first, source_path);
+  ASSERT_EQ(range_props.begin()->second->num_entries, 2u);
+
+  // The data path resolves the external path already; it must keep working.
+  std::string value;
+  ASSERT_OK(dst->Get(ReadOptions(), "k2", &value));
+  ASSERT_EQ(value, "v2");
+}
+
 TEST_F(DBTest2, RelinkApisThroughTransactionDB) {
   Options options = CurrentOptions();
   options.create_if_missing = true;

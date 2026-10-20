@@ -7268,8 +7268,13 @@ Status DBImpl::VerifyChecksumInternal(const ReadOptions& read_options,
         const auto& fd = fd_with_krange.fd;
         const FileMetaData* fmeta = fd_with_krange.file_metadata;
         assert(fmeta);
-        std::string fname = TableFileName(cfd->ioptions()->cf_paths,
-                                          fd.GetNumber(), fd.GetPathId());
+        // [relink 2026-10-20] an in-place external reference is verified at its
+        // absolute storage path (TableFilePathOnStorage in version_set.cc).
+        std::string fname =
+            fmeta->fd.external_path.empty()
+                ? TableFileName(cfd->ioptions()->cf_paths, fd.GetNumber(),
+                                fd.GetPathId())
+                : fmeta->fd.external_path;
         if (use_file_checksum) {
           s = VerifyFullFileChecksum(fmeta->file_checksum,
                                      fmeta->file_checksum_func_name, fname,
