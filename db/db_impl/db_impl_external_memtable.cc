@@ -244,18 +244,32 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
 
     const MutableCFOptions* mopts = cfd->GetLatestMutableCFOptions();
     seq_before = versions_->LastSequence();
+    const size_t num_cfs =
+        versions_->GetColumnFamilySet()->NumberOfColumnFamilies();
     if (cfd->IsDropped()) {
       s = Status::InvalidArgument(
           "InstallExternalMemTable: column family is dropped");
-    } else if (versions_->GetColumnFamilySet()->NumberOfColumnFamilies() > 1) {
-      // Single-CF only (review 2026-09-24): the block reuses the active
-      // memtable's id and carries no WAL record; with several column
-      // families the flush id fence (needs_to_sync_closed_wals) and the
-      // per-CF WAL floor could both be defeated. The relink driver runs one
-      // column family per shard DB.
+    } else if (cfd != default_cf_handle_->cfd()) {
+      // [migagent 2026-10-20] Default column family only. The single-CF
+      // refusal of review 2026-09-24 (the block reuses a memtable id and
+      // carries no WAL record, so the multi-CF flush id fence and the per-CF
+      // WAL floor needed care) is replaced by the two multi-CF rules below
+      // plus the id fence fix in step 5: MyRocks opens {default, __system__}
+      // and the migration agent installs into default only.
       s = Status::NotSupported(
-          "InstallExternalMemTable: DBs with more than one column family "
-          "are not supported");
+          "InstallExternalMemTable: only the default column family is "
+          "supported");
+    } else if (num_cfs > 1 && !request_flush) {
+      // [migagent 2026-10-20] With several column families the block must be
+      // flushed by its own request. request_flush == false relies on the
+      // next memtable switch to co-flush the block with the active memtable,
+      // but with >1 CF the flush id fence (needs_to_sync_closed_wals, see
+      // FlushMemTableToOutputFile) can pick the block without the switched
+      // memtable, and the block is the only memtable without WAL records, so
+      // its flush must not be left to a WAL-driven schedule.
+      s = Status::InvalidArgument(
+          "InstallExternalMemTable: request_flush must be true when the DB "
+          "has more than one column family");
     } else if (mopts->memtable_protection_bytes_per_key != 0) {
       // MemTableIterator verifies a per-entry checksum the block does not
       // carry (db/memtable.cc VerifyEntryChecksum).

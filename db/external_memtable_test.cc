@@ -638,6 +638,67 @@ TEST_F(ExternalMemTableTest, StackableDBPassthrough) {
   ASSERT_EQ(Get(Key(3)), Val(3));
 }
 
+// [migagent 2026-10-20] Multi-CF rules: a DB with more than one column family
+// (MyRocks: {default, __system__}) accepts a block for the DEFAULT column
+// family only, and only with request_flush = true. Both refusals leave the
+// block unconsumed.
+TEST_F(ExternalMemTableTest, MultiCFDefaultOnly) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  CreateAndReopenWithCF({"__system__"}, options);
+  ASSERT_EQ(handles_.size(), 2u);
+  // handles_[0] is a distinct handle object for the default CF (the check in
+  // the engine compares the ColumnFamilyData, not the handle).
+  ASSERT_EQ(handles_[0]->GetID(), db_->DefaultColumnFamily()->GetID());
+
+  const SequenceNumber s0 = db_->GetLatestSequenceNumber();
+  std::atomic<int> released{0};
+  ExternalMemTableBlock good = MakeBlock(SequentialEntries(10, s0 + 1, true),
+                                         &released);
+  // Non-default column family -> NotSupported, block not consumed.
+  {
+    ExternalMemTableBlock b = good;
+    Status st = db_->InstallExternalMemTable(handles_[1], std::move(b));
+    ASSERT_TRUE(st.IsNotSupported()) << st.ToString();
+    ASSERT_NE(st.ToString().find("only the default column family"),
+              std::string::npos)
+        << st.ToString();
+  }
+  ASSERT_EQ(released.load(), 0);
+  ASSERT_EQ(Get(1, Key(0)), "NOT_FOUND");
+  ASSERT_EQ(Get(0, Key(0)), "NOT_FOUND");
+  // request_flush = false with >1 CF -> InvalidArgument, block not consumed.
+  {
+    ExternalMemTableBlock b = good;
+    b.request_flush = false;
+    Status st = db_->InstallExternalMemTable(handles_[0], std::move(b));
+    ASSERT_TRUE(st.IsInvalidArgument()) << st.ToString();
+  }
+  ASSERT_EQ(released.load(), 0);
+  ASSERT_EQ(Get(0, Key(0)), "NOT_FOUND");
+  ASSERT_EQ(db_->GetLatestSequenceNumber(), s0);
+
+  // Default column family with request_flush = true -> installed, visible,
+  // flushed by its own request, released exactly once.
+  ASSERT_OK(db_->InstallExternalMemTable(handles_[0], std::move(good)));
+  for (int i = 0; i < 10; ++i) {
+    ASSERT_EQ(Get(0, Key(i)), Val(i));
+    ASSERT_EQ(Get(1, Key(i)), "NOT_FOUND");
+  }
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable(handles_[0]));
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0, 0), 1);
+  ASSERT_EQ(NumTableFilesAtLevel(0, 1), 0);
+  ASSERT_OK(Put(1, "sys", "1"));
+  ReopenWithColumnFamilies({"default", "__system__"}, options);
+  ASSERT_EQ(Get(0, Key(0)), Val(0));
+  ASSERT_EQ(Get(0, Key(9)), Val(9));
+  ASSERT_EQ(Get(1, "sys"), "1");
+  ASSERT_EQ(Get(1, Key(0)), "NOT_FOUND");
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
