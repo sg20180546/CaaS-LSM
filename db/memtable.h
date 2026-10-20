@@ -505,6 +505,12 @@ class MemTable {
 
   uint64_t GetID() const { return id_; }
 
+  // [migagent 2026-10-20] True for a memtable built by
+  // NewFromExternalSortedBlock (an installed ExternalMemTableBlock: no WAL
+  // record, log number stamped at install). FlushJob::PickMemTable clamps the
+  // log number of a flush whose every memtable is such a block.
+  bool IsExternalBlock() const { return is_external_block_; }
+
   void SetFlushCompleted(bool completed) { flush_completed_ = completed; }
 
   uint64_t GetFileNumber() const { return file_number_; }
@@ -631,6 +637,9 @@ class MemTable {
 
   // Memtable id to track flush.
   uint64_t id_ = 0;
+
+  // [migagent 2026-10-20] Set by the ExternalSortedBlockTag constructor only.
+  bool is_external_block_ = false;
 
   // Sequence number of the atomic flush that is responsible for this memtable.
   // The sequence number of atomic flush is a seq, such that no writes with

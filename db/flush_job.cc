@@ -179,12 +179,48 @@ void FlushJob::PickMemTable() {
   // becomes necessary because mems_->back()->GetNextLogNumber() is no longer
   // necessarily equal to max_next_log_number.
   uint64_t max_next_log_number = 0;
+  // [migagent 2026-10-20] Largest NextLogNumber of the older memtables whose
+  // flush is already in flight (see MemTableList::PickMemtablesToFlush); only
+  // consulted for a block-only flush below.
+  uint64_t older_in_progress_max_next_log_number = 0;
 
   // Save the contents of the earliest memtable as a new Table
   cfd_->imm()->PickMemtablesToFlush(max_memtable_id_, &mems_,
-                                    &max_next_log_number);
+                                    &max_next_log_number,
+                                    &older_in_progress_max_next_log_number);
   if (mems_.empty()) {
     return;
+  }
+
+  // [migagent 2026-10-20] Block-only flush: an installed
+  // ExternalMemTableBlock (MemTable::IsExternalBlock) has no WAL record and
+  // was stamped at install with the column family's log number OF THAT
+  // MOMENT (DBImpl::InstallExternalMemTable step 5). An older plain immutable
+  // that was still unflushed then carries the WAL opened at its switch, which
+  // is larger; once its flush commits, the CF log number is above the block's
+  // stamp and this job's edit would carry a smaller log number than the CF
+  // already has (assert in VersionSet::LogAndApplyHelper; recovery logs
+  // "MANIFEST corruption detected, but ignored - Log numbers in records NOT
+  // monotonically increasing"). Clamp to the CF log number (that older flush
+  // committed before this pick) and to the NextLogNumber of older memtables
+  // still in flight (their result is installed before ours). Both values
+  // only cover WALs whose data is flushed by then, so no live WAL is
+  // declared obsolete. A flush containing any plain memtable never needs
+  // this: its NextLogNumber is the WAL opened at its switch, which is >= that
+  // of every older memtable, so stock flushes are untouched.
+  {
+    bool all_external_blocks = true;
+    for (MemTable* m : mems_) {
+      if (!m->IsExternalBlock()) {
+        all_external_blocks = false;
+        break;
+      }
+    }
+    if (all_external_blocks) {
+      max_next_log_number =
+          std::max({max_next_log_number, cfd_->GetLogNumber(),
+                    older_in_progress_max_next_log_number});
+    }
   }
 
   ReportFlushInputSize(mems_);

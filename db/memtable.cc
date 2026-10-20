@@ -208,6 +208,7 @@ MemTable::MemTable(ExternalSortedBlockTag, const InternalKeyComparator& cmp,
   // No UpdateFlushState(): flush_state_ is only consulted for the ACTIVE
   // memtable, and ShouldFlushNow() would trip on a block larger than the
   // write buffer. No bloom_filter_: it could never be populated.
+  is_external_block_ = true;  // [migagent 2026-10-20] see IsExternalBlock()
   const auto* rep = static_cast<const SortedBlockMemTableRep*>(table_.get());
   const ExternalMemTableBlock& b = rep->block();
   // Counters the flush path (FlushJob::WriteLevel0Table: num_entries /

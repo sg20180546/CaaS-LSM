@@ -265,9 +265,15 @@ class MemTableList {
 
   // Returns the earliest memtables that needs to be flushed. The returned
   // memtables are guaranteed to be in the ascending order of created time.
-  void PickMemtablesToFlush(uint64_t max_memtable_id,
-                            autovector<MemTable*>* mems,
-                            uint64_t* max_next_log_number = nullptr);
+  // [migagent 2026-10-20] If non-null, *older_in_progress_max_next_log_number
+  // is raised to the largest NextLogNumber of the memtables OLDER than every
+  // picked one whose flush is already in progress (their results are
+  // installed before this pick's, in list order). Only FlushJob passes it,
+  // for the block-only clamp; the picking itself is unchanged.
+  void PickMemtablesToFlush(
+      uint64_t max_memtable_id, autovector<MemTable*>* mems,
+      uint64_t* max_next_log_number = nullptr,
+      uint64_t* older_in_progress_max_next_log_number = nullptr);
 
   // Reset status of the given memtable list back to pending state so that
   // they can get picked up again on the next round of flush.

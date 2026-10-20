@@ -811,6 +811,200 @@ TEST_F(ExternalMemTableTest, MultiCFFenceExcludesSwitchedActive) {
   ASSERT_EQ(Get(Key(3)), Val(3));
 }
 
+// [migagent 2026-10-20] Block-only flush log number, sequential case. The
+// block is stamped at install with the CF log number of that moment. An older
+// plain immutable, already being flushed (parked inside WriteLevel0Table with
+// the mutex released), carries the newer WAL opened at its switch; its commit
+// raises the CF log number, and the block's own flush -- queued behind it on
+// the single flush thread -- then picks the block alone. Without the clamp in
+// FlushJob::PickMemTable its edit carries the lower stamp: the debug assert
+// in VersionSet::LogAndApplyHelper fires; a release build writes a
+// non-monotonic log number that recovery reports as "NOT monotonically
+// increasing".
+TEST_F(ExternalMemTableTest, BlockOnlyFlushAfterOlderImmCommitWithWal) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_write_buffer_number = 4;
+  options.max_background_flushes = 1;  // the block's flush waits for the older
+  DestroyAndReopen(options);
+  ASSERT_GT(dbfull()->TEST_LogfileNumber(), 0u);  // WAL on
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+
+  // A committed flush gives the CF a real log number: the block's stamp.
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const uint64_t log_at_install = cfd->GetLogNumber();
+  ASSERT_GT(log_at_install, 0u);
+
+  // Older plain immutable whose flush parks with the mutex released.
+  ASSERT_OK(Put("b", "2"));
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release_older{false};
+  std::atomic<int> arrivals{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:output_compression", [&](void*) {
+        if (arrivals.fetch_add(1) == 0) {
+          parked.store(true);
+          while (!release_older.load()) {
+            Env::Default()->SleepForMicroseconds(1000);
+          }
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  {
+    FlushOptions fo;
+    fo.wait = false;
+    ASSERT_OK(db_->Flush(fo));  // switches "b" out and schedules its flush
+  }
+  for (int i = 0; i < 20000 && !parked.load(); ++i) {
+    Env::Default()->SleepForMicroseconds(1000);
+  }
+  ASSERT_TRUE(parked.load());
+  const uint64_t imm_next_log = dbfull()->TEST_LogfileNumber();
+  ASSERT_GT(imm_next_log, log_at_install);  // the WAL opened at the switch
+
+  // Install while the older flush is in flight: stamp = log_at_install.
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(SequentialEntries(10, g, /*width_one=*/true), &released);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk)));
+  ASSERT_EQ(cfd->GetLogNumber(), log_at_install);
+  // Let the older flush commit (CF log number -> imm_next_log); the block's
+  // flush then runs alone.
+  release_older.store(true);
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(arrivals.load(), 2);  // older flush, then the block-only flush
+  ASSERT_EQ(NumTableFilesAtLevel(0), 3);
+  ASSERT_GE(cfd->GetLogNumber(), imm_next_log);
+  ASSERT_EQ(Get("a"), "1");
+  ASSERT_EQ(Get("b"), "2");
+  ASSERT_EQ(Get(Key(5)), Val(5));
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), "1");
+  ASSERT_EQ(Get("b"), "2");
+  ASSERT_EQ(Get(Key(0)), Val(0));
+  ASSERT_EQ(Get(Key(9)), Val(9));
+  std::string log_contents;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/LOG", &log_contents));
+  ASSERT_EQ(log_contents.find("NOT monotonically increasing"),
+            std::string::npos);
+}
+
+// [migagent 2026-10-20] Block-only flush log number, concurrent case: two
+// flush threads. The older immutable's flush is parked, the block's flush
+// picks the block alone (the older one is in progress) BEFORE the older
+// commit raises the CF log number, then parks itself; the older flush commits
+// in between. max(stamp, CF log number) at pick time is too early here; the
+// clamp also folds in the NextLogNumber of older memtables still in flight.
+TEST_F(ExternalMemTableTest, BlockOnlyFlushConcurrentWithOlderImmCommitWithWal) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_write_buffer_number = 4;
+  options.max_background_flushes = 2;  // two flush jobs of one CF in flight
+  DestroyAndReopen(options);
+  ASSERT_GT(dbfull()->TEST_LogfileNumber(), 0u);  // WAL on
+  ColumnFamilyData* cfd =
+      static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+
+  ASSERT_OK(Put("a", "1"));
+  ASSERT_OK(Flush());
+  const uint64_t log_at_install = cfd->GetLogNumber();
+  ASSERT_GT(log_at_install, 0u);
+
+  ASSERT_OK(Put("b", "2"));
+  std::atomic<bool> older_parked{false}, block_parked{false};
+  std::atomic<bool> release_older{false}, release_block{false};
+  std::atomic<bool> older_committed{false};
+  std::atomic<int> arrivals{0};
+  std::atomic<int> finishes{0};
+  SyncPoint::GetInstance()->SetCallBack(
+      "FlushJob::WriteLevel0Table:output_compression", [&](void*) {
+        const int n = arrivals.fetch_add(1);
+        if (n == 0) {  // the older immutable's flush
+          older_parked.store(true);
+          while (!release_older.load()) {
+            Env::Default()->SleepForMicroseconds(1000);
+          }
+        } else if (n == 1) {  // the block-only flush, already picked
+          block_parked.store(true);
+          while (!release_block.load()) {
+            Env::Default()->SleepForMicroseconds(1000);
+          }
+        }
+      });
+  SyncPoint::GetInstance()->SetCallBack(
+      "DBImpl::FlushMemTableToOutputFile:Finish", [&](void*) {
+        if (finishes.fetch_add(1) == 0) {
+          older_committed.store(true);
+        }
+      });
+  SyncPoint::GetInstance()->EnableProcessing();
+  {
+    FlushOptions fo;
+    fo.wait = false;
+    ASSERT_OK(db_->Flush(fo));
+  }
+  for (int i = 0; i < 20000 && !older_parked.load(); ++i) {
+    Env::Default()->SleepForMicroseconds(1000);
+  }
+  ASSERT_TRUE(older_parked.load());
+  const uint64_t imm_next_log = dbfull()->TEST_LogfileNumber();
+  ASSERT_GT(imm_next_log, log_at_install);
+
+  const SequenceNumber g = db_->GetLatestSequenceNumber() + 1;
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      MakeBlock(SequentialEntries(10, g, /*width_one=*/true), &released);
+  ASSERT_OK(db_->InstallExternalMemTable(db_->DefaultColumnFamily(),
+                                         std::move(blk)));
+  // The second flush slot picks the block alone and parks.
+  for (int i = 0; i < 20000 && !block_parked.load(); ++i) {
+    Env::Default()->SleepForMicroseconds(1000);
+  }
+  ASSERT_TRUE(block_parked.load());
+  ASSERT_EQ(cfd->GetLogNumber(), log_at_install);  // nothing committed yet
+  // Older flush commits first ...
+  release_older.store(true);
+  for (int i = 0; i < 20000 && !older_committed.load(); ++i) {
+    Env::Default()->SleepForMicroseconds(1000);
+  }
+  ASSERT_TRUE(older_committed.load());
+  // ... then the block-only flush installs its result.
+  release_block.store(true);
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
+  ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
+  SyncPoint::GetInstance()->DisableProcessing();
+  SyncPoint::GetInstance()->ClearAllCallBacks();
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  ASSERT_EQ(arrivals.load(), 2);
+  ASSERT_EQ(finishes.load(), 2);
+  ASSERT_EQ(NumTableFilesAtLevel(0), 3);
+  ASSERT_GE(cfd->GetLogNumber(), imm_next_log);
+  ASSERT_EQ(Get("a"), "1");
+  ASSERT_EQ(Get("b"), "2");
+  ASSERT_EQ(Get(Key(5)), Val(5));
+
+  Reopen(options);
+  ASSERT_EQ(Get("a"), "1");
+  ASSERT_EQ(Get("b"), "2");
+  ASSERT_EQ(Get(Key(0)), Val(0));
+  ASSERT_EQ(Get(Key(9)), Val(9));
+  std::string log_contents;
+  ASSERT_OK(ReadFileToString(env_, dbname_ + "/LOG", &log_contents));
+  ASSERT_EQ(log_contents.find("NOT monotonically increasing"),
+            std::string::npos);
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
