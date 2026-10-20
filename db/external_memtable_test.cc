@@ -548,7 +548,11 @@ TEST_F(ExternalMemTableTest, L0SeqnoRuleWidthOneWindow) {
   ASSERT_EQ(Get("b"), "2");
   ASSERT_EQ(Get("c"), "3");
   // The block is flushed alone (auto request) into an external-shape file.
-  { FlushOptions fo; fo.wait = true; ASSERT_OK(db_->Flush(fo)); }  // NDEBUG-safe wait (TEST_WaitForFlushMemTable is debug-only)
+  // Wait for that flush only: db_->Flush() would also switch and flush the
+  // active memtable holding "a" (seq 1) into a second L0 file, which the
+  // rest of this test assumes is still unflushed (force_consistency_checks
+  // then reports "L0 file with seqno 1 1 vs. file with global_seqno 1").
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());
   ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
   WaitForRelease(&released, 1);
   ASSERT_EQ(released.load(), 1);
@@ -595,7 +599,7 @@ TEST_F(ExternalMemTableTest, L0SeqnoRuleWidthOneWindow) {
                                          std::move(multi)));
   ASSERT_EQ(Get("f"), "6");
   ASSERT_EQ(Get("g"), "7");
-  { FlushOptions fo; fo.wait = true; ASSERT_OK(db_->Flush(fo)); }  // NDEBUG-safe wait (TEST_WaitForFlushMemTable is debug-only)
+  ASSERT_OK(dbfull()->TEST_WaitForFlushMemTable());  // the block's own flush
   ASSERT_OK(dbfull()->TEST_WaitForBackgroundWork());
   WaitForRelease(&released2, 1);
   ASSERT_EQ(released2.load(), 1);
