@@ -104,6 +104,9 @@ class ExternalMemTableBlockBuilder {
 
   uint64_t count() const { return offsets_.size(); }
   size_t data_size() const { return data_.size(); }
+  // [migagent 2026-10-20] User key of the last Add() (empty if none): the
+  // resume point of ExportMemTableRange after Status::Incomplete.
+  const std::string& last_user_key() const { return last_user_key_; }
 
  private:
   std::string data_;
@@ -116,5 +119,51 @@ class ExternalMemTableBlockBuilder {
   SequenceNumber largest_ = 0;
   Status status_;  // first violation, returned by Finish()
 };
+
+class DB;
+class ColumnFamilyHandle;
+class Snapshot;
+
+// [migagent 2026-10-20] Typed export of the unflushed state of a key range.
+// Walks the column family's ACTIVE and IMMUTABLE memtables (merged, under a
+// referenced SuperVersion; SST files are not read) for user keys in
+// [begin, end) and appends one entry per user key to `out` at sequence
+// number `block_seq` (a width-1 block, the shape DB::InstallExternalMemTable
+// accepts next to older unflushed data). `db` may be a wrapper (StackableDB /
+// TransactionDB): the root DB is reached through GetRootDB() and must be the
+// engine's DBImpl (InvalidArgument otherwise). The column family must use the
+// default bytewise key order (the builder's ordering rule).
+//
+// Versions with a sequence number above `snapshot` are skipped (nullptr =
+// everything); of the surviving versions of a user key only the newest is
+// exported, with this type mapping:
+//   Value          -> Value, unless an older surviving version of the key is
+//                     a SingleDeletion (NotSupported: the destination cannot
+//                     reproduce the single-delete pairing);
+//   Deletion       -> Deletion;
+//   SingleDeletion -> SingleDeletion when it is the key's only version in the
+//                     memtables, Deletion when older versions exist beneath;
+//   Merge (any version)               -> NotSupported;
+//   a range tombstone overlapping [begin, end] (inclusive end, the engine's
+//                     overlap check) -> NotSupported;
+//   any other type                    -> Corruption.
+// `*num_deletes` (may be nullptr) receives the number of Deletion +
+// SingleDeletion entries added by this call.
+//
+// Byte budget: this call adds at most `max_data_bytes` of encoded entries
+// (0 = unlimited; the first entry is always added so progress is guaranteed)
+// and returns Status::Incomplete() when the next entry would exceed it. The
+// builder then holds everything up to and including out->last_user_key();
+// continue with begin = out->last_user_key() + std::string(1, '\0') -- with
+// a fresh builder if each call is to become one block. A range with
+// begin >= end, or one without surviving memtable entries, returns OK with
+// nothing added. The caller provides the consistency cut (snapshot) and the
+// cutover discipline described at DB::InstallExternalMemTable; the walk
+// takes no DB mutex beyond the SuperVersion reference.
+Status ExportMemTableRange(DB* db, ColumnFamilyHandle* cf, const Slice& begin,
+                           const Slice& end, const Snapshot* snapshot,
+                           SequenceNumber block_seq, size_t max_data_bytes,
+                           ExternalMemTableBlockBuilder* out,
+                           uint64_t* num_deletes);
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -31,10 +31,15 @@
 #include "db/job_context.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
+#include "db/range_del_aggregator.h"
 #include "db/version_set.h"
 #include "logging/logging.h"
+#include "memory/arena.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/external_memtable.h"
 #include "rocksdb/status.h"
+#include "table/merging_iterator.h"
+#include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -470,6 +475,223 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
                    largest, seq_before, versions_->LastSequence(),
                    imm_unflushed, request_flush ? 1 : 0);
   }
+  return s;
+}
+
+// [migagent 2026-10-20] Source-side typed export, see
+// include/rocksdb/external_memtable.h for the contract. A free function (no
+// vtable slot): the migration agent links against librocksdb.so and reaches
+// the DBImpl through GetRootDB(), the same unwrapping as
+// utilities/sst_access_stats.cc. The walk is DBImpl::NewInternalIterator's
+// memtable half (mem->NewIterator + imm->AddIterators into a
+// MergeIteratorBuilder, no SST level) under a referenced SuperVersion; the
+// range-tombstone check uses the same ReadRangeDelAggregator the read path
+// builds, so the only mutex use is the SuperVersion unref.
+Status ExportMemTableRange(DB* db, ColumnFamilyHandle* cf, const Slice& begin,
+                           const Slice& end, const Snapshot* snapshot,
+                           SequenceNumber block_seq, size_t max_data_bytes,
+                           ExternalMemTableBlockBuilder* out,
+                           uint64_t* num_deletes) {
+  if (num_deletes != nullptr) {
+    *num_deletes = 0;
+  }
+  if (db == nullptr || cf == nullptr || out == nullptr) {
+    return Status::InvalidArgument(
+        "ExportMemTableRange: db, cf and out must not be null");
+  }
+  if (block_seq == 0 || block_seq > kMaxSequenceNumber) {
+    // InstallExternalMemTable requires smallest_seqno >= 1.
+    return Status::InvalidArgument(
+        "ExportMemTableRange: block_seq must be in [1, kMaxSequenceNumber]");
+  }
+  DB* root = db->GetRootDB();
+#ifdef ROCKSDB_USE_RTTI
+  DBImpl* impl = dynamic_cast<DBImpl*>(root);
+#else
+  DBImpl* impl = static_cast<DBImpl*>(root);
+#endif
+  if (impl == nullptr) {
+    return Status::InvalidArgument(
+        "ExportMemTableRange: the root DB is not a DBImpl");
+  }
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cf)->cfd();
+  const InternalKeyComparator& icmp = cfd->internal_comparator();
+  const Comparator* ucmp = icmp.user_comparator();
+  if (ucmp->timestamp_size() != 0) {
+    return Status::NotSupported(
+        "ExportMemTableRange: user-defined timestamps are not supported");
+  }
+  if (ucmp->Compare(begin, end) >= 0) {
+    return Status::OK();  // empty range
+  }
+  const SequenceNumber snap_seq =
+      snapshot != nullptr ? snapshot->GetSequenceNumber() : kMaxSequenceNumber;
+
+  SuperVersion* sv = impl->GetAndRefSuperVersion(cfd);
+  Status s;
+  {
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    ro.snapshot = snapshot;  // read_seq of the immutable tombstone iterators
+    Arena arena;
+
+    // ---- Range tombstones: a block cannot carry one, so any tombstone
+    // (at or below the snapshot) overlapping the range refuses the export.
+    {
+      ReadRangeDelAggregator range_del_agg(&icmp, snap_seq);
+      std::unique_ptr<FragmentedRangeTombstoneIterator> mem_tombstones(
+          sv->mem->NewRangeTombstoneIterator(ro, snap_seq,
+                                             false /* immutable_memtable */));
+      range_del_agg.AddTombstones(std::move(mem_tombstones));
+      s = sv->imm->AddRangeTombstoneIterators(ro, &arena, &range_del_agg);
+      if (s.ok() && !range_del_agg.IsEmpty() &&
+          range_del_agg.IsRangeOverlapped(begin, end)) {
+        s = Status::NotSupported(
+            "ExportMemTableRange: a range tombstone overlaps the exported "
+            "range");
+      }
+    }
+
+    if (s.ok()) {
+      // ---- Point entries: user key ascending, sequence descending.
+      MergeIteratorBuilder builder(&icmp, &arena, false /* prefix_seek_mode */);
+      builder.AddIterator(sv->mem->NewIterator(ro, &arena));
+      sv->imm->AddIterators(ro, &builder, false /* add_range_tombstone_iter */);
+      ScopedArenaIterator iter(builder.Finish());
+      InternalKey seek_key(begin, kMaxSequenceNumber, kValueTypeForSeek);
+      iter->Seek(seek_key.Encode());
+
+      // The user key being assembled: its newest surviving version decides
+      // the output; the older surviving versions only matter for the
+      // SingleDeletion rules and the Merge / type checks.
+      bool have_cur = false;
+      std::string cur_key;
+      ValueType cur_type = kTypeValue;
+      std::string cur_value;
+      bool cur_has_older = false;
+      bool cur_older_single_deletion = false;
+      size_t bytes_added = 0;
+      uint64_t deletes = 0;
+      bool budget_hit = false;
+
+      auto emit_cur = [&]() -> Status {
+        ValueType out_type = kTypeValue;
+        if (cur_type == kTypeValue) {
+          if (cur_older_single_deletion) {
+            return Status::NotSupported(
+                "ExportMemTableRange: key has a Value over an older "
+                "SingleDeletion in the memtables (" +
+                Slice(cur_key).ToString(true) + ")");
+          }
+          out_type = kTypeValue;
+        } else if (cur_type == kTypeDeletion) {
+          out_type = kTypeDeletion;
+        } else {
+          assert(cur_type == kTypeSingleDeletion);
+          out_type = cur_has_older ? kTypeDeletion : kTypeSingleDeletion;
+        }
+        const Slice v = (out_type == kTypeValue) ? Slice(cur_value) : Slice();
+        // ExternalMemTableBlockBuilder::Add's encoded size.
+        const uint32_t internal_key_size =
+            static_cast<uint32_t>(cur_key.size()) + kNumInternalBytes;
+        const size_t encoded = VarintLength(internal_key_size) +
+                               internal_key_size +
+                               VarintLength(static_cast<uint32_t>(v.size())) +
+                               v.size();
+        if (max_data_bytes != 0 && bytes_added > 0 &&
+            bytes_added + encoded > max_data_bytes) {
+          budget_hit = true;  // the entry stays unexported; resume from it
+          return Status::OK();
+        }
+        out->Add(cur_key, block_seq, out_type, v);
+        bytes_added += encoded;
+        if (out_type != kTypeValue) {
+          ++deletes;
+        }
+        return Status::OK();
+      };
+
+      for (; iter->Valid(); iter->Next()) {
+        ParsedInternalKey pik;
+        s = ParseInternalKey(iter->key(), &pik, false /* log_err_key */);
+        if (!s.ok()) {
+          break;  // Corruption
+        }
+        if (ucmp->Compare(pik.user_key, end) >= 0) {
+          break;
+        }
+        if (pik.sequence > snap_seq) {
+          continue;  // newer than the snapshot: not part of the cut
+        }
+        if (have_cur && ucmp->Equal(pik.user_key, cur_key)) {
+          // An older surviving version of the key being assembled.
+          cur_has_older = true;
+          if (pik.type == kTypeSingleDeletion) {
+            cur_older_single_deletion = true;
+          } else if (pik.type == kTypeMerge) {
+            s = Status::NotSupported(
+                "ExportMemTableRange: merge operand in the memtables (" +
+                pik.user_key.ToString(true) + ")");
+            break;
+          } else if (pik.type != kTypeValue && pik.type != kTypeDeletion) {
+            s = Status::Corruption(
+                "ExportMemTableRange: unexpected value type " +
+                std::to_string(static_cast<unsigned>(pik.type)) +
+                " in the memtables");
+            break;
+          }
+          continue;
+        }
+        if (have_cur) {
+          s = emit_cur();
+          if (!s.ok() || budget_hit) {
+            break;
+          }
+        }
+        // Newest surviving version of a new user key.
+        if (pik.type == kTypeMerge) {
+          s = Status::NotSupported(
+              "ExportMemTableRange: merge operand in the memtables (" +
+              pik.user_key.ToString(true) + ")");
+          break;
+        } else if (pik.type != kTypeValue && pik.type != kTypeDeletion &&
+                   pik.type != kTypeSingleDeletion) {
+          s = Status::Corruption("ExportMemTableRange: unexpected value type " +
+                                 std::to_string(static_cast<unsigned>(pik.type)) +
+                                 " in the memtables");
+          break;
+        }
+        have_cur = true;
+        cur_key.assign(pik.user_key.data(), pik.user_key.size());
+        cur_type = pik.type;
+        if (pik.type == kTypeValue) {
+          const Slice v = iter->value();
+          cur_value.assign(v.data(), v.size());
+        } else {
+          cur_value.clear();
+        }
+        cur_has_older = false;
+        cur_older_single_deletion = false;
+      }
+      if (s.ok()) {
+        s = iter->status();
+      }
+      if (s.ok() && have_cur && !budget_hit) {
+        s = emit_cur();
+      }
+      if (s.ok() && budget_hit) {
+        s = Status::Incomplete(
+            "ExportMemTableRange: max_data_bytes reached; resume from "
+            "last_user_key() + '\\0'");
+      }
+      if (num_deletes != nullptr) {
+        *num_deletes = deletes;
+      }
+    }
+    // Iterators (arena) and the aggregator are destroyed here, before the
+    // SuperVersion that pins their memtables is released.
+  }
+  impl->ReturnAndCleanupSuperVersion(cfd, sv);
   return s;
 }
 

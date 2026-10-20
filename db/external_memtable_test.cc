@@ -19,6 +19,7 @@
 #include "rocksdb/external_memtable.h"
 #include "rocksdb/utilities/stackable_db.h"
 #include "util/coding.h"
+#include "utilities/merge_operators.h"
 
 #ifndef NDEBUG  // TEST_* wait hooks exist in debug builds only (RocksDB test convention)
 namespace ROCKSDB_NAMESPACE {
@@ -35,20 +36,16 @@ class ExternalMemTableTest : public DBTestBase {
     std::string value;
   };
 
-  // Builds a block whose buffers live on the heap and are freed by
-  // block.release, which also counts how often it ran.
-  static ExternalMemTableBlock MakeBlock(const std::vector<Entry>& entries,
-                                         std::atomic<int>* release_count,
-                                         bool request_flush = true) {
-    ExternalMemTableBlockBuilder b;
-    for (const auto& e : entries) {
-      b.Add(e.key, e.seq, e.type, e.value);
-    }
+  // Finishes a builder into a block whose buffers live on the heap and are
+  // freed by block.release, which also counts how often it ran.
+  static ExternalMemTableBlock BlockFromBuilder(ExternalMemTableBlockBuilder* b,
+                                                std::atomic<int>* release_count,
+                                                bool request_flush = true) {
     auto* data = new std::string;
     auto* offsets = new std::vector<uint32_t>;
     ExternalMemTableBlock blk;
-    EXPECT_OK(b.Finish(data, offsets, &blk.smallest_seqno, &blk.largest_seqno,
-                       &blk.count));
+    EXPECT_OK(b->Finish(data, offsets, &blk.smallest_seqno, &blk.largest_seqno,
+                        &blk.count));
     blk.data = data->data();
     blk.data_size = data->size();
     blk.offsets = offsets->data();
@@ -59,6 +56,81 @@ class ExternalMemTableTest : public DBTestBase {
       release_count->fetch_add(1);
     };
     return blk;
+  }
+
+  static ExternalMemTableBlock MakeBlock(const std::vector<Entry>& entries,
+                                         std::atomic<int>* release_count,
+                                         bool request_flush = true) {
+    ExternalMemTableBlockBuilder b;
+    for (const auto& e : entries) {
+      b.Add(e.key, e.seq, e.type, e.value);
+    }
+    return BlockFromBuilder(&b, release_count, request_flush);
+  }
+
+  // Decodes a finished block (memtable entry encoding) back into entries.
+  static std::vector<Entry> DecodeBlock(const std::string& data,
+                                        const std::vector<uint32_t>& offsets) {
+    std::vector<Entry> out;
+    const char* limit = data.data() + data.size();
+    for (uint32_t off : offsets) {
+      const char* p = data.data() + off;
+      uint32_t klen = 0;
+      p = GetVarint32Ptr(p, limit, &klen);
+      EXPECT_NE(p, nullptr);
+      EXPECT_GE(klen, 8u);
+      Entry e;
+      e.key.assign(p, klen - 8);
+      const uint64_t tag = DecodeFixed64(p + klen - 8);
+      e.seq = tag >> 8;
+      e.type = static_cast<ValueType>(tag & 0xff);
+      p += klen;
+      uint32_t vlen = 0;
+      p = GetVarint32Ptr(p, limit, &vlen);
+      EXPECT_NE(p, nullptr);
+      e.value.assign(p, vlen);
+      out.push_back(e);
+    }
+    return out;
+  }
+
+  // Finishes a builder and decodes it (empty builder -> no entries).
+  static std::vector<Entry> DrainBuilder(ExternalMemTableBlockBuilder* b) {
+    if (b->count() == 0) {
+      return {};
+    }
+    std::string data;
+    std::vector<uint32_t> offsets;
+    SequenceNumber smallest, largest;
+    uint64_t count;
+    EXPECT_OK(b->Finish(&data, &offsets, &smallest, &largest, &count));
+    return DecodeBlock(data, offsets);
+  }
+
+  static std::string GetAt(DB* db, const Snapshot* snap, const std::string& k) {
+    ReadOptions ro;
+    ro.snapshot = snap;
+    std::string v;
+    Status s = db->Get(ro, k, &v);
+    if (s.IsNotFound()) {
+      return "NOT_FOUND";
+    }
+    EXPECT_OK(s);
+    return v;
+  }
+
+  static std::vector<std::pair<std::string, std::string>> Scan(
+      DB* db, const Snapshot* snap, const Slice& lo, const Slice& hi) {
+    ReadOptions ro;
+    ro.snapshot = snap;
+    ro.total_order_seek = true;
+    std::vector<std::pair<std::string, std::string>> out;
+    std::unique_ptr<Iterator> it(db->NewIterator(ro));
+    for (it->Seek(lo); it->Valid() && it->key().compare(hi) < 0; it->Next()) {
+      out.emplace_back(it->key().ToString(), it->value().ToString());
+    }
+    EXPECT_OK(it->status());
+    return out;
   }
 
   static std::string Key(int i) {
@@ -680,6 +752,253 @@ TEST_F(ExternalMemTableTest, StackableDBPassthrough) {
   WaitForRelease(&released, 1);
   ASSERT_EQ(released.load(), 1);
   ASSERT_EQ(Get(Key(3)), Val(3));
+}
+
+// [migagent 2026-10-20] ExportMemTableRange: typed export of the unflushed
+// state of a key range (active + immutable memtables, snapshot cut, newest
+// version per key with the Value / Deletion / SingleDeletion mapping),
+// installed into a second DB that holds the older versions as an SST. The
+// destination must equal the source's snapshot view before and after
+// Flush + CompactRange (the tombstones have to cancel the SST versions).
+// Merge, a DeleteRange overlapping the range and a Value over an older
+// SingleDeletion are NotSupported; the byte budget resumes correctly.
+TEST_F(ExternalMemTableTest, ExportTypedRoundTrip) {
+  Options options = CurrentOptions();
+  options.disable_auto_compactions = true;
+  options.max_write_buffer_number = 4;
+  options.merge_operator = MergeOperators::CreateStringAppendOperator();
+  DestroyAndReopen(options);
+  ColumnFamilyHandle* cf = db_->DefaultColumnFamily();
+
+  // Destination: a separate DB that will hold the older versions as an SST.
+  Options dopt = CurrentOptions();
+  dopt.disable_auto_compactions = true;
+  dopt.create_if_missing = true;
+  const std::string dest_name = dbname_ + "_export_dest";
+  ASSERT_OK(DestroyDB(dest_name, dopt));
+  DB* dest_raw = nullptr;
+  ASSERT_OK(DB::Open(dopt, dest_name, &dest_raw));
+  std::unique_ptr<DB> dest(dest_raw);
+
+  // Phase 1: older versions, flushed to an SST on both sides.
+  for (int i = 0; i < 20; ++i) {
+    ASSERT_OK(Put(Key(i), "old" + std::to_string(i)));
+    ASSERT_OK(dest->Put(WriteOptions(), Key(i), "old" + std::to_string(i)));
+  }
+  ASSERT_OK(Flush());
+  ASSERT_OK(dest->Flush(FlushOptions()));
+  ASSERT_EQ(NumTableFilesAtLevel(0), 1);
+
+  // Phase 2: the unflushed state, spread over an immutable and the active
+  // memtable. Error cases live under "z*", outside the main range.
+  ASSERT_OK(Put(Key(0), "new0"));
+  ASSERT_OK(Put(Key(1), "x"));
+  ASSERT_OK(Delete(Key(2)));
+  ASSERT_OK(Put(Key(3), "y"));
+  ASSERT_OK(Put(Key(5), "z"));
+  ASSERT_OK(Put(Key(8), "a"));
+  ASSERT_OK(SingleDelete("zs"));
+  ASSERT_OK(dbfull()->TEST_SwitchMemtable());
+  ASSERT_OK(Put(Key(1), "new1"));
+  ASSERT_OK(Delete(Key(3)));
+  ASSERT_OK(SingleDelete(Key(4)));
+  ASSERT_OK(SingleDelete(Key(5)));
+  ASSERT_OK(Put(Key(8), "b"));
+  ASSERT_OK(Put(Key(20), "fresh"));
+  ASSERT_OK(db_->Merge(WriteOptions(), "zm", "m"));
+  ASSERT_OK(db_->DeleteRange(WriteOptions(), cf, "zr0", "zr5"));
+  ASSERT_OK(Put("zs", "w"));
+  const Snapshot* snap = db_->GetSnapshot();
+  // Newer than the snapshot: must not be exported.
+  ASSERT_OK(Put(Key(0), "newer0"));
+  ASSERT_OK(Put(Key(9), "after9"));
+  uint64_t num_imm = 0;
+  ASSERT_TRUE(db_->GetIntProperty(DB::Properties::kNumImmutableMemTable,
+                                  &num_imm));
+  ASSERT_EQ(num_imm, 1u);
+
+  const std::string lo = Key(0), hi = Key(100);
+  const SequenceNumber block_seq = dest->GetLatestSequenceNumber() + 1;
+
+  // Refusals: Merge, overlapping DeleteRange, Value over SingleDeletion.
+  {
+    ExternalMemTableBlockBuilder b;
+    Status st = ExportMemTableRange(db_, cf, "zm", "zn", snap, block_seq, 0,
+                                    &b, nullptr);
+    ASSERT_TRUE(st.IsNotSupported()) << st.ToString();
+  }
+  {
+    ExternalMemTableBlockBuilder b;
+    Status st = ExportMemTableRange(db_, cf, "zr0", "zr9", snap, block_seq, 0,
+                                    &b, nullptr);
+    ASSERT_TRUE(st.IsNotSupported()) << st.ToString();
+    // Also when the tombstone is only partially inside the range.
+    st = ExportMemTableRange(db_, cf, "zr3", "zr4", snap, block_seq, 0, &b,
+                             nullptr);
+    ASSERT_TRUE(st.IsNotSupported()) << st.ToString();
+  }
+  {
+    ExternalMemTableBlockBuilder b;
+    Status st = ExportMemTableRange(db_, cf, "zs", "zt", snap, block_seq, 0,
+                                    &b, nullptr);
+    ASSERT_TRUE(st.IsNotSupported()) << st.ToString();
+  }
+  // Nothing in the range / empty range / bad arguments.
+  {
+    ExternalMemTableBlockBuilder b;
+    uint64_t nd = 7;
+    ASSERT_OK(ExportMemTableRange(db_, cf, "za", "zb", snap, block_seq, 0, &b,
+                                  &nd));
+    ASSERT_EQ(b.count(), 0u);
+    ASSERT_EQ(nd, 0u);
+    ASSERT_OK(ExportMemTableRange(db_, cf, hi, lo, snap, block_seq, 0, &b,
+                                  &nd));
+    ASSERT_EQ(b.count(), 0u);
+    ASSERT_TRUE(ExportMemTableRange(db_, cf, lo, hi, snap, 0, 0, &b, &nd)
+                    .IsInvalidArgument());
+    ASSERT_TRUE(ExportMemTableRange(nullptr, cf, lo, hi, snap, block_seq, 0,
+                                    &b, &nd)
+                    .IsInvalidArgument());
+    ASSERT_TRUE(
+        ExportMemTableRange(db_, cf, lo, hi, snap, block_seq, 0, nullptr, &nd)
+            .IsInvalidArgument());
+  }
+
+  // The main range, unlimited budget.
+  std::vector<Entry> expected = {
+      {Key(0), block_seq, kExternalMemTableTypeValue, "new0"},
+      {Key(1), block_seq, kExternalMemTableTypeValue, "new1"},
+      {Key(2), block_seq, kExternalMemTableTypeDeletion, ""},
+      {Key(3), block_seq, kExternalMemTableTypeDeletion, ""},
+      {Key(4), block_seq, kExternalMemTableTypeSingleDeletion, ""},
+      {Key(5), block_seq, kExternalMemTableTypeDeletion, ""},  // SD over Put
+      {Key(8), block_seq, kExternalMemTableTypeValue, "b"},
+      {Key(20), block_seq, kExternalMemTableTypeValue, "fresh"},
+  };
+  auto check_entries = [&](const std::vector<Entry>& got) {
+    ASSERT_EQ(got.size(), expected.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+      EXPECT_EQ(got[i].key, expected[i].key) << i;
+      EXPECT_EQ(got[i].seq, expected[i].seq) << i;
+      EXPECT_EQ(got[i].type, expected[i].type) << i;
+      EXPECT_EQ(got[i].value, expected[i].value) << i;
+    }
+  };
+  ExternalMemTableBlockBuilder main_builder;
+  uint64_t num_deletes = 0;
+  ASSERT_OK(ExportMemTableRange(db_, cf, lo, hi, snap, block_seq, 0,
+                                &main_builder, &num_deletes));
+  ASSERT_EQ(main_builder.count(), expected.size());
+  ASSERT_EQ(num_deletes, 4u);
+  ASSERT_EQ(main_builder.last_user_key(), Key(20));
+  {
+    // Same result through a StackableDB wrapper (GetRootDB unwrapping) and
+    // without a snapshot (then the two newer writes are included).
+    std::shared_ptr<DB> no_own(db_, [](DB*) {});
+    StackableDB sdb(no_own);
+    ExternalMemTableBlockBuilder b;
+    ASSERT_OK(ExportMemTableRange(&sdb, sdb.DefaultColumnFamily(), lo, hi,
+                                  snap, block_seq, 0, &b, nullptr));
+    check_entries(DrainBuilder(&b));
+    ExternalMemTableBlockBuilder b2;
+    ASSERT_OK(ExportMemTableRange(db_, cf, lo, hi, nullptr, block_seq, 0, &b2,
+                                  nullptr));
+    std::vector<Entry> all = DrainBuilder(&b2);
+    ASSERT_EQ(all.size(), expected.size() + 1);  // + Key(9)
+    ASSERT_EQ(all[0].value, "newer0");
+    ASSERT_EQ(all[7].key, Key(9));
+    ASSERT_EQ(all[7].value, "after9");
+  }
+  // Byte budget: tiny (one entry per call) and medium budgets reassemble the
+  // same entries over several calls, resuming from last_user_key() + '\0'.
+  for (size_t budget : {size_t{1}, size_t{40}}) {
+    std::vector<Entry> pieces;
+    std::string from = lo;
+    int calls = 0;
+    uint64_t deletes_total = 0;
+    while (true) {
+      ExternalMemTableBlockBuilder b;
+      uint64_t nd = 0;
+      Status st = ExportMemTableRange(db_, cf, from, hi, snap, block_seq,
+                                      budget, &b, &nd);
+      ++calls;
+      ASSERT_TRUE(st.ok() || st.IsIncomplete()) << st.ToString();
+      ASSERT_LE(calls, 20);
+      deletes_total += nd;
+      if (st.IsIncomplete()) {
+        ASSERT_GT(b.count(), 0u);
+        ASSERT_TRUE(budget == 1 || b.data_size() <= budget);
+        from = b.last_user_key() + std::string(1, '\0');
+      }
+      std::vector<Entry> part = DrainBuilder(&b);
+      pieces.insert(pieces.end(), part.begin(), part.end());
+      if (st.ok()) {
+        break;
+      }
+    }
+    ASSERT_GE(calls, 2) << budget;
+    if (budget == 1) {
+      // One entry per call; the call that adds the last key finds the range
+      // exhausted and returns OK, not Incomplete.
+      ASSERT_EQ(calls, static_cast<int>(expected.size()));
+    }
+    ASSERT_EQ(deletes_total, 4u);
+    check_entries(pieces);
+  }
+
+  // Install the main block into the destination and compare views.
+  std::atomic<int> released{0};
+  ExternalMemTableBlock blk =
+      BlockFromBuilder(&main_builder, &released, /*request_flush=*/false);
+  ASSERT_EQ(blk.smallest_seqno, block_seq);
+  ASSERT_EQ(blk.largest_seqno, block_seq);
+  ASSERT_OK(dest->InstallExternalMemTable(dest->DefaultColumnFamily(),
+                                          std::move(blk)));
+  auto compare_views = [&](const char* when) {
+    for (int i = 0; i < 25; ++i) {
+      EXPECT_EQ(GetAt(dest.get(), nullptr, Key(i)), GetAt(db_, snap, Key(i)))
+          << when << " " << Key(i);
+    }
+    EXPECT_EQ(Scan(dest.get(), nullptr, lo, hi), Scan(db_, snap, lo, hi))
+        << when;
+  };
+  compare_views("after install");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(0)), "new0");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(1)), "new1");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(2)), "NOT_FOUND");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(3)), "NOT_FOUND");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(4)), "NOT_FOUND");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(5)), "NOT_FOUND");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(6)), "old6");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(8)), "b");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(9)), "old9");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(20)), "fresh");
+  ASSERT_EQ(Scan(dest.get(), nullptr, lo, hi).size(), 17u);  // 20 - 4 + 1
+
+  // Flush + CompactRange on the destination: the tombstones must cancel the
+  // SST versions (SingleDeletion of Key(4) pairs with its single older Put).
+  {
+    FlushOptions fo;
+    fo.allow_write_stall = true;  // request_flush=false: no queued flush
+    ASSERT_OK(dest->Flush(fo));
+  }
+  DBImpl* dest_impl = static_cast_with_check<DBImpl>(dest->GetRootDB());
+  ASSERT_OK(dest_impl->TEST_WaitForBackgroundWork());
+  WaitForRelease(&released, 1);
+  ASSERT_EQ(released.load(), 1);
+  compare_views("after flush");
+  ASSERT_OK(dest->CompactRange(CompactRangeOptions(), nullptr, nullptr));
+  compare_views("after compaction");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(4)), "NOT_FOUND");
+  ASSERT_EQ(GetAt(dest.get(), nullptr, Key(5)), "NOT_FOUND");
+  dest.reset();
+  ASSERT_OK(DB::Open(dopt, dest_name, &dest_raw));
+  dest.reset(dest_raw);
+  compare_views("after reopen");
+
+  db_->ReleaseSnapshot(snap);
+  dest.reset();
+  ASSERT_OK(DestroyDB(dest_name, dopt));
 }
 
 // [migagent 2026-10-20] A block's tombstones are counted at install (the
