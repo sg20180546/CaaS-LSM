@@ -371,6 +371,37 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
 
 #ifndef ROCKSDB_LITE  // GetColumnFamilyOptionsFromString is not supported in
                       // ROCKSDB_LITE
+// [migagent 2026-10-20] parallel_split_flush is a parseable CF option (registered
+// like l0_bucket_*), so a MyRocks rocksdb_default_cf_options string can set it.
+TEST_F(OptionsTest, ParallelSplitFlushParses) {
+  ColumnFamilyOptions base_cf_opt;
+  ColumnFamilyOptions new_cf_opt;
+  ConfigOptions config_options;
+  config_options.input_strings_escaped = false;
+  config_options.ignore_unknown_options = false;
+  ASSERT_EQ(base_cf_opt.parallel_split_flush, 0u);
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      config_options, base_cf_opt, "parallel_split_flush=1", &new_cf_opt));
+  ASSERT_EQ(new_cf_opt.parallel_split_flush, 1u);
+  ASSERT_OK(GetColumnFamilyOptionsFromString(
+      config_options, base_cf_opt,
+      "l0_bucket_count=16;l0_bucket_key_space=1000000;parallel_split_flush=8",
+      &new_cf_opt));
+  ASSERT_EQ(new_cf_opt.l0_bucket_count, 16u);
+  ASSERT_EQ(new_cf_opt.l0_bucket_key_space, 1000000u);
+  ASSERT_EQ(new_cf_opt.parallel_split_flush, 8u);
+  // Round trip through the serialized form (the string the remote CSA / an
+  // OPTIONS file sees).
+  std::string serialized;
+  ASSERT_OK(GetStringFromColumnFamilyOptions(config_options, new_cf_opt,
+                                             &serialized));
+  ASSERT_NE(serialized.find("parallel_split_flush=8"), std::string::npos);
+  ColumnFamilyOptions round_trip;
+  ASSERT_OK(GetColumnFamilyOptionsFromString(config_options, base_cf_opt,
+                                             serialized, &round_trip));
+  ASSERT_EQ(round_trip.parallel_split_flush, 8u);
+}
+
 TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ColumnFamilyOptions base_cf_opt;
   ColumnFamilyOptions new_cf_opt;

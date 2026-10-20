@@ -620,6 +620,16 @@ static std::unordered_map<std::string, OptionTypeInfo>
          {offsetof(struct ImmutableCFOptions, l0_bucket_boundaries_encoded),
           OptionType::kString, OptionVerificationType::kNormal,
           OptionTypeFlags::kNone}},
+        // [migagent 2026-10-20] parallel_split_flush (BucketLSM C2, parallel BucketFlush worker count) rides
+        // the same cf-options string as l0_bucket_*: MyRocks sets CF options only through
+        // rocksdb_default_cf_options = GetColumnFamilyOptionsFromString, where an unregistered name is a
+        // parse error, so without this entry L0 bucketing could never be turned on under MyRocks. Mirrors
+        // the l0_bucket_* registration (+ the reverse copy in options_helper.cc). Baselines leave it 0 =>
+        // serializes "parallel_split_flush=0" => no behavior change.
+        {"parallel_split_flush",
+         {offsetof(struct ImmutableCFOptions, parallel_split_flush),
+          OptionType::kUInt32T, OptionVerificationType::kNormal,
+          OptionTypeFlags::kNone}},
         {"bloom_locality",
          {offsetof(struct ImmutableCFOptions, bloom_locality),
           OptionType::kUInt32T, OptionVerificationType::kNormal,
