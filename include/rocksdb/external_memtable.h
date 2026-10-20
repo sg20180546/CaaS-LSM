@@ -107,6 +107,9 @@ class ExternalMemTableBlockBuilder {
   // [migagent 2026-10-20] User key of the last Add() (empty if none): the
   // resume point of ExportMemTableRange after Status::Incomplete.
   const std::string& last_user_key() const { return last_user_key_; }
+  // First ordering / type violation seen by Add() (OK while none); Add() drops
+  // entries once this is set, so callers must check it after every Add().
+  const Status& status() const { return status_; }
 
  private:
   std::string data_;

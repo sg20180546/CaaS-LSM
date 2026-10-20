@@ -692,7 +692,7 @@ TEST_F(ExternalMemTableTest, ValidationFailuresDoNotConsumeBlock) {
     b.smallest_seqno = b.largest_seqno = s0 + 1;
     b.release = [&merge_released]() { merge_released.fetch_add(1); };
     Status st = db_->InstallExternalMemTable(cf, std::move(b));
-    ASSERT_TRUE(st.IsCorruption()) << st.ToString();
+    ASSERT_TRUE(st.IsInvalidArgument()) << st.ToString();
     ASSERT_EQ(merge_released.load(), 0);
     ASSERT_EQ(Get("m"), "NOT_FOUND");
     // A second entry whose header runs past its offset slot (the first
@@ -1252,7 +1252,8 @@ TEST_F(ExternalMemTableTest, BlockOnlyFlushAfterOlderImmCommitWithWal) {
   options.disable_auto_compactions = true;
   options.max_write_buffer_number = 4;
   options.max_background_flushes = 1;  // the block's flush waits for the older
-  DestroyAndReopen(options);
+  // [migagent review 2026-10-20] the clamp is gated on >1 CF (MyRocks shape)
+  CreateAndReopenWithCF({"__system__"}, options);
   ASSERT_GT(dbfull()->TEST_LogfileNumber(), 0u);  // WAL on
   ColumnFamilyData* cfd =
       static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
@@ -1336,7 +1337,8 @@ TEST_F(ExternalMemTableTest, BlockOnlyFlushConcurrentWithOlderImmCommitWithWal) 
   options.disable_auto_compactions = true;
   options.max_write_buffer_number = 4;
   options.max_background_flushes = 2;  // two flush jobs of one CF in flight
-  DestroyAndReopen(options);
+  // [migagent review 2026-10-20] the clamp is gated on >1 CF (MyRocks shape)
+  CreateAndReopenWithCF({"__system__"}, options);
   ASSERT_GT(dbfull()->TEST_LogfileNumber(), 0u);  // WAL on
   ColumnFamilyData* cfd =
       static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();

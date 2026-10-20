@@ -20,6 +20,7 @@
 // once from ~MemTable after the flush result is in the MANIFEST and the last
 // SuperVersion / iterator reference is gone.
 
+#include <cstring>
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -152,7 +153,7 @@ Status ValidateBlockCheap(const ExternalMemTableBlock& b,
     if (type == kTypeDeletion || type == kTypeSingleDeletion) {
       ++deletes;
     } else if (type != kTypeValue) {
-      return Status::Corruption(
+      return Status::InvalidArgument(
           "InstallExternalMemTable: entry " + std::to_string(i) +
           " has value type " + std::to_string(static_cast<unsigned>(type)) +
           "; only Value (0x1), Deletion (0x0) and SingleDeletion (0x7) are "
@@ -521,6 +522,12 @@ Status ExportMemTableRange(DB* db, ColumnFamilyHandle* cf, const Slice& begin,
     return Status::NotSupported(
         "ExportMemTableRange: user-defined timestamps are not supported");
   }
+  if (strcmp(ucmp->Name(), "leveldb.BytewiseComparator") != 0) {
+    // the block format (and the builder's ordering check) assume bytewise order
+    return Status::NotSupported(
+        "ExportMemTableRange: bytewise comparator required, CF uses " +
+        std::string(ucmp->Name()));
+  }
   if (ucmp->Compare(begin, end) >= 0) {
     return Status::OK();  // empty range
   }
@@ -604,6 +611,9 @@ Status ExportMemTableRange(DB* db, ColumnFamilyHandle* cf, const Slice& begin,
           return Status::OK();
         }
         out->Add(cur_key, block_seq, out_type, v);
+        if (!out->status().ok()) {
+          return out->status();  // the builder drops entries once poisoned; surface it now
+        }
         bytes_added += encoded;
         if (out_type != kTypeValue) {
           ++deletes;

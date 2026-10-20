@@ -195,6 +195,9 @@ class StackableDB : public DB {
   virtual Status EnableFileDeletionsNoFullScan(bool force = true) override {
     return db_->EnableFileDeletionsNoFullScan(force);
   }
+  // WriteCommitted only: forwards to the base DB, bypassing
+  // WritePreparedTxnDB::GetSnapshotInternal (MyRocks' default policy is
+  // write_committed, where GetSnapshot is a plain forward as well).
   virtual const Snapshot* GetSnapshotNoBottommostTrigger() override {
     return db_->GetSnapshotNoBottommostTrigger();
   }

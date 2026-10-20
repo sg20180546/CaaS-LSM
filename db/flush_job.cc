@@ -216,7 +216,13 @@ void FlushJob::PickMemTable() {
         break;
       }
     }
-    if (all_external_blocks) {
+    // [migagent review 2026-10-20] Only when the DB has more than one column
+    // family (MyRocks: default + __system__): with a single CF the clamp
+    // would only ever replace a log number that is below the CF's current
+    // one (an invalid MANIFEST record that recovery ignores), and the KV
+    // shards must stay bit-identical to the pre-change engine.
+    if (all_external_blocks && versions_ != nullptr &&
+        versions_->GetColumnFamilySet()->NumberOfColumnFamilies() > 1) {
       max_next_log_number =
           std::max({max_next_log_number, cfd_->GetLogNumber(),
                     older_in_progress_max_next_log_number});
