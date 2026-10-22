@@ -1529,6 +1529,23 @@ void LevelIterator::InitFileIterator(size_t new_file_index) {
 }
 }  // anonymous namespace
 
+// [relink 2026-10-20] Where a table file actually lives on storage. An in-place
+// external reference keeps the absolute path of the source DB's file (nothing
+// was renamed); every other file is cf_paths + file number. Any code that
+// derives a file name in order to open or stat a table must use this instead of
+// TableFileName(): MyRocks' on-demand index statistics (GetPropertiesOfTablesInRange
+// right after a move, before any read had opened the relinked files) failed on
+// the lab on 2026-10-20 with "No such file or directory: <dst>/000169.sst"
+// because the callers below handed GetTableProperties() a destination-derived
+// name, so its table-cache-miss fallback opened a file that does not exist.
+static std::string TableFilePathOnStorage(const ImmutableOptions& ioptions,
+                                          const FileMetaData& f) {
+  return f.fd.external_path.empty()
+             ? TableFileName(ioptions.cf_paths, f.fd.GetNumber(),
+                             f.fd.GetPathId())
+             : f.fd.external_path;
+}
+
 Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
                                    const FileMetaData* file_meta,
                                    const std::string* fname) const {
@@ -1650,9 +1667,7 @@ Status Version::TablesRangeTombstoneSummary(int max_entries_to_print,
 
   for (int level = 0; level < storage_info_.num_levels_; level++) {
     for (const auto& file_meta : storage_info_.files_[level]) {
-      auto fname =
-          TableFileName(cfd_->ioptions()->cf_paths, file_meta->fd.GetNumber(),
-                        file_meta->fd.GetPathId());
+      auto fname = TableFilePathOnStorage(*cfd_->ioptions(), *file_meta);
 
       ss << "=== file : " << fname << " ===\n";
 
@@ -1697,9 +1712,7 @@ Status Version::TablesRangeTombstoneSummary(int max_entries_to_print,
 Status Version::GetPropertiesOfAllTables(TablePropertiesCollection* props,
                                          int level) {
   for (const auto& file_meta : storage_info_.files_[level]) {
-    auto fname =
-        TableFileName(cfd_->ioptions()->cf_paths, file_meta->fd.GetNumber(),
-                      file_meta->fd.GetPathId());
+    auto fname = TableFilePathOnStorage(*cfd_->ioptions(), *file_meta);
     // 1. If the table is already present in table cache, load table
     // properties from there.
     std::shared_ptr<const TableProperties> table_properties;
@@ -1725,9 +1738,7 @@ Status Version::GetPropertiesOfTablesInRange(
       storage_info_.GetOverlappingInputs(level, &k1, &k2, &files, -1, nullptr,
                                          false);
       for (const auto& file_meta : files) {
-        auto fname =
-            TableFileName(cfd_->ioptions()->cf_paths, file_meta->fd.GetNumber(),
-                          file_meta->fd.GetPathId());
+        auto fname = TableFilePathOnStorage(*cfd_->ioptions(), *file_meta);
         if (props->count(fname) == 0) {
           // 1. If the table is already present in table cache, load table
           // properties from there.
@@ -3561,8 +3572,7 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
           file_modification_time = f->TryGetOldestAncesterTime();
         }
         if (file_modification_time == kUnknownOldestAncesterTime) {
-          auto file_path = TableFileName(ioptions.cf_paths, f->fd.GetNumber(),
-                                         f->fd.GetPathId());
+          auto file_path = TableFilePathOnStorage(ioptions, *f);
           status = ioptions.env->GetFileModificationTime(
               file_path, &file_modification_time);
           if (!status.ok()) {

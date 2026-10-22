@@ -126,11 +126,15 @@ class MemTable {
   // could never be populated and would give false negatives) and
   // write_buffer_manager may be nullptr so the block is not charged to the
   // write buffer. Refcount starts at 0 like the stock ctor.
+  // [migagent 2026-10-20] num_deletes = number of Deletion / SingleDeletion
+  // entries in the block (the block carries no such count; the installer
+  // counts them in its validation scan), stored in num_deletes_ for the
+  // rocksdb.num-deletes-imm-mem-tables property and the flush event log.
   static MemTable* NewFromExternalSortedBlock(
       const InternalKeyComparator& comparator, const ImmutableOptions& ioptions,
       const MutableCFOptions& mutable_cf_options,
       WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
-      ExternalMemTableBlock&& block);
+      ExternalMemTableBlock&& block, uint64_t num_deletes = 0);
 
   // Increase reference count.
   // REQUIRES: external synchronization to prevent simultaneous
@@ -505,6 +509,12 @@ class MemTable {
 
   uint64_t GetID() const { return id_; }
 
+  // [migagent 2026-10-20] True for a memtable built by
+  // NewFromExternalSortedBlock (an installed ExternalMemTableBlock: no WAL
+  // record, log number stamped at install). FlushJob::PickMemTable clamps the
+  // log number of a flush whose every memtable is such a block.
+  bool IsExternalBlock() const { return is_external_block_; }
+
   void SetFlushCompleted(bool completed) { flush_completed_ = completed; }
 
   uint64_t GetFileNumber() const { return file_number_; }
@@ -565,7 +575,8 @@ class MemTable {
            const ImmutableOptions& ioptions,
            const MutableCFOptions& mutable_cf_options,
            WriteBufferManager* write_buffer_manager, uint32_t column_family_id,
-           SequenceNumber block_smallest_seqno, ExternalMemTableBlock&& block);
+           SequenceNumber block_smallest_seqno, ExternalMemTableBlock&& block,
+           uint64_t num_deletes);
 
   KeyComparator comparator_;
   const ImmutableMemTableOptions moptions_;
@@ -631,6 +642,9 @@ class MemTable {
 
   // Memtable id to track flush.
   uint64_t id_ = 0;
+
+  // [migagent 2026-10-20] Set by the ExternalSortedBlockTag constructor only.
+  bool is_external_block_ = false;
 
   // Sequence number of the atomic flush that is responsible for this memtable.
   // The sequence number of atomic flush is a seq, such that no writes with

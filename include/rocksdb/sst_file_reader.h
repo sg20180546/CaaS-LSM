@@ -7,6 +7,8 @@
 
 #ifndef ROCKSDB_LITE
 
+#include <memory>
+
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
@@ -29,6 +31,13 @@ class SstFileReader {
   // Most read options provide the same control as we read from DB.
   // If "snapshot" is nullptr, the iterator returns only the latest keys.
   Iterator* NewIterator(const ReadOptions& options);
+
+  // [migagent 2026-10-21] Raw entries of the table, tombstones included (NewIterator hides deletions). Seek and
+  // SeekForPrev take USER keys; key() returns the INTERNAL key: the user key followed by 8 bytes, a little-endian
+  // fixed64 (sequence << 8 | value type), e.g. type 0x1 = value, 0x0 = deletion, 0x7 = single deletion. Range
+  // tombstones (a separate meta block) are not returned. Used by the migration agent's L0 copy-extract, which must
+  // carry deletions to the destination. (Upstream later added a similar SstFileReader::NewTableIterator.)
+  std::unique_ptr<Iterator> NewRawIterator(const ReadOptions& options);
 
   std::shared_ptr<const TableProperties> GetTableProperties() const;
 

@@ -385,9 +385,10 @@ bool MemTableList::IsFlushPendingOrRunning() const {
 }
 
 // Returns the memtables that need to be flushed.
-void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
-                                        autovector<MemTable*>* ret,
-                                        uint64_t* max_next_log_number) {
+void MemTableList::PickMemtablesToFlush(
+    uint64_t max_memtable_id, autovector<MemTable*>* ret,
+    uint64_t* max_next_log_number,
+    uint64_t* older_in_progress_max_next_log_number) {
   AutoThreadOperationStageUpdater stage_updater(
       ThreadStatus::STAGE_PICK_MEMTABLES_TO_FLUSH);
   const auto& memlist = current_->memlist_;
@@ -426,6 +427,13 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
       // `flush_in_progress_ == false`. This could happen after parallel flushes
       // are picked and the one flushing older memtables is rolled back.
       break;
+    } else if (older_in_progress_max_next_log_number != nullptr) {
+      // [migagent 2026-10-20] m is older than everything this call will pick
+      // and another flush job is already writing it; that job's result is
+      // installed before ours (TryInstallMemtableFlushResults walks from the
+      // oldest), so our log number must not fall below its NextLogNumber.
+      *older_in_progress_max_next_log_number = std::max(
+          m->GetNextLogNumber(), *older_in_progress_max_next_log_number);
     }
   }
   if (!atomic_flush || num_flush_not_started_ == 0) {

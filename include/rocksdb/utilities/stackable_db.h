@@ -183,6 +183,65 @@ class StackableDB : public DB {
                                          ExternalMemTableBlock&& block) override {
     return db_->InstallExternalMemTable(column_family, std::move(block));
   }
+  // [migagent 2026-10-20] The migration agent (the KV server's relink code in
+  // library mode) is handed a TransactionDB, i.e. a StackableDB. Until now the
+  // relink APIs it calls fell back to the DB base defaults through the wrapper:
+  // EnableFileDeletionsNoFullScan to the FULL-scan EnableFileDeletions (which
+  // re-collects relink-unregistered-but-still-present SSTs: the 0825
+  // double-RequestDelete bug) and GetSnapshotNoBottommostTrigger to a plain
+  // GetSnapshot (arms the bottommost seqno-zeroing sweep); the six below
+  // returned NotSupported. Forward all of them. Overrides of existing DB
+  // virtuals -- no new vtable slots, nothing changes for callers of a DBImpl.
+  virtual Status EnableFileDeletionsNoFullScan(bool force = true) override {
+    return db_->EnableFileDeletionsNoFullScan(force);
+  }
+  // WriteCommitted only: forwards to the base DB, bypassing
+  // WritePreparedTxnDB::GetSnapshotInternal (MyRocks' default policy is
+  // write_committed, where GetSnapshot is a plain forward as well).
+  virtual const Snapshot* GetSnapshotNoBottommostTrigger() override {
+    return db_->GetSnapshotNoBottommostTrigger();
+  }
+  virtual Status StreamTableCacheWarmupEntries(
+      ColumnFamilyHandle* column_family,
+      const std::vector<TableCacheWarmupRequest>& files,
+      size_t max_entry_bytes, const TableCacheWarmupEntryCallback& callback,
+      TableCacheWarmupTransferStats* stats) override {
+    return db_->StreamTableCacheWarmupEntries(column_family, files,
+                                              max_entry_bytes, callback, stats);
+  }
+  virtual Status SnapshotTableCacheWarmupEntries(
+      ColumnFamilyHandle* column_family,
+      const std::vector<TableCacheWarmupRequest>& files,
+      size_t max_entry_bytes,
+      std::vector<TableCacheWarmupSnapshotEntry>* entries,
+      TableCacheWarmupTransferStats* stats) override {
+    return db_->SnapshotTableCacheWarmupEntries(column_family, files,
+                                                max_entry_bytes, entries, stats);
+  }
+  virtual Status InstallExternalTableCacheEntries(
+      ColumnFamilyHandle* column_family,
+      std::vector<ExternalTableCacheEntry>&& entries, size_t max_entry_bytes,
+      TableCacheWarmupTransferStats* stats) override {
+    return db_->InstallExternalTableCacheEntries(
+        column_family, std::move(entries), max_entry_bytes, stats);
+  }
+  virtual Status GetPropertiesOfResidentTables(
+      ColumnFamilyHandle* column_family,
+      std::unordered_map<uint64_t, std::shared_ptr<const TableProperties>>*
+          props) override {
+    return db_->GetPropertiesOfResidentTables(column_family, props);
+  }
+  virtual Status GetBlockCacheKeyPrefixes(
+      ColumnFamilyHandle* column_family,
+      const std::vector<uint64_t>& file_numbers,
+      std::unordered_map<uint64_t, std::string>* prefixes) override {
+    return db_->GetBlockCacheKeyPrefixes(column_family, file_numbers, prefixes);
+  }
+  virtual Status SetBucketBoundaries(
+      ColumnFamilyHandle* column_family,
+      const std::vector<uint64_t>& boundaries) override {
+    return db_->SetBucketBoundaries(column_family, boundaries);
+  }
 
   using DB::CreateColumnFamilyWithImport;
   virtual Status CreateColumnFamilyWithImport(

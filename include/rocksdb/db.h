@@ -2002,8 +2002,16 @@ class DB {
   //    is raised to max(current, largest_seqno) so every later write shadows
   //    the block (post-cutover writes land in the active memtable and win by
   //    seqno and by consult order);
-  //  * one column family per DB (multi-CF DBs are refused: the block reuses
-  //    the active memtable's id and has no WAL record);
+  //  * [migagent 2026-10-20] the DEFAULT column family only (any other ->
+  //    NotSupported); in a DB with more than one column family the block
+  //    must be installed with request_flush = true (-> InvalidArgument
+  //    otherwise: it has no WAL record and the multi-CF flush id fence can
+  //    pick it without the switched active memtable, so its flush is not
+  //    left to the next WAL-driven switch) and carries memtable id
+  //    active - 1 so that fence excludes a memtable switched while its
+  //    flush syncs the closed WALs. ExportMemTableRange
+  //    (rocksdb/external_memtable.h) produces a block from a source DB's
+  //    memtables;
   //  * entries are unique (user key, seqno) pairs in InternalKeyComparator
   //    order (user key asc, seq desc), types Value / Deletion /
   //    SingleDeletion only; no range tombstones, no merge operands, no

@@ -12,13 +12,15 @@
 // Sequence of operations (all under mutex_ + both write queues stopped):
 //   validate -> build MemTable(SortedBlockMemTableRep) -> raise the DB's
 //   last sequence to max(current, block.largest) -> SetNextLogNumber /
-//   SetID (active memtable's id) -> imm()->Add -> new SuperVersion ->
+//   SetID (active memtable's id; active - 1 with >1 CF) -> imm()->Add ->
+//   new SuperVersion ->
 //   (optionally) queue a flush request.
 // On any non-OK return the block is untouched and block.release is NOT
 // called; on success the MemTable owns the block and release() runs exactly
 // once from ~MemTable after the flush result is in the MANIFEST and the last
 // SuperVersion / iterator reference is gone.
 
+#include <cstring>
 #include <algorithm>
 #include <cassert>
 #include <cinttypes>
@@ -30,10 +32,15 @@
 #include "db/job_context.h"
 #include "db/memtable.h"
 #include "db/memtable_list.h"
+#include "db/range_del_aggregator.h"
 #include "db/version_set.h"
 #include "logging/logging.h"
+#include "memory/arena.h"
+#include "rocksdb/comparator.h"
 #include "rocksdb/external_memtable.h"
 #include "rocksdb/status.h"
+#include "table/merging_iterator.h"
+#include "table/scoped_arena_iterator.h"
 #include "util/autovector.h"
 #include "util/cast_util.h"
 #include "util/coding.h"
@@ -65,7 +72,17 @@ bool ParseMemTableEntry(const char* p, const char* limit, Slice* internal_key,
 
 // O(count) over 4-byte offsets plus two entry parses: cheap enough for the
 // install window (~0.3 ms for 700k entries).
-Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
+// [migagent 2026-10-20] ...plus one header parse per entry (varint32 key
+// length, 8-byte tag, varint32 value length; the key and value bytes are not
+// read), still O(count), for the release-mode type check and the tombstone
+// count the memtable's num_deletes_ reports. Before this, a release build
+// trusted the builder and only the debug-only ValidateBlockFull rejected a
+// Merge / blob / wide-column type; a hand-encoded or foreign block could put
+// an entry into the memtable that the read paths cannot interpret.
+Status ValidateBlockCheap(const ExternalMemTableBlock& b,
+                          uint64_t* num_deletes) {
+  assert(num_deletes != nullptr);
+  *num_deletes = 0;
   if (b.data == nullptr || b.offsets == nullptr) {
     return Status::InvalidArgument(
         "InstallExternalMemTable: block data/offsets must not be null");
@@ -119,6 +136,31 @@ Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
         "InstallExternalMemTable: last entry is malformed or exceeds "
         "data_size");
   }
+  // [migagent 2026-10-20] Every entry: header fits its offset slot, type is
+  // one of the three a block may carry, tombstones counted.
+  uint64_t deletes = 0;
+  for (uint64_t i = 0; i < b.count; ++i) {
+    const char* slot_end =
+        (i + 1 < b.count) ? b.data + b.offsets[i + 1] : limit;
+    if (!ParseMemTableEntry(b.data + b.offsets[i], slot_end, &ik, &v, &end) ||
+        end > slot_end) {
+      return Status::InvalidArgument(
+          "InstallExternalMemTable: entry " + std::to_string(i) +
+          " does not fit its offset slot");
+    }
+    const unsigned char type = static_cast<unsigned char>(
+        DecodeFixed64(ik.data() + ik.size() - kNumInternalBytes) & 0xff);
+    if (type == kTypeDeletion || type == kTypeSingleDeletion) {
+      ++deletes;
+    } else if (type != kTypeValue) {
+      return Status::InvalidArgument(
+          "InstallExternalMemTable: entry " + std::to_string(i) +
+          " has value type " + std::to_string(static_cast<unsigned>(type)) +
+          "; only Value (0x1), Deletion (0x0) and SingleDeletion (0x7) are "
+          "allowed in a block");
+    }
+  }
+  *num_deletes = deletes;
   return Status::OK();
 }
 
@@ -126,7 +168,9 @@ Status ValidateBlockCheap(const ExternalMemTableBlock& b) {
 // Full entry walk (debug builds only: O(bytes), ~0.1 s for 780 MB): every
 // entry parses inside its slot, carries an allowed type and a seqno inside
 // the window, and the sequence is strictly increasing in
-// InternalKeyComparator order.
+// InternalKeyComparator order. (Slot fit and type are also checked by
+// ValidateBlockCheap since 2026-10-20; the seqno window and the ordering
+// remain debug-only.)
 Status ValidateBlockFull(const ExternalMemTableBlock& b,
                          const InternalKeyComparator& icmp) {
   const char* limit = b.data + b.data_size;
@@ -181,7 +225,8 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
         "InstallExternalMemTable: column_family must not be null");
   }
   // ---- 1. Validate WITHOUT consuming the block (no release() on failure).
-  Status s = ValidateBlockCheap(block);
+  uint64_t num_deletes = 0;
+  Status s = ValidateBlockCheap(block, &num_deletes);
   if (!s.ok()) {
     return s;
   }
@@ -244,18 +289,32 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
 
     const MutableCFOptions* mopts = cfd->GetLatestMutableCFOptions();
     seq_before = versions_->LastSequence();
+    const size_t num_cfs =
+        versions_->GetColumnFamilySet()->NumberOfColumnFamilies();
     if (cfd->IsDropped()) {
       s = Status::InvalidArgument(
           "InstallExternalMemTable: column family is dropped");
-    } else if (versions_->GetColumnFamilySet()->NumberOfColumnFamilies() > 1) {
-      // Single-CF only (review 2026-09-24): the block reuses the active
-      // memtable's id and carries no WAL record; with several column
-      // families the flush id fence (needs_to_sync_closed_wals) and the
-      // per-CF WAL floor could both be defeated. The relink driver runs one
-      // column family per shard DB.
+    } else if (cfd != default_cf_handle_->cfd()) {
+      // [migagent 2026-10-20] Default column family only. The single-CF
+      // refusal of review 2026-09-24 (the block reuses a memtable id and
+      // carries no WAL record, so the multi-CF flush id fence and the per-CF
+      // WAL floor needed care) is replaced by the two multi-CF rules below
+      // plus the id fence fix in step 5: MyRocks opens {default, __system__}
+      // and the migration agent installs into default only.
       s = Status::NotSupported(
-          "InstallExternalMemTable: DBs with more than one column family "
-          "are not supported");
+          "InstallExternalMemTable: only the default column family is "
+          "supported");
+    } else if (num_cfs > 1 && !request_flush) {
+      // [migagent 2026-10-20] With several column families the block must be
+      // flushed by its own request. request_flush == false relies on the
+      // next memtable switch to co-flush the block with the active memtable,
+      // but with >1 CF the flush id fence (needs_to_sync_closed_wals, see
+      // FlushMemTableToOutputFile) can pick the block without the switched
+      // memtable, and the block is the only memtable without WAL records, so
+      // its flush must not be left to a WAL-driven schedule.
+      s = Status::InvalidArgument(
+          "InstallExternalMemTable: request_flush must be true when the DB "
+          "has more than one column family");
     } else if (mopts->memtable_protection_bytes_per_key != 0) {
       // MemTableIterator verifies a per-entry checksum the block does not
       // carry (db/memtable.cc VerifyEntryChecksum).
@@ -294,7 +353,8 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       // not charged to the write buffer manager).
       mem = MemTable::NewFromExternalSortedBlock(
           cfd->internal_comparator(), *cfd->ioptions(), *mopts,
-          nullptr /* write_buffer_manager */, cfd->GetID(), std::move(block));
+          nullptr /* write_buffer_manager */, cfd->GetID(), std::move(block),
+          num_deletes);
       // No range tombstones => no-op, but keeps the immutable-list invariant
       // (IsFragmentedRangeTombstonesConstructed) explicit like SwitchMemtable.
       mem->ConstructFragmentedRangeTombstones();
@@ -354,7 +414,19 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
       // fresh id larger than the active's would be skipped by
       // PickMemtablesToFlush (breaks on id > request max) and strand the
       // block. Duplicate ids are tolerated by every id comparison.
-      memtable_id = cfd->mem()->GetID();
+      //
+      // [migagent 2026-10-20] With more than one column family and a WAL,
+      // FlushMemTableToOutputFile fences the pick at
+      // imm()->GetLatestMemTableID() (= this block's id, it is the newest
+      // immutable) BEFORE SyncClosedLogs drops the mutex; a memtable switched
+      // during that window keeps the active's id and, if the block carried
+      // the same id, would pass the fence although its WAL is unsynced. The
+      // active's id is >= 1 (ColumnFamilyData::SetMemtable mints from 1), and
+      // every existing immutable has an id <= active - 1, so active - 1 is
+      // the block's own position in the list. Single-CF DBs never fence
+      // (max id = UINT64_MAX) and keep the active's id as before.
+      const uint64_t active_id = cfd->mem()->GetID();
+      memtable_id = (num_cfs > 1) ? active_id - 1 : active_id;
       mem->SetID(memtable_id);
       // The immutable list takes over this reference (MemTableList::Add
       // does not Ref).
@@ -404,6 +476,232 @@ Status DBImpl::InstallExternalMemTable(ColumnFamilyHandle* column_family,
                    largest, seq_before, versions_->LastSequence(),
                    imm_unflushed, request_flush ? 1 : 0);
   }
+  return s;
+}
+
+// [migagent 2026-10-20] Source-side typed export, see
+// include/rocksdb/external_memtable.h for the contract. A free function (no
+// vtable slot): the migration agent links against librocksdb.so and reaches
+// the DBImpl through GetRootDB(), the same unwrapping as
+// utilities/sst_access_stats.cc. The walk is DBImpl::NewInternalIterator's
+// memtable half (mem->NewIterator + imm->AddIterators into a
+// MergeIteratorBuilder, no SST level) under a referenced SuperVersion; the
+// range-tombstone check uses the same ReadRangeDelAggregator the read path
+// builds, so the only mutex use is the SuperVersion unref.
+Status ExportMemTableRange(DB* db, ColumnFamilyHandle* cf, const Slice& begin,
+                           const Slice& end, const Snapshot* snapshot,
+                           SequenceNumber block_seq, size_t max_data_bytes,
+                           ExternalMemTableBlockBuilder* out,
+                           uint64_t* num_deletes) {
+  if (num_deletes != nullptr) {
+    *num_deletes = 0;
+  }
+  if (db == nullptr || cf == nullptr || out == nullptr) {
+    return Status::InvalidArgument(
+        "ExportMemTableRange: db, cf and out must not be null");
+  }
+  if (block_seq == 0 || block_seq > kMaxSequenceNumber) {
+    // InstallExternalMemTable requires smallest_seqno >= 1.
+    return Status::InvalidArgument(
+        "ExportMemTableRange: block_seq must be in [1, kMaxSequenceNumber]");
+  }
+  DB* root = db->GetRootDB();
+#ifdef ROCKSDB_USE_RTTI
+  DBImpl* impl = dynamic_cast<DBImpl*>(root);
+#else
+  DBImpl* impl = static_cast<DBImpl*>(root);
+#endif
+  if (impl == nullptr) {
+    return Status::InvalidArgument(
+        "ExportMemTableRange: the root DB is not a DBImpl");
+  }
+  auto* cfd = static_cast_with_check<ColumnFamilyHandleImpl>(cf)->cfd();
+  const InternalKeyComparator& icmp = cfd->internal_comparator();
+  const Comparator* ucmp = icmp.user_comparator();
+  if (ucmp->timestamp_size() != 0) {
+    return Status::NotSupported(
+        "ExportMemTableRange: user-defined timestamps are not supported");
+  }
+  if (strcmp(ucmp->Name(), "leveldb.BytewiseComparator") != 0) {
+    // the block format (and the builder's ordering check) assume bytewise order
+    return Status::NotSupported(
+        "ExportMemTableRange: bytewise comparator required, CF uses " +
+        std::string(ucmp->Name()));
+  }
+  if (ucmp->Compare(begin, end) >= 0) {
+    return Status::OK();  // empty range
+  }
+  const SequenceNumber snap_seq =
+      snapshot != nullptr ? snapshot->GetSequenceNumber() : kMaxSequenceNumber;
+
+  SuperVersion* sv = impl->GetAndRefSuperVersion(cfd);
+  Status s;
+  {
+    ReadOptions ro;
+    ro.total_order_seek = true;
+    ro.snapshot = snapshot;  // read_seq of the immutable tombstone iterators
+    Arena arena;
+
+    // ---- Range tombstones: a block cannot carry one, so any tombstone
+    // (at or below the snapshot) overlapping the range refuses the export.
+    {
+      ReadRangeDelAggregator range_del_agg(&icmp, snap_seq);
+      std::unique_ptr<FragmentedRangeTombstoneIterator> mem_tombstones(
+          sv->mem->NewRangeTombstoneIterator(ro, snap_seq,
+                                             false /* immutable_memtable */));
+      range_del_agg.AddTombstones(std::move(mem_tombstones));
+      s = sv->imm->AddRangeTombstoneIterators(ro, &arena, &range_del_agg);
+      if (s.ok() && !range_del_agg.IsEmpty() &&
+          range_del_agg.IsRangeOverlapped(begin, end)) {
+        s = Status::NotSupported(
+            "ExportMemTableRange: a range tombstone overlaps the exported "
+            "range");
+      }
+    }
+
+    if (s.ok()) {
+      // ---- Point entries: user key ascending, sequence descending.
+      MergeIteratorBuilder builder(&icmp, &arena, false /* prefix_seek_mode */);
+      builder.AddIterator(sv->mem->NewIterator(ro, &arena));
+      sv->imm->AddIterators(ro, &builder, false /* add_range_tombstone_iter */);
+      ScopedArenaIterator iter(builder.Finish());
+      InternalKey seek_key(begin, kMaxSequenceNumber, kValueTypeForSeek);
+      iter->Seek(seek_key.Encode());
+
+      // The user key being assembled: its newest surviving version decides
+      // the output; the older surviving versions only matter for the
+      // SingleDeletion rules and the Merge / type checks.
+      bool have_cur = false;
+      std::string cur_key;
+      ValueType cur_type = kTypeValue;
+      std::string cur_value;
+      bool cur_has_older = false;
+      bool cur_older_single_deletion = false;
+      size_t bytes_added = 0;
+      uint64_t deletes = 0;
+      bool budget_hit = false;
+
+      auto emit_cur = [&]() -> Status {
+        ValueType out_type = kTypeValue;
+        if (cur_type == kTypeValue) {
+          if (cur_older_single_deletion) {
+            return Status::NotSupported(
+                "ExportMemTableRange: key has a Value over an older "
+                "SingleDeletion in the memtables (" +
+                Slice(cur_key).ToString(true) + ")");
+          }
+          out_type = kTypeValue;
+        } else if (cur_type == kTypeDeletion) {
+          out_type = kTypeDeletion;
+        } else {
+          assert(cur_type == kTypeSingleDeletion);
+          out_type = cur_has_older ? kTypeDeletion : kTypeSingleDeletion;
+        }
+        const Slice v = (out_type == kTypeValue) ? Slice(cur_value) : Slice();
+        // ExternalMemTableBlockBuilder::Add's encoded size.
+        const uint32_t internal_key_size =
+            static_cast<uint32_t>(cur_key.size()) + kNumInternalBytes;
+        const size_t encoded = VarintLength(internal_key_size) +
+                               internal_key_size +
+                               VarintLength(static_cast<uint32_t>(v.size())) +
+                               v.size();
+        if (max_data_bytes != 0 && bytes_added > 0 &&
+            bytes_added + encoded > max_data_bytes) {
+          budget_hit = true;  // the entry stays unexported; resume from it
+          return Status::OK();
+        }
+        out->Add(cur_key, block_seq, out_type, v);
+        if (!out->status().ok()) {
+          return out->status();  // the builder drops entries once poisoned; surface it now
+        }
+        bytes_added += encoded;
+        if (out_type != kTypeValue) {
+          ++deletes;
+        }
+        return Status::OK();
+      };
+
+      for (; iter->Valid(); iter->Next()) {
+        ParsedInternalKey pik;
+        s = ParseInternalKey(iter->key(), &pik, false /* log_err_key */);
+        if (!s.ok()) {
+          break;  // Corruption
+        }
+        if (ucmp->Compare(pik.user_key, end) >= 0) {
+          break;
+        }
+        if (pik.sequence > snap_seq) {
+          continue;  // newer than the snapshot: not part of the cut
+        }
+        if (have_cur && ucmp->Equal(pik.user_key, cur_key)) {
+          // An older surviving version of the key being assembled.
+          cur_has_older = true;
+          if (pik.type == kTypeSingleDeletion) {
+            cur_older_single_deletion = true;
+          } else if (pik.type == kTypeMerge) {
+            s = Status::NotSupported(
+                "ExportMemTableRange: merge operand in the memtables (" +
+                pik.user_key.ToString(true) + ")");
+            break;
+          } else if (pik.type != kTypeValue && pik.type != kTypeDeletion) {
+            s = Status::Corruption(
+                "ExportMemTableRange: unexpected value type " +
+                std::to_string(static_cast<unsigned>(pik.type)) +
+                " in the memtables");
+            break;
+          }
+          continue;
+        }
+        if (have_cur) {
+          s = emit_cur();
+          if (!s.ok() || budget_hit) {
+            break;
+          }
+        }
+        // Newest surviving version of a new user key.
+        if (pik.type == kTypeMerge) {
+          s = Status::NotSupported(
+              "ExportMemTableRange: merge operand in the memtables (" +
+              pik.user_key.ToString(true) + ")");
+          break;
+        } else if (pik.type != kTypeValue && pik.type != kTypeDeletion &&
+                   pik.type != kTypeSingleDeletion) {
+          s = Status::Corruption("ExportMemTableRange: unexpected value type " +
+                                 std::to_string(static_cast<unsigned>(pik.type)) +
+                                 " in the memtables");
+          break;
+        }
+        have_cur = true;
+        cur_key.assign(pik.user_key.data(), pik.user_key.size());
+        cur_type = pik.type;
+        if (pik.type == kTypeValue) {
+          const Slice v = iter->value();
+          cur_value.assign(v.data(), v.size());
+        } else {
+          cur_value.clear();
+        }
+        cur_has_older = false;
+        cur_older_single_deletion = false;
+      }
+      if (s.ok()) {
+        s = iter->status();
+      }
+      if (s.ok() && have_cur && !budget_hit) {
+        s = emit_cur();
+      }
+      if (s.ok() && budget_hit) {
+        s = Status::Incomplete(
+            "ExportMemTableRange: max_data_bytes reached; resume from "
+            "last_user_key() + '\\0'");
+      }
+      if (num_deletes != nullptr) {
+        *num_deletes = deletes;
+      }
+    }
+    // Iterators (arena) and the aggregator are destroyed here, before the
+    // SuperVersion that pins their memtables is released.
+  }
+  impl->ReturnAndCleanupSuperVersion(cfd, sv);
   return s;
 }
 
