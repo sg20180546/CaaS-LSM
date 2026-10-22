@@ -86,6 +86,44 @@ Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
   return res;
 }
 
+namespace {
+// [migagent 2026-10-21] Public Iterator over a TableReader's InternalIterator (heap-allocated, owned): raw entries,
+// internal keys out, user keys in (Seek / SeekForPrev build the internal seek key).
+class SstRawIterator : public Iterator {
+ public:
+  explicit SstRawIterator(InternalIterator* iter) : iter_(iter) {}
+  ~SstRawIterator() override { delete iter_; }
+  bool Valid() const override { return iter_->Valid(); }
+  void SeekToFirst() override { iter_->SeekToFirst(); }
+  void SeekToLast() override { iter_->SeekToLast(); }
+  void Seek(const Slice& user_key) override {
+    InternalKey ik(user_key, kMaxSequenceNumber, kValueTypeForSeek);
+    iter_->Seek(ik.Encode());
+  }
+  void SeekForPrev(const Slice& user_key) override {
+    InternalKey ik(user_key, 0, static_cast<ValueType>(0));
+    iter_->SeekForPrev(ik.Encode());
+  }
+  void Next() override { iter_->Next(); }
+  void Prev() override { iter_->Prev(); }
+  Slice key() const override { return iter_->key(); }
+  Slice value() const override { return iter_->value(); }
+  Status status() const override { return iter_->status(); }
+
+ private:
+  InternalIterator* iter_;
+};
+}  // namespace
+
+std::unique_ptr<Iterator> SstFileReader::NewRawIterator(const ReadOptions& roptions) {
+  auto r = rep_.get();
+  InternalIterator* internal_iter = r->table_reader->NewIterator(
+      roptions, r->moptions.prefix_extractor.get(), /*arena=*/nullptr,
+      false /* skip_filters */, TableReaderCaller::kSSTFileReader);
+  if (internal_iter == nullptr) return nullptr;
+  return std::unique_ptr<Iterator>(new SstRawIterator(internal_iter));
+}
+
 std::shared_ptr<const TableProperties> SstFileReader::GetTableProperties()
     const {
   return rep_->table_reader->GetTableProperties();
