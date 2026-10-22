@@ -261,18 +261,34 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     return grpc::Status::OK;
   }
 
+  // [untracked link 2026-10-21] A link to a path the CP has never seen created (no NotifyCreate: the file predates
+  // the CP's tracking, e.g. a MyRocks bulk load, or was created before the CN armed STORAGE_CP_ADDR) also counts the
+  // SOURCE's reference: the source exported it from its live version, so it still holds the file and sends its own
+  // RequestDelete when it drops it. Counting the link alone let that drop zero the count while the destination still
+  // served the file, and the GC deleted it (2026-10-21 17:39 MST, MyRocks fence smoke: /kg/sql53/001879.sst, mysqld
+  // on 54 aborted; it stayed hidden while the source was idle and never purged). Tracked paths: plain ++ as before.
+  // Returns the extra count added (0 or 1) for the log line.
+  static int LinkRefLocked(const std::string& path, uint32_t shard, RefEntry** out) {
+    auto ins = storage_refcount_map_.try_emplace(path);
+    RefEntry& e = ins.first->second;
+    const int implicit = ins.second ? 1 : 0;   // fresh entry = untracked until now
+    e.count += 1 + implicit;
+    e.owners.insert(shard);  // debug only
+    *out = &e;
+    return implicit;
+  }
+
   // Logical link of an already-existing shared SST into another shard (relink).
-  // PLAIN COUNT (++) like NotifyCreate.
+  // PLAIN COUNT (++) like NotifyCreate (+1 for the source when the path was untracked, see LinkRefLocked).
   grpc::Status NotifyLink(grpc::ServerContext* context,
                           const compactionservice::FileRef* request,
                           google::protobuf::Empty* response) override {
     std::lock_guard<std::mutex> lock(storage_latch_);
-    auto& e = storage_refcount_map_[request->path()];
-    e.count++;
-    e.owners.insert(request->shard_id());  // debug only
+    RefEntry* e = nullptr;
+    const int implicit = LinkRefLocked(request->path(), request->shard_id(), &e);
     std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path()
-              << " shard=" << request->shard_id() << " refcount=" << e.count
-              << std::endl;
+              << " shard=" << request->shard_id() << " refcount=" << e->count
+              << (implicit ? " (untracked: +1 source ref)" : "") << std::endl;
     return grpc::Status::OK;
   }
 
@@ -288,12 +304,12 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     std::lock_guard<std::mutex> lock(storage_latch_);
     const int n = request->path_size();
     for (int i = 0; i < n; i++) {
-      auto& e = storage_refcount_map_[request->path(i)];
-      e.count++;
-      e.owners.insert(request->shard_id());  // debug only
+      RefEntry* e = nullptr;
+      const int implicit = LinkRefLocked(request->path(i), request->shard_id(), &e);
       std::cout << GetTime() << "[storage] NotifyLink   path=" << request->path(i)
-                << " shard=" << request->shard_id() << " refcount=" << e.count
-                << " (batch " << (i + 1) << "/" << n << ")\n";
+                << " shard=" << request->shard_id() << " refcount=" << e->count
+                << " (batch " << (i + 1) << "/" << n << ")"
+                << (implicit ? " (untracked: +1 source ref)" : "") << "\n";
     }
     std::cout << GetTime() << "[storage] link-batch n=" << n
               << " shard=" << request->shard_id() << std::endl;
