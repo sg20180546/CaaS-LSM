@@ -8,6 +8,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #pragma once
 
+#include <mutex>
 #include <atomic>
 #include <deque>
 #include <functional>
@@ -1362,6 +1363,9 @@ class DBImpl : public DB {
   // `mutex_` can be a hot lock in some workloads, so it deserves dedicated
   // cachelines.
   mutable CacheAlignedInstrumentedMutex mutex_;
+  // [options persist 2026-11-02] serializes SetOptions() option-file writes (replaces the write-thread entry in
+  // WriteOptionsFile for that caller); always taken BEFORE mutex_, never while holding it.
+  std::mutex options_persist_mu_;
 
   ColumnFamilyHandleImpl* default_cf_handle_;
   InternalStats* default_cf_internal_stats_;

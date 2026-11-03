@@ -1190,6 +1190,11 @@ Status DBImpl::SetOptions(
   Status persist_options_status;
   SuperVersionContext sv_context(/* create_superversion */ true);
   {
+    // [options persist 2026-11-02] Serialize concurrent SetOptions() calls here instead of entering the write
+    // thread inside WriteOptionsFile(): with a writer parked in a write stop, EnterUnbatched waits behind it, so a
+    // SetOptions() that keeps or re-arms the stop (the stall-trigger RESTORE at the live export) blocked until the
+    // stop cleared by itself (51 s in the 11-02 IBM072 live cell). Taken before mutex_, never the other way round.
+    std::lock_guard<std::mutex> persist_guard(options_persist_mu_);
     auto db_options = GetDBOptions();
     InstrumentedMutexLock l(&mutex_);
     s = cfd->SetOptions(db_options, options_map);
@@ -1211,7 +1216,7 @@ Status DBImpl::SetOptions(
       bg_cv_.SignalAll();
 
       persist_options_status = WriteOptionsFile(
-          false /*need_mutex_lock*/, true /*need_enter_write_thread*/);
+          false /*need_mutex_lock*/, false /*need_enter_write_thread: options_persist_mu_ serializes instead*/);
       bg_cv_.SignalAll();
     }
   }
