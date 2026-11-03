@@ -1203,6 +1203,12 @@ Status DBImpl::SetOptions(
       // options to file, otherwise there will be a deadlock with writer
       // thread.
       InstallSuperVersionAndScheduleWork(cfd, &sv_context, new_options);
+      // [lift-stall wake 2026-11-02] A writer parked in DelayWrite (write stop) sleeps on bg_cv_, and
+      // WriteOptionsFile below enters the write thread BEHIND it. Without this wake-up the lifted stall
+      // limits only take effect when an unrelated background job signals bg_cv_ (18 s in the 11-02
+      // IBM072 live cell: OP_STOPGO_LIFT -> SetOptions waited for compaction JOB 3006). A spurious
+      // wake-up is harmless: DelayWrite re-checks write_controller_.IsStopped().
+      bg_cv_.SignalAll();
 
       persist_options_status = WriteOptionsFile(
           false /*need_mutex_lock*/, true /*need_enter_write_thread*/);
