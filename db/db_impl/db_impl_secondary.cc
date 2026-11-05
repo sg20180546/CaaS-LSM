@@ -876,6 +876,11 @@ Status DB::OpenAndCompact(
 
   compaction_input.db_options.max_open_files = -1;
   compaction_input.db_options.compaction_service = nullptr;
+  // [ft 2026-11-05] The remote compaction worker compacts the listed input files only; it never reads
+  // the primary's WAL. A CN whose WAL lives on a node-local disk (wal_dir outside the shared store)
+  // ships that path in db_options, and FindNewLogNumbers() would fail the whole task with
+  // "Failed to open wal_dir" (CSA on 87/88, 2026-11-05). Open the secondary against the DB dir instead.
+  compaction_input.db_options.wal_dir.clear();
   if (compaction_input.db_options.statistics) {
     compaction_input.db_options.statistics.reset();
   }
