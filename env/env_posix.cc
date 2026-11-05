@@ -73,6 +73,7 @@
 
 #ifdef HDFS
 #include "plugin/hdfs/env_hdfs.h"
+#include "plugin/hdfs/env_local_route.h"
 #endif
 
 #if !defined(TMPFS_MAGIC)
@@ -425,7 +426,15 @@ PosixEnv::PosixEnv()
   std::shared_ptr<FileSystem> fs;
   Status s = NewHdfsFileSystem(options.hdfs_address, &fs);
   assert(s.ok());
-  file_system_ = std::move(fs);
+  // [ft 2026-11-04] ROCKSDB_LOCAL_PREFIX=<absolute local dir>: paths under it stay on the Posix file system
+  // (DBOptions::wal_dir on the compute node's NVMe for the failure-tolerance cells). Unset = HDFS for everything.
+  const char* local_prefix = getenv("ROCKSDB_LOCAL_PREFIX");
+  if (local_prefix != nullptr && local_prefix[0] == '/') {
+    file_system_ = std::make_shared<PrefixRoutingFileSystem>(fs, FileSystem::Default(), std::string(local_prefix));
+    fprintf(stderr, "[env] ROCKSDB_LOCAL_PREFIX=%s: paths under it use the local file system\n", local_prefix);
+  } else {
+    file_system_ = std::move(fs);
+  }
 #endif
   ThreadPoolImpl::PthreadCall("mutex_init", pthread_mutex_init(&mu_, nullptr));
   for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
