@@ -666,6 +666,9 @@ int main() {
   }
   std::cout << GetTime() << "Server listening on " << server_address
             << " (port=" << selected_port << ")" << std::endl;
+  std::cout << "[ft] t4 om_ready epoch_ms="
+            << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()
+            << " durable=" << (storage_registry_ ? 1 : 0) << std::endl;   // [ft 2026-11-05] registry recovered + port bound
   std::thread scheduler(ConsumeTask);
   std::thread monitor(UpdateCSAStatus);
   if (storage_registry_) std::thread(RunStorageGC).detach();

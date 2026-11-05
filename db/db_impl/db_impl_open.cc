@@ -6,7 +6,9 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
+#include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 
 #include "db/builder.h"
 #include "db/compaction/compaction_service.h"
@@ -1048,6 +1050,20 @@ Status DBImpl::RecoverLogFiles(const std::vector<uint64_t>& wal_numbers,
                                SequenceNumber* next_sequence, bool read_only,
                                bool* corrupted_wal_found,
                                RecoveryContext* recovery_ctx) {
+  // [ft 2026-11-05] FT_TRACE=1: the WAL-replay span of a restart, on stderr with epoch milliseconds (the harness splits
+  // "engine restart" into DB open and WAL replay from it; the info LOG is not always readable after a crash).
+  struct FtReplayTrace {
+    size_t n; std::chrono::system_clock::time_point t0; bool on;
+    explicit FtReplayTrace(size_t wals) : n(wals), t0(std::chrono::system_clock::now()), on(std::getenv("FT_TRACE") != nullptr) {
+      if (on) std::fprintf(stderr, "[ft] t4w wal_replay_begin epoch_ms=%lld wals=%zu\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t0.time_since_epoch()).count(), n);
+    }
+    ~FtReplayTrace() {
+      if (!on) return;
+      const auto t1 = std::chrono::system_clock::now();
+      std::fprintf(stderr, "[ft] t4w wal_replay_end epoch_ms=%lld ms=%.1f wals=%zu\n", (long long)std::chrono::duration_cast<std::chrono::milliseconds>(t1.time_since_epoch()).count(),
+                   std::chrono::duration<double, std::milli>(t1 - t0).count(), n);
+    }
+  } ft_replay_trace(wal_numbers.size());
   struct LogReporter : public log::Reader::Reporter {
     Env* env;
     Logger* info_log;
