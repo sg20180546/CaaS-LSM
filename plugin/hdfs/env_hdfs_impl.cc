@@ -579,6 +579,16 @@ int StorageRpcTimeoutMs() {
   return end != value && *end == '\0' && ms > 0 && ms <= 60000
              ? static_cast<int>(ms) : 5000;
 }
+// [ft 2026-11-04] STORAGE_CP_RPC_ATTEMPTS (default 3, 1..1000000): under the fail-stop model the Storage-CP
+// restarts within seconds, so a failure-tolerance cell retries transport errors until it answers instead of
+// failing the publication after three tries. Only UNAVAILABLE / DEADLINE_EXCEEDED are retried (unchanged).
+int StorageRpcAttempts() {
+  const char* value = std::getenv("STORAGE_CP_RPC_ATTEMPTS");
+  if (!value) return 3;
+  char* end = nullptr;
+  long n = std::strtol(value, &end, 10);
+  return end != value && *end == '\0' && n > 0 && n <= 1000000 ? static_cast<int>(n) : 3;
+}
 void TracePublication(const char* phase, const std::vector<std::string>& paths) {
   if (!sst_creation_trace::Enabled()) return;
   for (const auto& path : paths) {
@@ -603,7 +613,8 @@ Status HdfsFileSystem::CallStorageBatch(
   req.set_shard_id(storage_cp_shard_);
   req.set_operation_id(StorageOperationId());
   grpc::Status result;
-  for (int attempt = 0; attempt != 3; ++attempt) {
+  const int attempts = StorageRpcAttempts();
+  for (int attempt = 0; attempt != attempts; ++attempt) {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() +
                      std::chrono::milliseconds(StorageRpcTimeoutMs()));
@@ -615,7 +626,7 @@ Status HdfsFileSystem::CallStorageBatch(
     else if (op == "AbortUnpublished") result = client->stub->AbortUnpublished(&ctx, req, &reply);
     else if (op == "RecoverReferences") result = client->stub->RecoverReferences(&ctx, req, &reply);
     else return Status::InvalidArgument("Unknown Storage-CP operation", op);
-    const bool retry = !result.ok() && attempt != 2 &&
+    const bool retry = !result.ok() && attempt != attempts - 1 &&
         (result.error_code() == grpc::StatusCode::UNAVAILABLE ||
          result.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED);
     timer.Finish(operation, req.path(0), result.ok(), req.path_size(),
@@ -623,7 +634,7 @@ Status HdfsFileSystem::CallStorageBatch(
     LogStorageRpc(operation, req.path(0), result.ok(), result.error_message());
     if (result.ok()) return Status::OK();
     if (!retry) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10 << attempt));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10 << std::min(attempt, 7)));   // [ft] capped at 1.28 s
   }
   return Status::IOError(std::string("Storage-CP ") + operation, result.error_message());
 }

@@ -407,8 +407,12 @@ class Registry {
           throw Error(ErrorCode::FailedPrecondition, "SST path already retired or belongs to a different birth: " + path);
         }
       } else if (record.kind == Kind::Link) {
+        // [ft 2026-11-04] An owner that released this path earlier may link it AGAIN when the link carries an
+        // operation id (a later migration of the same range back to that shard). Safe under the FT model: the
+        // Migration Module serializes migrations per range and a crashed releaser retries its release (idempotent
+        // per owner, see Apply) BEFORE the next migration starts, so no old release can trail the new link.
         if (!entry || entry->state != State::Active || entry->aborted || !entry->born ||
-            entry->released_by.count(record.owner)) {
+            (entry->released_by.count(record.owner) && record.operation_id.empty())) {
           throw Error(ErrorCode::FailedPrecondition, "link requires a known live immutable SST: " + path);
         }
         const uint64_t additions = ++link_additions[path];
@@ -453,8 +457,12 @@ class Registry {
         }
       } else if (record.kind == Kind::Link) {
         entry.linked_refs[record.owner]++; entry.count++;
-        // No reference-generation token exists in legacy RequestDelete. Never
-        // re-arm a released owner: a delayed old release could eat the new ref.
+        // [ft 2026-11-04] a re-link by a previously-releasing owner (allowed only with an operation id, see
+        // Validate) re-arms that owner: its earlier release is complete and will not be retried after the
+        // next migration started (MM-serialized), so the fence that guarded a trailing old release is lifted.
+        if (!record.operation_id.empty() && entry.released_by.erase(record.owner)) {
+          entry.last_release_sequence.erase(record.owner);
+        }
       } else if (record.kind == Kind::Release) {
         if (entry.state != State::Active || entry.released_by.count(record.owner)) continue;
         auto linked = entry.linked_refs.find(record.owner);
