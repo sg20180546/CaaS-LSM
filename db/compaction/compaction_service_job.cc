@@ -17,6 +17,7 @@
 #include "monitoring/thread_status_util.h"
 #include "options/options_helper.h"
 #include "plugin/hdfs/storage_cp_hook.h"
+#include "rocksdb/storage_cp_release.h"
 #include "rocksdb/utilities/options_type.h"
 
 #ifndef ROCKSDB_LITE
@@ -37,6 +38,14 @@ CompactionJob::ProcessKeyValueCompactionWithCompactionService(
 
   const std::vector<CompactionInputFiles>& inputs =
       *(compact_->compaction->inputs());
+
+  // [ft 2026-11-05] a migration's PREPARE discards the stale remnants of a returning range through the OwnershipFilter,
+  // which only exists in this process: while the switch is set, compactions stay local (storage_cp_release.h).
+  if (StorageCpForceLocalCompactionsCount() > 0) {
+    ROCKS_LOG_INFO(db_options_.info_log, "[%s] [JOB %d] force-local switch set -> local compaction",
+                   compact_->compaction->column_family_data()->GetName().c_str(), job_id_);
+    return CompactionServiceJobStatus::kUseLocal;
+  }
 
   // [relink] Compactions whose INPUTS are in-place external references
   // (external_path) or carry a read-time GSN override run LOCALLY: the remote

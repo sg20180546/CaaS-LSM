@@ -15,4 +15,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 Status StorageCpReleaseReferences(Env* env, const std::vector<std::string>& paths);
+// [ft 2026-11-05] While the counter is > 0 every compaction of this process runs locally instead of on the remote
+// compaction service (whose DB open has no compaction filter): a migration's PREPARE uses it to discard the stale
+// remnants of a returning key range through the OwnershipFilter (CompactFiles, intra-L0). delta = +1 / -1.
+void StorageCpForceLocalCompactions(int delta);
+int StorageCpForceLocalCompactionsCount();
 }  // namespace ROCKSDB_NAMESPACE

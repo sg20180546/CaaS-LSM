@@ -1264,9 +1264,16 @@ Status SystemClock::CreateFromString(const ConfigOptions& config_options,
 }  // namespace ROCKSDB_NAMESPACE
 
 // [ft 2026-11-04] non-HDFS builds: no Storage-CP, nothing to release (the HDFS plugin defines the real one).
-#ifndef HDFS
 #include "rocksdb/storage_cp_release.h"
+#ifndef HDFS
 namespace ROCKSDB_NAMESPACE {
 Status StorageCpReleaseReferences(Env*, const std::vector<std::string>&) { return Status::OK(); }
 }  // namespace ROCKSDB_NAMESPACE
 #endif
+// [ft 2026-11-05] force-local compaction switch (see storage_cp_release.h); every build.
+#include <atomic>
+namespace ROCKSDB_NAMESPACE {
+static std::atomic<int> g_storage_cp_force_local_compactions{0};
+void StorageCpForceLocalCompactions(int delta) { g_storage_cp_force_local_compactions.fetch_add(delta, std::memory_order_acq_rel); }
+int StorageCpForceLocalCompactionsCount() { return g_storage_cp_force_local_compactions.load(std::memory_order_acquire); }
+}  // namespace ROCKSDB_NAMESPACE
