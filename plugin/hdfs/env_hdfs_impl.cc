@@ -924,7 +924,10 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
     LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
     if (!s.ok()) return IOStatus::IOError("Storage-CP release", s.error_message());
     publication_.Set({fname}, State::kReleased);
-    ft_crash::Check("src_after_release");   // [ft] a purge that released one file and died (step 7 mid-way)
+    // [ft 2026-11-05] NOT the step-7 point: this path serves every obsolete-file purge of the shard (compactions delete files
+    // all the time), and an armed "src_after_release" fired on a compaction 16 s before the migration (full cell 1105_fts_5
+    // migration 8). The step-7 point is the server's, after EnableFileDeletions issued the migration's releases.
+    ft_crash::Check("src_after_release_any_file");
     // Physical SST deletion belongs exclusively to CP, even if an old server
     // responds deleted=true. There is deliberately no unsafe client fallback.
     return IOStatus::OK();
