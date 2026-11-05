@@ -311,8 +311,9 @@ class StorageImpl final : public compactionservice::StorageService::Service {
                              compactionservice::DeleteReply* reply) override {
     reply->set_deleted(false);  // No Storage RPC ever authorizes client-side HDFS deletion.
     return StorageCall([&](ownership_cp::Registry& registry) {
+      const bool shared_before = registry.Inspect(request->path()).count > 1;   // [ft] a relinked file (step 7), not a compaction input
       const auto result = registry.Release(request->path(), request->shard_id());
-      ft_crash::Check("om_after_release");   // [ft] the release is durable, the reply is not sent
+      if (shared_before) ft_crash::Check("om_after_release");   // [ft] the release is durable, the reply is not sent
       reply->set_refcount(static_cast<int>(std::min<uint64_t>(result.count, std::numeric_limits<int>::max())));
       if (result.unknown) {
         std::cout << GetTime() << "[storage] ★UNTRACKED RequestDelete path=" << request->path()
