@@ -558,9 +558,10 @@ void HdfsFileSystem::LogStorageRpc(const char* op, const std::string& path,
   constexpr uint64_t kLogFirst = 5, kLogEvery = 1000;
   uint64_t n = ok ? ++n_ok : ++n_err;
   if (n <= kLogFirst || n % kLogEvery == 0) {
-    fprintf(stderr, "[storage-cp] %s %s %s (#%llu)%s%s\n", op,
+    fprintf(stderr, "[storage-cp] %s %s %s (#%llu)%s%s t=%lld\n", op,
             ok ? "ok" : "FAILED", path.c_str(), (unsigned long long)n,
-            err.empty() ? "" : " err=", err.c_str());
+            err.empty() ? "" : " err=", err.c_str(),
+            (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
   }
 }
 
@@ -622,6 +623,7 @@ Status HdfsFileSystem::CallStorageBatch(
   req.set_operation_id(StorageOperationId());
   grpc::Status result;
   const int attempts = StorageRpcAttempts();
+  const auto loop_t0 = std::chrono::steady_clock::now();   // [ft 2026-11-05] how long a retried batch took (OM restart diagnosis)
   for (int attempt = 0; attempt != attempts; ++attempt) {
     grpc::ClientContext ctx;
     ctx.set_deadline(std::chrono::system_clock::now() +
@@ -640,7 +642,13 @@ Status HdfsFileSystem::CallStorageBatch(
     timer.Finish(operation, req.path(0), result.ok(), req.path_size(),
                  req.operation_id(), attempt + 1, !retry);
     LogStorageRpc(operation, req.path(0), result.ok(), result.error_message());
-    if (result.ok()) return Status::OK();
+    if (result.ok()) {
+      if (attempt > 0)
+        fprintf(stderr, "[storage-cp] %s ok after %d attempts, %.3f s (the Ownership Module was away) t=%lld\n", operation, attempt + 1,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - loop_t0).count(),
+                (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count());
+      return Status::OK();
+    }
     if (!retry) break;
     std::this_thread::sleep_for(std::chrono::milliseconds(std::min(10 << std::min(attempt, 7), 100)));   // [ft 2026-11-05] capped at 100 ms
   }
