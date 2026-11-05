@@ -1262,3 +1262,11 @@ Status SystemClock::CreateFromString(const ConfigOptions& config_options,
   }
 }
 }  // namespace ROCKSDB_NAMESPACE
+
+// [ft 2026-11-04] non-HDFS builds: no Storage-CP, nothing to release (the HDFS plugin defines the real one).
+#ifndef HDFS
+#include "rocksdb/storage_cp_release.h"
+namespace ROCKSDB_NAMESPACE {
+Status StorageCpReleaseReferences(Env*, const std::vector<std::string>&) { return Status::OK(); }
+}  // namespace ROCKSDB_NAMESPACE
+#endif

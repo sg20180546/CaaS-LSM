@@ -19,6 +19,8 @@
 
 #include "env_hdfs.h"
 #include "storage_cp_hook.h"
+#include "rocksdb/storage_cp_release.h"
+#include "util/ft_crash.h"
 
 #include <atomic>
 #include <chrono>
@@ -858,6 +860,37 @@ IOStatus HdfsFileSystem::GetChildren(const std::string& path,
   return s;
 }
 
+// [ft 2026-11-04] Release every listed reference this shard holds (prepared-but-unpublished links of a rolled-back
+// migration, see include/rocksdb/storage_cp_release.h). One RequestDelete per path, like the obsolete-file purge, but
+// without the publication-state gate: the caller asserts it will never publish these paths.
+Status HdfsFileSystem::ReleaseReferences(const std::vector<std::string>& paths) const {
+  auto* client = GetStorageCpClient();
+  if (client == nullptr || paths.empty()) return Status::OK();
+  for (const auto& p : paths) {
+    if (!IsSstFile(p)) continue;
+    compactionservice::FileRef req;
+    req.set_path(p);
+    req.set_shard_id(storage_cp_shard_);
+    compactionservice::DeleteReply reply;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() +
+                     std::chrono::milliseconds(StorageRpcTimeoutMs()));
+    const auto s = client->stub->RequestDelete(&ctx, req, &reply);
+    LogStorageRpc("ReleaseReference", p, s.ok(), s.error_message());
+    if (!s.ok()) return Status::IOError("Storage-CP release", s.error_message());
+    publication_.Set({p}, storage_cp::PublicationTracker::State::kReleased);
+  }
+  return Status::OK();
+}
+
+Status StorageCpReleaseReferences(Env* env, const std::vector<std::string>& paths) {
+  if (env == nullptr || paths.empty()) return Status::OK();
+  FileSystem* fs = env->GetFileSystem().get();
+  const auto* hfs = fs ? fs->CheckedCast<HdfsFileSystem>() : nullptr;
+  if (hfs == nullptr) return Status::OK();
+  return hfs->ReleaseReferences(paths);
+}
+
 IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
                                     const IOOptions& /*options*/,
                                     IODebugContext* /*dbg*/) {
@@ -891,6 +924,7 @@ IOStatus HdfsFileSystem::DeleteFile(const std::string& fname,
     LogStorageRpc("RequestDelete", fname, s.ok(), s.error_message());
     if (!s.ok()) return IOStatus::IOError("Storage-CP release", s.error_message());
     publication_.Set({fname}, State::kReleased);
+    ft_crash::Check("src_after_release");   // [ft] a purge that released one file and died (step 7 mid-way)
     // Physical SST deletion belongs exclusively to CP, even if an old server
     // responds deleted=true. There is deliberately no unsafe client fallback.
     return IOStatus::OK();

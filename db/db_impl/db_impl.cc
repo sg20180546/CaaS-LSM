@@ -119,6 +119,7 @@
 // [relink/Storage-CP] refcount++ when this shard adopts an external_path
 // reference. Header is free of hdfs.h/grpc so it costs nothing here.
 #include "plugin/hdfs/storage_cp_hook.h"
+#include "util/ft_crash.h"
 #endif
 
 namespace ROCKSDB_NAMESPACE {
@@ -6072,6 +6073,7 @@ Status DBImpl::RegisterExternalFilesInPlace(
       return s;
     }
   }
+  ft_crash::Check("dst_after_prepare");   // [ft] step 3 done at the Storage-CP, step 4 not started
 #endif
   {
     InstrumentedMutexLock l(&mutex_);
@@ -6083,6 +6085,7 @@ Status DBImpl::RegisterExternalFilesInPlace(
     else
       StorageCpPreserveOutputsOnUncertainCommit(fs_.get(), ownership_paths);
 #endif
+    if (s.ok()) ft_crash::Check("dst_after_publish");   // [ft] step 4 durable in the MANIFEST, nothing acknowledged yet
     if (s.ok()) {
       if (max_gsn != kDisableGlobalSequenceNumber &&
           max_gsn > versions_->LastSequence()) {

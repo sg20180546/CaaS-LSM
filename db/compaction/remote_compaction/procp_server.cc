@@ -18,6 +18,7 @@
 #include <vector>
 #include "hdfs.h"  // [relink/Storage-CP] libhdfs C API: the CP now owns the physical SST delete
 #include "storage_ownership_registry.h"
+#include "util/ft_crash.h"
 
 ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
 std::unordered_map<uint64_t, compactionservice::AddTaskArgs> task_args_map_;
@@ -311,6 +312,7 @@ class StorageImpl final : public compactionservice::StorageService::Service {
     reply->set_deleted(false);  // No Storage RPC ever authorizes client-side HDFS deletion.
     return StorageCall([&](ownership_cp::Registry& registry) {
       const auto result = registry.Release(request->path(), request->shard_id());
+      ft_crash::Check("om_after_release");   // [ft] the release is durable, the reply is not sent
       reply->set_refcount(static_cast<int>(std::min<uint64_t>(result.count, std::numeric_limits<int>::max())));
       if (result.unknown) {
         std::cout << GetTime() << "[storage] ★UNTRACKED RequestDelete path=" << request->path()
@@ -327,6 +329,7 @@ class StorageImpl final : public compactionservice::StorageService::Service {
   grpc::Status LinkBatch(const compactionservice::FileRefBatch* request, bool prepared) {
     return StorageCall([&](ownership_cp::Registry& registry) {
       registry.Link(StoragePaths(*request), request->shard_id(), request->operation_id());
+      ft_crash::Check("om_after_link");   // [ft] the link batch is durable, the reply is not sent
       for (const auto& path : request->path()) {
         std::cout << GetTime() << "[storage] NotifyLink path=" << path
                   << " shard=" << request->shard_id() << " refcount=" << registry.Inspect(path).count

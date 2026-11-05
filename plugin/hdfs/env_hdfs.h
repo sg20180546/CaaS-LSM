@@ -118,6 +118,7 @@ class HdfsFileSystem : public FileSystemWrapper {
   Status PrepareOutputs(const std::vector<std::string>& paths) const;
   Status AbortOutputs(const std::vector<std::string>& paths) const;
   Status RecoverReferences(const std::vector<std::string>& paths) const;
+  Status ReleaseReferences(const std::vector<std::string>& paths) const;   // [ft 2026-11-04]
   Status TrackUnpublishedOutput(const std::string& path) const;
   void MarkOutputsPublished(const std::vector<std::string>& paths) const;
   void PreserveOutputs(const std::vector<std::string>& paths) const;
