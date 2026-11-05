@@ -525,8 +525,14 @@ HdfsFileSystem::StorageCpClient* HdfsFileSystem::GetStorageCpClient() const {
             ? static_cast<uint32_t>(std::strtoul(shard, nullptr, 10))
             : 0u;
     auto client = std::unique_ptr<StorageCpClient>(new StorageCpClient());
-    client->channel = grpc::CreateChannel(
-        std::string(addr), grpc::InsecureChannelCredentials());
+    // [ft 2026-11-05] gRPC's default reconnect backoff (1 s initial, x1.6) made a destination wait ~3.5 s for its `own` after the
+    // Ownership Module had restarted in 40 ms (full cell 1105_fts_5, OM at step 3). Reconnect quickly instead.
+    grpc::ChannelArguments cargs;
+    cargs.SetInt(GRPC_ARG_INITIAL_RECONNECT_BACKOFF_MS, 100);
+    cargs.SetInt(GRPC_ARG_MIN_RECONNECT_BACKOFF_MS, 100);
+    cargs.SetInt(GRPC_ARG_MAX_RECONNECT_BACKOFF_MS, 500);
+    client->channel = grpc::CreateCustomChannel(
+        std::string(addr), grpc::InsecureChannelCredentials(), cargs);
     client->stub = compactionservice::StorageService::NewStub(client->channel);
     storage_cp_client_ = std::move(client);
     // [diag 2026-08-08] The refcount was silently inert for months (procp saw
@@ -636,7 +642,7 @@ Status HdfsFileSystem::CallStorageBatch(
     LogStorageRpc(operation, req.path(0), result.ok(), result.error_message());
     if (result.ok()) return Status::OK();
     if (!retry) break;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10 << std::min(attempt, 7)));   // [ft] capped at 1.28 s
+    std::this_thread::sleep_for(std::chrono::milliseconds(std::min(10 << std::min(attempt, 7), 100)));   // [ft 2026-11-05] capped at 100 ms
   }
   return Status::IOError(std::string("Storage-CP ") + operation, result.error_message());
 }
@@ -1081,6 +1087,11 @@ Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base,
   result->reset();
   std::string cwd;
   hdfsFS fs;
+  // [ft 2026-11-05] FT_TRACE=1: the shared-storage open (libhdfs starts a JVM and talks to the NameNode) as its own segment
+  // of a restart's timeline; a CN pays it before its DB open, the Migration Module pays it as its only start-up cost.
+  const bool ft_trace = std::getenv("FT_TRACE") != nullptr;
+  auto now_ms = [] { return (long long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count(); };
+  if (ft_trace) std::fprintf(stderr, "[ft] t3h hdfs_connect_begin epoch_ms=%lld uri=%s\n", now_ms(), uri.c_str());
   if (uri.empty() || uri == HdfsFileSystem::kProto) {
     // Either empty or hdfs://
     fs = hdfsConnectNewInstance("default", 0);
@@ -1112,6 +1123,7 @@ Status HdfsFileSystem::Create(const std::shared_ptr<FileSystem>& base,
       }
     }
   }
+  if (ft_trace) std::fprintf(stderr, "[ft] t3h hdfs_connect_end epoch_ms=%lld ok=%d\n", now_ms(), fs != nullptr ? 1 : 0);
   if (fs == nullptr) {
   } else if (!cwd.empty()) {
     int code = hdfsSetWorkingDirectory(fs, cwd.c_str());
