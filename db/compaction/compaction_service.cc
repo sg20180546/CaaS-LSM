@@ -34,7 +34,7 @@ class ProCPClient {
     compaction_args.set_output_directory(output_directory);
     compaction_args.set_input(input);
     compaction_args.set_trigger_ms(trigger_ms);
-    compaction_args.set_retained_ranges(OwnershipRetainedRanges());   // [ownership 2026-11-05] the host's filter, evaluated on the CSA
+    compaction_args.set_retained_ranges(ROCKSDB_NAMESPACE::OwnershipRetainedRanges());   // [ownership 2026-11-05] the host's filter, evaluated on the CSA
     compactionservice::TaskId taskId;
     grpc::ClientContext context;
     compactionservice::AddTaskArgs add_task_args;
