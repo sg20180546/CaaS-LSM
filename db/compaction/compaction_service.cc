@@ -12,6 +12,7 @@
 
 #include "compaction_service.grpc.pb.h"
 #include "rocksdb/db.h"
+#include "rocksdb/storage_cp_release.h"
 
 class ProCPClient {
  public:
@@ -184,6 +185,7 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
       compaction_addition_info->compensated_file_size);
   addition_info.set_output_level(compaction_addition_info->output_level);
   addition_info.set_start_level(compaction_addition_info->start_level);
+  addition_info.set_retained_ranges(OwnershipRetainedRanges());   // [ownership 2026-11-05] the host's filter, evaluated on the CSA
   uint64_t compact_process_latency;
   uint64_t open_db_latency;
   Status s = proCp_client.OpenAndCompact(

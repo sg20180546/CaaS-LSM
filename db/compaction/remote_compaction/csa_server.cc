@@ -7,6 +7,9 @@
 #include <grpcpp/server_context.h>
 
 #include <string>
+#include <vector>
+#include <memory>
+#include <algorithm>
 #include <thread>
 #include <atomic>  // [heartbeat] hb_done flag
 #include <cstdlib>
@@ -14,6 +17,7 @@
 #include "compaction_service.grpc.pb.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "rocksdb/compaction_filter.h"
 #include "utils.h"
 
 #ifdef HDFS
@@ -24,6 +28,48 @@ ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
 // [heartbeat 2026-06-29] Sentinel in CompactionReply.code() telling ProCP "this task is still
 // progressing" (a ping, not a result). MUST match procp_server.cc's kHeartbeatCode.
 static constexpr int kHeartbeatCode = 424242;
+
+// [ownership 2026-11-05] The requesting instance's OwnershipFilter, evaluated here: a key (8-byte big-endian) outside the
+// retained ranges belongs to a key group this instance no longer owns (it migrated away) -> dropped. Keys of another size
+// are kept. Ranges arrive as "lo:hi;lo:hi;..." (half-open) in CompactionAdditionInfo.retained_ranges; empty = keep all.
+class RetainedRangesFilter : public ROCKSDB_NAMESPACE::CompactionFilter {
+ public:
+  explicit RetainedRangesFilter(const std::string& text) {
+    size_t i = 0;
+    while (i < text.size()) {
+      size_t j = text.find(';', i);
+      if (j == std::string::npos) j = text.size();
+      const std::string item = text.substr(i, j - i);
+      i = j + 1;
+      const size_t c = item.find(':');
+      if (c == std::string::npos) continue;
+      ranges_.emplace_back(std::strtoull(item.substr(0, c).c_str(), nullptr, 10),
+                           std::strtoull(item.substr(c + 1).c_str(), nullptr, 10));
+    }
+    std::sort(ranges_.begin(), ranges_.end());
+  }
+  const char* Name() const override { return "RetainedRangesFilter"; }
+  bool Filter(int /*level*/, const ROCKSDB_NAMESPACE::Slice& key, const ROCKSDB_NAMESPACE::Slice& /*value*/,
+              std::string* /*new_value*/, bool* /*value_changed*/) const override {
+    if (key.size() != 8) return false;
+    uint64_t k = 0;
+    for (size_t i = 0; i < 8; i++) k = (k << 8) | static_cast<uint8_t>(key[i]);
+    // the last range whose lo <= k
+    auto it = std::upper_bound(ranges_.begin(), ranges_.end(), std::make_pair(k, ~0ull));
+    if (it != ranges_.begin()) {
+      --it;
+      if (k >= it->first && k < it->second) return false;
+    }
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return true;
+  }
+  uint64_t dropped() const { return dropped_.load(); }
+  size_t ranges() const { return ranges_.size(); }
+
+ private:
+  std::vector<std::pair<uint64_t, uint64_t>> ranges_;
+  mutable std::atomic<uint64_t> dropped_{0};
+};
 
 class CSAImpl final : public compactionservice::CSAService::Service {
  public:
@@ -56,6 +102,12 @@ class CSAImpl final : public compactionservice::CSAService::Service {
       options_override.compaction_filter = options_.compaction_filter;
       options_override.compaction_filter_factory =
           options_.compaction_filter_factory;
+      // [ownership 2026-11-05] per task: the requesting instance's retained ranges -> its ownership filter runs here
+      std::unique_ptr<RetainedRangesFilter> ownership_filter;
+      if (!compaction_task_args.compaction_addition_info().retained_ranges().empty()) {
+        ownership_filter.reset(new RetainedRangesFilter(compaction_task_args.compaction_addition_info().retained_ranges()));
+        options_override.compaction_filter = ownership_filter.get();
+      }
       options_override.prefix_extractor = options_.prefix_extractor;
       options_override.table_factory = options_.table_factory;
       options_override.sst_partitioner_factory =
@@ -88,6 +140,11 @@ class CSAImpl final : public compactionservice::CSAService::Service {
           &open_db_latency, options_override);
       hb_done.store(true);
       hb_thread.join();
+      if (ownership_filter) {
+        std::cout << GetTime() << "Compaction task (" << compaction_task_args.task_id() << ") ownership filter: "
+                  << ownership_filter->ranges() << " retained range(s), dropped " << ownership_filter->dropped()
+                  << " un-owned key(s)" << std::endl;
+      }
       compactionservice::CompactionReply compaction_reply;
       uint64_t process_latency =
           start_time - compaction_task_args.compaction_args().trigger_ms();
