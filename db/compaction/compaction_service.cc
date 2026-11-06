@@ -34,6 +34,7 @@ class ProCPClient {
     compaction_args.set_output_directory(output_directory);
     compaction_args.set_input(input);
     compaction_args.set_trigger_ms(trigger_ms);
+    compaction_args.set_retained_ranges(OwnershipRetainedRanges());   // [ownership 2026-11-05] the host's filter, evaluated on the CSA
     compactionservice::TaskId taskId;
     grpc::ClientContext context;
     compactionservice::AddTaskArgs add_task_args;
@@ -185,7 +186,6 @@ CompactionServiceJobStatus MyTestCompactionService::WaitForCompleteV2(
       compaction_addition_info->compensated_file_size);
   addition_info.set_output_level(compaction_addition_info->output_level);
   addition_info.set_start_level(compaction_addition_info->start_level);
-  addition_info.set_retained_ranges(OwnershipRetainedRanges());   // [ownership 2026-11-05] the host's filter, evaluated on the CSA
   uint64_t compact_process_latency;
   uint64_t open_db_latency;
   Status s = proCp_client.OpenAndCompact(

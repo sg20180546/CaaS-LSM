@@ -7,6 +7,7 @@
 #include <grpcpp/server_context.h>
 
 #include <string>
+#include <limits>
 #include <chrono>
 #include <vector>
 #include <memory>
@@ -58,7 +59,8 @@ class RetainedRangesFilter : public ROCKSDB_NAMESPACE::CompactionFilter {
     uint64_t k = 0;
     for (size_t i = 0; i < 8; i++) k = (k << 8) | static_cast<uint8_t>(key[i]);
     // the last range whose lo <= k
-    auto it = std::upper_bound(ranges_.begin(), ranges_.end(), std::make_pair(k, ~0ull));
+    auto it = std::upper_bound(ranges_.begin(), ranges_.end(),
+                               std::pair<uint64_t, uint64_t>(k, std::numeric_limits<uint64_t>::max()));
     if (it != ranges_.begin()) {
       --it;
       if (k >= it->first && k < it->second) return false;
@@ -107,8 +109,8 @@ class CSAImpl final : public compactionservice::CSAService::Service {
           options_.compaction_filter_factory;
       // [ownership 2026-11-05] per task: the requesting instance's retained ranges -> its ownership filter runs here
       std::unique_ptr<RetainedRangesFilter> ownership_filter;
-      if (!compaction_task_args.compaction_addition_info().retained_ranges().empty()) {
-        ownership_filter.reset(new RetainedRangesFilter(compaction_task_args.compaction_addition_info().retained_ranges()));
+      if (!compaction_task_args.compaction_args().retained_ranges().empty()) {
+        ownership_filter.reset(new RetainedRangesFilter(compaction_task_args.compaction_args().retained_ranges()));
         options_override.compaction_filter = ownership_filter.get();
       }
       options_override.prefix_extractor = options_.prefix_extractor;
