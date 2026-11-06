@@ -25,6 +25,9 @@ message CompactionAdditionInfo {
   uint64 compensated_file_size = 4;
   int32 output_level = 5;
   int32 start_level = 6;
+  // [ownership 2026-11-05] the requesting instance's retained key ranges ("lo:hi;lo:hi;...", 8-byte big-endian keys):
+  // the CSA drops every key outside them (the instance's OwnershipFilter, evaluated remotely). Empty = no filter.
+  string retained_ranges = 7;
 }
 
 message CompactionReply {

@@ -1272,8 +1272,21 @@ Status StorageCpReleaseReferences(Env*, const std::vector<std::string>&) { retur
 #endif
 // [ft 2026-11-05] force-local compaction switch (see storage_cp_release.h); every build.
 #include <atomic>
+#include <functional>
+#include <mutex>
 namespace ROCKSDB_NAMESPACE {
 static std::atomic<int> g_storage_cp_force_local_compactions{0};
 void StorageCpForceLocalCompactions(int delta) { g_storage_cp_force_local_compactions.fetch_add(delta, std::memory_order_acq_rel); }
 int StorageCpForceLocalCompactionsCount() { return g_storage_cp_force_local_compactions.load(std::memory_order_acquire); }
+static std::mutex g_ownership_ranges_mu;
+static std::function<std::string()> g_ownership_ranges_provider;
+void SetOwnershipRetainedRangesProvider(std::function<std::string()> provider) {
+  std::lock_guard<std::mutex> lk(g_ownership_ranges_mu);
+  g_ownership_ranges_provider = std::move(provider);
+}
+std::string OwnershipRetainedRanges() {
+  std::function<std::string()> p;
+  { std::lock_guard<std::mutex> lk(g_ownership_ranges_mu); p = g_ownership_ranges_provider; }
+  return p ? p() : std::string();
+}
 }  // namespace ROCKSDB_NAMESPACE

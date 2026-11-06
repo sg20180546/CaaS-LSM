@@ -7,6 +7,7 @@
 // No-op when the Env is not backed by the HDFS file system or STORAGE_CP_ADDR is unset.
 #pragma once
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -20,4 +21,9 @@ Status StorageCpReleaseReferences(Env* env, const std::vector<std::string>& path
 // remnants of a returning key range through the OwnershipFilter (CompactFiles, intra-L0). delta = +1 / -1.
 void StorageCpForceLocalCompactions(int delta);
 int StorageCpForceLocalCompactionsCount();
+// [ownership 2026-11-05] The host registers a provider of its retained key ranges ("lo:hi;..." over 8-byte big-endian keys);
+// every remote compaction request carries the current value and the CSA drops keys outside the ranges (the host's
+// OwnershipFilter, evaluated remotely). Unset / empty string = the remote compaction keeps every key (stock behaviour).
+void SetOwnershipRetainedRangesProvider(std::function<std::string()> provider);
+std::string OwnershipRetainedRanges();
 }  // namespace ROCKSDB_NAMESPACE
