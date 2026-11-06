@@ -7,6 +7,7 @@
 #include <grpcpp/server_context.h>
 
 #include <string>
+#include <chrono>
 #include <vector>
 #include <memory>
 #include <algorithm>
@@ -28,6 +29,8 @@ ROCKSDB_NAMESPACE::OpenAndCompactOptions compaction_service_options;
 // [heartbeat 2026-06-29] Sentinel in CompactionReply.code() telling ProCP "this task is still
 // progressing" (a ping, not a result). MUST match procp_server.cc's kHeartbeatCode.
 static constexpr int kHeartbeatCode = 424242;
+// [ft 2026-11-05] re-register with the ProCP after this long without a CheckCSAStatus poll (its poll period is seconds)
+static constexpr int64_t kReregisterAfterSilenceMs = 15000;
 
 // [ownership 2026-11-05] The requesting instance's OwnershipFilter, evaluated here: a key (8-byte big-endian) outside the
 // retained ranges belongs to a key group this instance no longer owns (it migrated away) -> dropped. Keys of another size
@@ -180,6 +183,7 @@ class CSAImpl final : public compactionservice::CSAService::Service {
   grpc::Status CheckCSAStatus(
       grpc::ServerContext* context, const google::protobuf::Empty* request,
       compactionservice::CSAStatus* csa_status) override {
+    last_status_poll_ms_.store(NowMs());   // [ft 2026-11-05] the ProCP polls only the CSAs it knows; silence => re-register
     csa_status->set_address(address_);
     csa_status->set_local_task_nums(local_task_nums_);
     csa_status->set_max_task_nums(max_task_nums_);
@@ -203,6 +207,10 @@ class CSAImpl final : public compactionservice::CSAService::Service {
     }
   }
 
+  static int64_t NowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+  }
+  std::atomic<int64_t> last_status_poll_ms_{0};
   std::unique_ptr<compactionservice::ProCPService::Stub> stub_;
 
  private:
@@ -269,5 +277,23 @@ int main(int argc, char** argv) {
   std::cout << GetTime() << "Server listening on " << server_address
             << std::endl;
   service.RegisterCSA();
+  // [ft 2026-11-05] Re-register whenever the ProCP stops polling us. The ProCP keeps its CSA table in memory and polls every
+  // registered CSA's CheckCSAStatus; after it restarts (Ownership Module crash, FT point OM3) the table is empty, the polls
+  // stop, and every remote compaction falls back to local until the CSA registers again (fts_11: 245 of 246 compactions
+  // after the OM restart ran locally; the destination wedged at the L0 stall). RegisterCSA on the ProCP replaces the stub for
+  // an existing address, so a repeat is harmless; one attempt per silence window keeps the retired-stub list short.
+  service.last_status_poll_ms_.store(CSAImpl::NowMs());
+  std::thread rereg([&service] {
+    for (;;) {
+      sleep(1);
+      if (CSAImpl::NowMs() - service.last_status_poll_ms_.load() > kReregisterAfterSilenceMs) {
+        std::cout << GetTime() << "no status poll from the ProCP for " << kReregisterAfterSilenceMs / 1000
+                  << " s -> re-registering" << std::endl;
+        service.RegisterCSA();
+        service.last_status_poll_ms_.store(CSAImpl::NowMs());
+      }
+    }
+  });
+  rereg.detach();
   server->Wait();
 }
