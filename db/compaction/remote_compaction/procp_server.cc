@@ -54,7 +54,16 @@ std::unordered_map<std::string,
     csa_client_map_;
 std::unordered_map<uint64_t, compactionservice::CompactionReply>
     task_reply_map_;
-std::atomic<uint64_t> next_task_id_ = 0;
+// [ft 2026-11-06] Task ids are unique ACROSS ProCP restarts: seeded from the start time (epoch seconds << 24, 16M ids per
+// second). After the Ownership Module restarted (FT point OM3) the old instance's ids started again at 0 on the new one, so a CN
+// still polling an old id could have been handed another job's result; and CheckTask answered 99 ("still running") for ids it
+// had never accepted, parking 41 compactions of a shard for the whole poll budget (1106_ftss_2: the export's absorb waited on
+// them and the migration hung). Unknown ids now abort to the CN (see CheckTask).
+static uint64_t InitialTaskId() {
+  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+             std::chrono::system_clock::now().time_since_epoch()).count()) << 24;
+}
+std::atomic<uint64_t> next_task_id_{InitialTaskId()};
 std::unordered_map<uint64_t, uint64_t> reschedule_num;
 std::unordered_map<uint64_t, uint64_t> submit_fail_num_;  // [F2b] CSA-reported failures per task
 // [heartbeat 2026-06-29] Last time the CSA pinged that a task is still PROGRESSING. CheckTask tells the
@@ -154,6 +163,15 @@ class ProCPImpl final : public compactionservice::ProCPService::Service {
                          compactionservice::CompactionReply* reply) override {
     std::lock_guard<std::mutex> lock(scheduler_latch_);
     if (task_reply_map_.count(request->task_id()) == 0) {
+      if (task_args_map_.count(request->task_id()) == 0) {
+        // [ft 2026-11-06] This instance never accepted the task (it was accepted by the instance that crashed, or its result
+        // was already consumed): abort to the CN so it runs the compaction locally instead of polling "99" forever.
+        std::cout << GetTime() << "Check compaction task (" << request->task_id()
+                  << "): UNKNOWN to this ProCP instance (restart?) -> abort to CN" << std::endl;
+        last_heartbeat_.erase(request->task_id());
+        reply->set_code(10);
+        return grpc::Status::OK;
+      }
       // [heartbeat] Abort (tell the CN to fall back to local) ONLY if the task went silent for
       // > kHeartbeatStaleSec. A slow-but-progressing remote compaction keeps pinging -> stays 99 ->
       // CN keeps waiting instead of killing+retrying it. (Routine "Not finished" logging removed:
