@@ -35,7 +35,7 @@ static constexpr int64_t kReregisterAfterSilenceMs = 15000;
 
 // [ownership 2026-11-05] The requesting instance's OwnershipFilter, evaluated here: a key (8-byte big-endian) outside the
 // retained ranges belongs to a key group this instance no longer owns (it migrated away) -> dropped. Keys of another size
-// are kept. Ranges arrive as "lo:hi;lo:hi;..." (half-open) in CompactionAdditionInfo.retained_ranges; empty = keep all.
+// are kept. Ranges arrive as "lo:hi;lo:hi;..." (half-open) in CompactionArgs.retained_ranges; empty = keep all.
 class RetainedRangesFilter : public ROCKSDB_NAMESPACE::CompactionFilter {
  public:
   explicit RetainedRangesFilter(const std::string& text) {
